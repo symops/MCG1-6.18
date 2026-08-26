@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: GPL-2.0
+/dts-v1/;
+#include "ls1024a.dtsi"
+
+/ {
+	model = "Western Digital My Cloud (Gen 1)";
+	compatible = "wdc,mycloud-gen1", "fsl,ls1024a";
+
+	chosen {
+		bootargs = "console=ttyS0,115200n8 earlyprintk";
+		stdout-path = &uart1;
+	};
+};
+
+&uart1 {
+	status = "okay";
+};
+
+&sata {
+	status = "okay";
+};
+
+&usb3 {
+	status = "okay";
+};
+
+&usb3_phy {
+	status = "okay";
+};
+
+&ls_spi {
+	status = "okay";
+};
+
+&hs_spi {
+	status = "okay";
+};
+
+&i2c {
+	status = "okay";
+};
+
+/*
+ * Not yet ported (Stage 2+):
+ *  - PFE (Comcerto Packet Forwarding Engine / eth0): no mainline or
+ *    Bonstra/linux-ls1024a driver exists for this block yet. The old
+ *    3.2.26 kernel used a custom "pfe" module (see the imported
+ *    kmodules/mspd-c2k/pfe sources and firmware blobs in
+ *    symops/MCG1-3.2.26) driving EMAC1-3/EGPI/HGPI/BMU/CLASS/TMU/UTIL/HIF.
+ *  - RTC (c2k-rtc): proprietary Mindspeed block, no driver in mainline
+ *    or in this fork. Board boots with NTP-only timekeeping for now.
+ *  - Board LEDs (system_led RGB via GPIO 5/6/7, wifi_led via GPIO 12/13)
+ *    and system fan (PWM0-driven, formula-based duty cycle): the old
+ *    kernel drove these with direct register pokes
+ *    (drivers/leds/leds-wd.c, drivers/hwmon/wd-fan.c in the 3.2.26
+ *    tree), not through gpio-leds/pwm-fan bindings. No LS1024A PWM
+ *    driver exists yet in this fork, and the RGB LED combining logic
+ *    doesn't map cleanly onto plain gpio-leds. Left out of this DTS
+ *    rather than describing hardware with no driver behind it.
+ *  - PCIe (pcie0/pcie1, inherited disabled from ls1024a.dtsi): PCIe0
+ *    reported "Link Up Failed" in the old kernel's boot log -- nothing
+ *    is physically connected on this board.
+ */
