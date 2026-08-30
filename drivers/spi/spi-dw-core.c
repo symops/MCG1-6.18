@@ -622,6 +622,7 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	u8 *buf;
 	unsigned int tx_len0, rx_len0;
 	unsigned int tx_iters, rx_iters;
+	unsigned int tx_pushed;
 
 	dev_info(&dws->host->dev, "wtr: enter tx_len=%u rx_len=%u fifo_len=%u "
 		"SR=0x%x SSIENR=0x%x SER=0x%x\n",
@@ -692,8 +693,9 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	rx_len0 = len;
 	buf = dws->rx;
 	rx_iters = 0;
+	tx_pushed = 0;
 	while (len) {
-		if (dws->no_eeprom_read) {
+		if (dws->no_eeprom_read && tx_pushed < rx_len0) {
 			/*
 			 * EEPROM-read's hardware auto-continue doesn't work
 			 * on this controller (see struct dw_spi's
@@ -702,10 +704,24 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 			 * Tx FIFO room is available, same technique
 			 * dw_writer()/dw_spi_poll_transfer() use for regular
 			 * (non-native-CS-atomic) transfers.
+			 *
+			 * Budget against rx_len0 - tx_pushed (total dummy
+			 * bytes pushed so far across all iterations), NOT
+			 * against len (remaining bytes still to be *read*):
+			 * TXFLR reflects only what's currently queued, and
+			 * drains on its own as bytes get clocked out, so
+			 * using it to size "room" against len would let
+			 * already-pushed-but-since-drained slots look free
+			 * again and push extra dummy bytes on a later
+			 * iteration -- clocking in more real data than
+			 * requested and overflowing the Rx FIFO once len
+			 * bytes have been drained but the extra ones keep
+			 * arriving.
 			 */
 			entries = readl_relaxed(dws->regs + DW_SPI_TXFLR);
-			room = min(dws->fifo_len - entries, len);
-			for (; room; --room)
+			room = min3(dws->fifo_len - entries, len,
+				    rx_len0 - tx_pushed);
+			for (; room; --room, ++tx_pushed)
 				dw_write_io_reg(dws, DW_SPI_DR, 0);
 		}
 

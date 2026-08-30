@@ -843,7 +843,33 @@ for each byte still wanted, instead of just waiting on Rx FIFO level
 -- all while remaining inside the single CS-held call exec_op already
 provides. This combines the two previously-separate correct halves:
 exec_op's CS continuity, and the classic path's proven-working
-manual-clock-drive technique. Not yet re-tested on hardware.
+manual-clock-drive technique.
+
+Eleventh attempt: real progress -- ``wtr: Rx done`` prints (the Rx
+loop completed on its own, no timeout, all 6 bytes drained), but then
+immediately::
+
+    RX FIFO overflow detected
+    spi-nor spi0.0: probe with driver spi-nor failed with error -5
+
+``dw_spi_check_status()`` (called right after ``write_then_read()``
+returns success) finds the ``RXOI`` bit set in ``RISR``. Bug in the
+manual-drive loop itself: ``room`` was computed each iteration as
+``min(fifo_len - TXFLR, len)`` -- against ``len``, the bytes *still to
+be read*, not against how many dummy bytes had *already been pushed*.
+Since ``TXFLR`` only reflects what's currently queued and drains on
+its own as bytes get clocked out, an already-pushed slot freeing up
+made it look like fresh "room" on a later iteration, so the loop could
+push more dummy bytes across iterations than ``rx_len`` actually
+needed -- clocking in more real data than requested and overflowing
+the Rx FIFO once the wanted bytes were drained but extra ones kept
+arriving.
+
+Fixed by tracking total dummy bytes pushed in a separate ``tx_pushed``
+counter (persisting across iterations, only ever incremented) and
+budgeting ``room`` against ``rx_len0 - tx_pushed`` (the true remaining
+allowance) in addition to ``len`` and available FIFO space, via
+``min3()``. Not yet re-tested on hardware.
 
 Toolchain note
 ==============
