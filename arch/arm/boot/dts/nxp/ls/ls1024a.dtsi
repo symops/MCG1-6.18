@@ -357,6 +357,14 @@
 			compatible = "fsl,ls1024a-sata", "generic-ahci";
 			reg = <0x9d000000 0x10000>;
 			interrupts = <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH>;
+			/*
+			 * This SoC's AHCI HBA reads back PORTS_IMPL = 0
+			 * from hardware regardless of how many ports are
+			 * actually wired up (confirmed against the old
+			 * 3.2.26 vendor driver, which force-set it to 0x3
+			 * for the same reason). Override it explicitly.
+			 */
+			ports-implemented = <0x3>;
 			clocks =
 				<&clkcore LS1024A_CLK_SATA>,
 				<&clkcore LS1024A_CLK_SATA_OOB>,

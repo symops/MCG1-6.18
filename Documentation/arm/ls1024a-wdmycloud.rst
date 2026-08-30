@@ -261,7 +261,34 @@ return NULL.
 Fixed with a ``memblock_is_memory(CPU_VECTORS_PHYS)`` check before
 using the computed pointer: if physical address 0 isn't real RAM on
 this board, secondary-CPU bring-up is skipped (single-CPU boot)
-instead of crashing the kernel. Not yet re-tested on hardware.
+instead of crashing the kernel.
+
+Fourth attempt (with the SMP fix) got much further: full console
+output through driver probing, no oops. It stopped at::
+
+    ahci 9d000000.sata: masking port_map 0x0 -> 0x0
+    ahci 9d000000.sata: 0/2 ports implemented (port mask 0x0)
+    ...
+    VFS: Cannot open root device "/dev/md0" or unknown-block(0,0): error -6
+    Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)
+
+The AHCI HBA on this SoC reads back ``PORTS_IMPL = 0`` from hardware
+regardless of how many ports actually exist -- the same issue the old
+3.2.26 vendor driver worked around by unconditionally
+"forcing PORTS_IMPL to 0x3" (visible in its own boot log). The
+mainline ``generic-ahci``/``libahci_platform`` driver has a standard
+DT property for exactly this, ``ports-implemented``, which forces
+``hpriv->saved_port_map`` and overrides whatever the hardware register
+says (see ``libahci.c:ahci_save_initial_config()``). Added
+``ports-implemented = <0x3>;`` to the ``sata@9d000000`` node in
+``ls1024a.dtsi``.
+
+``root=/dev/md0`` will still fail (MD/RAID support isn't built in
+this defconfig) -- that's expected and separate from the AHCI fix;
+the plan is to see the real partition table once SATA actually
+enumerates a disk, and either build a `dm`-free multi-boot ``root=``
+against the correct real partition, or enable MD if the on-disk
+layout turns out to need it. Not yet re-tested on hardware.
 
 Toolchain note
 ==============
