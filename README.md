@@ -97,7 +97,8 @@ against real hardware, in order:
    item 4's oops, and only ~128 MiB usable). Building with
    `LOADADDR=0x00008000` instead rounds to `0x0`, recovers the full
    ~236 MiB, and lets secondary-CPU bring-up work without needing
-   item 4's guard to trigger at all.
+   item 4's guard to trigger at all. **Confirmed on hardware:** both
+   CPU cores online, 235 MiB total memory.
 
 See `Documentation/arm/ls1024a-wdmycloud.rst` for the full writeup of
 each, plus what's still not working post-boot (networking, LEDs --

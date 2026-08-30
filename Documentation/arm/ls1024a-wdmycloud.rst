@@ -418,7 +418,22 @@ closely than the ~128 MiB this kernel could see before). The
 ``memblock_is_memory()`` guard in ``platsmp.c`` is left in place as a
 defensive check -- it's a no-op once the memory map is correct, and a
 useful safety net if a future defconfig change reintroduces the
-wrong-bank scenario. Not yet re-tested on hardware.
+wrong-bank scenario.
+
+Confirmed on real hardware::
+
+    root@MCG1-Devuan:~# cat /proc/cpuinfo
+    processor       : 0
+    ...
+    processor       : 1
+    ...
+    root@MCG1-Devuan:~# free -m
+                   total        used        free      shared  buff/cache   available
+    Mem:             235          40          81           0         121         194
+
+Both CPU cores online, 235 MiB total memory (matches the old kernel's
+"236MB total" almost exactly). Both the SMP and the memory-size issue
+are resolved by this one build-time change.
 
 None of these block reaching a working shell. Stage 2 (as scoped) is
 done: this kernel boots the real rootfs on the real board over
