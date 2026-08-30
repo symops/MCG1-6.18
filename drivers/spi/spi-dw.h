@@ -127,13 +127,9 @@
 	(sizeof_field(struct spi_mem_op, cmd.opcode) + \
 	 sizeof_field(struct spi_mem_op, addr.val) + 256)
 /*
- * Separate, larger size for no_eeprom_read_buf: DW_SPI_BUF_SIZE (above)
- * only needs to cover a command's own opcode+address+dummy bytes, but
- * this scratch buffer also has to hold an entire combined command+data
- * capture in one piece (see dw_spi_write_then_read()) -- observed real
- * MTD reads (plain `dd` from /dev/mtd0, no explicit block size) request
- * 512 data bytes at a time. Sized generously for up to a 4 KiB data
- * phase plus command-phase headroom.
+ * Larger than DW_SPI_BUF_SIZE: the no_eeprom_read_buf scratch buffer holds
+ * a whole command+data capture in one piece (dw_spi_write_then_read()),
+ * not just a command. Sized for up to a 4 KiB data phase plus headroom.
  */
 #define DW_SPI_NO_EEPROM_READ_BUF_SIZE (4096 + 64)
 #define DW_SPI_GET_BYTE(_val, _idx) \
@@ -178,32 +174,13 @@ struct dw_spi {
 	u16			bus_num;
 	void (*set_cs)(struct spi_device *spi, bool enable);
 	/*
-	 * Some vendor-modified DW APB SSI instances don't correctly
-	 * continue clocking past the first data frame in EEPROM-read
-	 * (TMOD_EPROMREAD) mode -- confirmed on the ls1024a board's
-	 * ls_spi controller: a 6-byte JEDEC READ ID only ever returns 1
-	 * byte via dw_spi_exec_mem_op(), then the Rx FIFO never fills
-	 * again.
-	 *
-	 * Skipping mem_ops entirely and falling back to the classic
-	 * spi_sync()-based transfer path doesn't work either: that path
-	 * issues the command and data phases as two separate
-	 * ->transfer_one() calls, and this controller's *native* chip
-	 * select auto-releases as soon as the Tx FIFO empties between
-	 * them (the same "nasty peculiarity" dw_spi_poll_transfer()'s own
-	 * comment describes) -- confirmed by testing: the transfer
-	 * completes cleanly with no hang, but the chip returns all-zero
-	 * garbage because CS glitched between the opcode and the data
-	 * read.
-	 *
-	 * So instead, when this is set, dw_spi_exec_mem_op() uses
-	 * TMOD_TR (plain full-duplex) instead of TMOD_EPROMREAD, and
-	 * dw_spi_write_then_read()'s Rx loop manually pushes dummy 0x00
-	 * bytes into the Tx FIFO to drive the clock for each byte still
-	 * wanted, rather than relying on the (here, broken) EEPROM-read
-	 * hardware auto-continue -- while remaining inside the same
-	 * native-CS-safe atomic write-then-read call the exec_op path
-	 * already provides.
+	 * Some vendor-modified DW APB SSI instances (confirmed on the
+	 * ls1024a board's ls_spi controller) don't correctly continue
+	 * clocking past the first data frame in EEPROM-read
+	 * (TMOD_EPROMREAD) mode. When set, dw_spi_exec_mem_op() uses
+	 * TMOD_TR (plain full-duplex) instead, and
+	 * dw_spi_write_then_read()'s Rx loop manually drives dummy 0x00
+	 * bytes to clock in the rest of the data.
 	 */
 	bool			no_eeprom_read;
 
@@ -214,11 +191,10 @@ struct dw_spi {
 	unsigned int		rx_len;
 	u8			buf[DW_SPI_BUF_SIZE];
 	/*
-	 * Scratch capture buffer for the no_eeprom_read path: the command
-	 * phase's garbage byte(s) and the real data are captured as one
-	 * unbroken run into here (no phase boundary, no gap -- see
-	 * dw_spi_write_then_read()), then the real data is copied out to
-	 * the caller's actual buffer afterwards.
+	 * Scratch capture buffer for the no_eeprom_read path: command-phase
+	 * bytes and real data are captured together in one unbroken run
+	 * (see dw_spi_write_then_read()), then the real data is copied out
+	 * to the caller's actual buffer afterwards.
 	 */
 	u8			no_eeprom_read_buf[DW_SPI_NO_EEPROM_READ_BUF_SIZE];
 	int			dma_mapped;

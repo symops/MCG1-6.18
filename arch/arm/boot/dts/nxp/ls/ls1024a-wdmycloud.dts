@@ -36,61 +36,31 @@
 	/delete-property/ interrupts;
 
 	/*
-	 * This controller's EEPROM-read (TMOD_EPROMREAD) hardware mode
-	 * only ever clocks in the first data byte of a multi-byte read,
-	 * then stops -- confirmed via register-level tracing (Rx FIFO
-	 * genuinely never refills after byte 1, for millions of poll
-	 * iterations) against a 6-byte JEDEC READ ID.
-	 *
-	 * Falling back to the classic spi_sync()-based path doesn't work
-	 * either: it issues the command and data as two separate
-	 * ->transfer_one() calls, and this controller's native chip
-	 * select auto-releases as soon as the Tx FIFO empties between
-	 * them (confirmed: the transfer completes with no hang, but the
-	 * chip returns all-zero garbage -- CS glitched mid-command).
-	 *
-	 * With this set, dw_spi_exec_mem_op() uses plain full-duplex
-	 * (TMOD_TR) instead of EEPROM-read, and manually drives the read
-	 * phase's clock with dummy Tx bytes rather than relying on the
-	 * (here, broken) hardware auto-continue -- while staying inside
-	 * the same atomic, CS-held write-then-read call exec_op already
-	 * provides. See Documentation/arm/ls1024a-wdmycloud.rst for the
-	 * full trace-by-trace derivation.
+	 * This controller's EEPROM-read (TMOD_EPROMREAD) hardware mode only
+	 * ever clocks in the first data byte of a multi-byte read, then
+	 * stops. With this set, dw_spi_exec_mem_op() falls back to plain
+	 * full-duplex (TMOD_TR) and manually drives the read phase's clock
+	 * with dummy Tx bytes instead. See
+	 * Documentation/arm/ls1024a-wdmycloud.rst for the full derivation.
 	 */
 	snps,dwc-ssi-broken-eeprom-read;
 
 	/*
-	 * Likely root cause of the persistent, diagnostic-timeout-proof
-	 * hang documented at length in
-	 * Documentation/arm/ls1024a-wdmycloud.rst: this block was never
-	 * taken out of hardware reset. spi-dw-mmio.c already knows to look
-	 * up and deassert an optional reset named "spi"
-	 * (devm_reset_control_get_optional_exclusive(&pdev->dev, "spi")) --
-	 * it was just never given one. LS1024A_AXI_DUS_RST is the reset
-	 * line matching this controller's "dus" clock domain (shared with
-	 * uart1, which works without ever needing an explicit reset
-	 * deassert -- but a shared clock gate doesn't imply a shared reset
-	 * bit, and UART likely has its own separate one, or barebox leaves
-	 * it deasserted for its own console use).
+	 * This block was never taken out of hardware reset otherwise.
+	 * LS1024A_AXI_DUS_RST is the reset line for this controller's "dus"
+	 * clock domain.
 	 */
 	resets = <&clkreset LS1024A_AXI_DUS_RST>;
 	reset-names = "spi";
 
 	/*
-	 * Boot/env SPI-NOR flash (also used by barebox itself for its own
-	 * environment storage). barebox's own board file (vendor GPL
-	 * source, arch/arm/boards/comcerto-asic/c2k_asic.c and
-	 * commands/update_spi.c) names this "S25FL064A" (Spansion, 8 MiB),
-	 * but that's evidently just this board's generic/legacy device
-	 * name in the vendor firmware -- read on real hardware, with a
-	 * working driver, this chip's actual JEDEC ID is 0xef 0x30 0x13,
-	 * an exact match for upstream spi-nor's "w25x40" (Winbond, 512 KiB,
-	 * no SFDP/quad support, also an old, plain chip) -- a real BOM
-	 * second-source substitution the vendor firmware's naming was
-	 * simply never updated for. Mode (SPI_CPOL | SPI_CPHA, i.e. mode
-	 * 3) and frequency (4 MHz) still copied from that same barebox
-	 * board file's spi_board_info entry, and still correct (matches
-	 * the working w25x40 read).
+	 * Boot/env SPI-NOR flash (also used by barebox for its own
+	 * environment storage). barebox's board file calls this
+	 * "S25FL064A" (Spansion, 8 MiB), but that's a stale vendor device
+	 * name -- read on real hardware, the actual JEDEC ID is
+	 * 0xef 0x30 0x13, an exact match for "w25x40" (Winbond, 512 KiB).
+	 * Mode (SPI_CPOL | SPI_CPHA) and frequency (4 MHz) copied from
+	 * barebox's spi_board_info entry and confirmed correct.
 	 */
 	flash@0 {
 		compatible = "winbond,w25x40", "jedec,spi-nor";
