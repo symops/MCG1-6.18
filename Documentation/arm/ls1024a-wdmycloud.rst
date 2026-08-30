@@ -650,7 +650,58 @@ sub-step inside ``dw_spi_poll_transfer()``'s loop. Prints emitted
 console (UART output isn't blocked by a stuck SPI MMIO read on the
 same core -- the two are independent bus targets), so whichever trace
 line is the *last* one printed on the next attempt pinpoints the exact
-register access that never returns. Not yet re-tested on hardware.
+register access that never returns.
+
+Sixth attempt (with the tracing): none of the added trace lines
+printed at all -- not even ``transfer_one: entry``. This means the
+hang happens in a *different* code path entirely, one that never
+calls ``dw_spi_transfer_one()``.
+
+Found it: ``dw_spi_init_mem_ops()`` registers a ``spi_mem`` layer
+``exec_op`` callback (``dw_spi_exec_mem_op()``) whenever
+``!dws->set_cs`` -- i.e. exactly the *native-CS, no GPIO override*
+configuration this board uses. Its own comment explains why it exists::
+
+    The SPI memory operation implementation below is the best choice
+    for the devices, which are selected by the native chip-select
+    lane. It's specifically developed to workaround the problem with
+    automatic chip-select lane toggle when there is no data in the Tx
+    FIFO buffer.
+
+This is the driver's *actual*, already-correct answer to the whole
+native-CS/shallow-FIFO problem from ``tsx31.dts`` -- it's just a
+completely separate function from ``dw_spi_transfer_one()``/
+``dw_spi_poll_transfer()``, which spi-nor's core prefers whenever
+available, bypassing the traced path entirely (hence zero trace
+output).
+
+Inside it, ``dw_spi_write_then_read()`` has this, completely
+unguarded::
+
+    len = dws->rx_len;
+    buf = dws->rx;
+    while (len) {
+        entries = readl_relaxed(dws->regs + DW_SPI_RXFLR);
+        if (!entries) {
+            sts = readl_relaxed(dws->regs + DW_SPI_RISR);
+            if (sts & DW_SPI_INT_RXOI) { ...; return -EIO; }
+            continue;
+        }
+        ...
+    }
+
+A tight software spin loop with no bound at all -- not the earlier
+timeout-proof MMIO-read-stall theory; this is a genuine infinite
+``while (len)`` if the Rx FIFO level register never reports any
+entries. This is also finally consistent with barebox's own successful
+``crc32`` read moments earlier: the hardware works, but this specific
+mainline code path apparently never sees any Rx data arrive on this
+controller.
+
+Added the same timeout+register-dump pattern used before, but this
+time in the actually-executing function -- both the Tx and Rx
+``while`` loops in ``dw_spi_write_then_read()``, plus entry/milestone
+``dev_info()`` calls throughout. Not yet re-tested on hardware.
 
 Toolchain note
 ==============

@@ -614,6 +614,14 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	u32 room, entries, sts;
 	unsigned int len;
 	u8 *buf;
+	unsigned long deadline;
+	unsigned int tx_len0, rx_len0;
+
+	dev_info(&dws->host->dev, "wtr: enter tx_len=%u rx_len=%u fifo_len=%u "
+		"SR=0x%x SSIENR=0x%x SER=0x%x\n",
+		dws->tx_len, dws->rx_len, dws->fifo_len,
+		dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_SSIENR),
+		dw_readl(dws, DW_SPI_SER));
 
 	/*
 	 * At initial stage we just pre-fill the Tx FIFO in with no rush,
@@ -625,6 +633,9 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	while (len--)
 		dw_write_io_reg(dws, DW_SPI_DR, *buf++);
 
+	dev_info(&dws->host->dev, "wtr: prefilled, SR=0x%x TXFLR=0x%x\n",
+		dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_TXFLR));
+
 	/*
 	 * After setting any bit in the SER register the transmission will
 	 * start automatically. We have to keep up with that procedure
@@ -632,7 +643,15 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	 * operation will be pre-terminated.
 	 */
 	len = dws->tx_len - ((void *)buf - dws->tx);
+	tx_len0 = len;
 	dw_spi_set_cs(spi, false);
+
+	dev_info(&dws->host->dev, "wtr: CS asserted, remaining tx len=%u "
+		"SR=0x%x SER=0x%x TXFLR=0x%x\n",
+		len, dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_SER),
+		dw_readl(dws, DW_SPI_TXFLR));
+
+	deadline = jiffies + HZ;
 	while (len) {
 		entries = readl_relaxed(dws->regs + DW_SPI_TXFLR);
 		if (!entries) {
@@ -642,7 +661,20 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 		room = min(dws->fifo_len - entries, len);
 		for (; room; --room, --len)
 			dw_write_io_reg(dws, DW_SPI_DR, *buf++);
+		if (len && time_after(jiffies, deadline)) {
+			dev_err(&dws->host->dev,
+				"wtr: Tx loop timeout, tx_len0=%u remaining=%u "
+				"SR=0x%x RISR=0x%x TXFLR=0x%x RXFLR=0x%x\n",
+				tx_len0, len,
+				dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
+				dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR));
+			return -ETIMEDOUT;
+		}
 	}
+
+	dev_info(&dws->host->dev, "wtr: Tx done, rx_len=%u "
+		"SR=0x%x RXFLR=0x%x\n",
+		dws->rx_len, dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RXFLR));
 
 	/*
 	 * Data fetching will start automatically if the EEPROM-read mode is
@@ -650,7 +682,9 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	 * prevent the Rx FIFO overflow causing the inbound data loss.
 	 */
 	len = dws->rx_len;
+	rx_len0 = len;
 	buf = dws->rx;
+	deadline = jiffies + HZ;
 	while (len) {
 		entries = readl_relaxed(dws->regs + DW_SPI_RXFLR);
 		if (!entries) {
@@ -659,12 +693,25 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 				dev_err(&dws->host->dev, "FIFO overflow on Rx\n");
 				return -EIO;
 			}
+			if (time_after(jiffies, deadline)) {
+				dev_err(&dws->host->dev,
+					"wtr: Rx loop timeout, rx_len0=%u remaining=%u "
+					"SR=0x%x RISR=0x%x TXFLR=0x%x RXFLR=0x%x "
+					"SSIENR=0x%x SER=0x%x\n",
+					rx_len0, len,
+					dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
+					dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR),
+					dw_readl(dws, DW_SPI_SSIENR), dw_readl(dws, DW_SPI_SER));
+				return -ETIMEDOUT;
+			}
 			continue;
 		}
 		entries = min(entries, len);
 		for (; entries; --entries, --len)
 			*buf++ = dw_read_io_reg(dws, DW_SPI_DR);
 	}
+
+	dev_info(&dws->host->dev, "wtr: Rx done\n");
 
 	return 0;
 }
