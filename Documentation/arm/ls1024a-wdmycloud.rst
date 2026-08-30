@@ -754,6 +754,55 @@ specifically, since that's where execution stops. This should finally
 produce a real timeout/diagnostic on the next attempt instead of
 silently spinning past a check that can never trip.
 
+Ninth attempt confirmed it, with a real, working timeout at last::
+
+    wtr: Tx done, rx_len=6 SR=0xe RXFLR=0x1
+    wtr: Rx loop still waiting, iters=1048576 remaining=5 SR=0x6 RISR=0x1 TXFLR=0x0 RXFLR=0x0
+    wtr: Rx loop still waiting, iters=2097152 remaining=5 SR=0x6 RISR=0x1 TXFLR=0x0 RXFLR=0x0
+    wtr: Rx loop still waiting, iters=3145728 remaining=5 SR=0x6 RISR=0x1 TXFLR=0x0 RXFLR=0x0
+    wtr: Rx loop timeout after 4000001 iters, rx_len0=6 remaining=5 SR=0x6 RISR=0x1 TXFLR=0x0 RXFLR=0x0 SSIENR=0x1 SER=0x1
+    spi-nor spi0.0: probe with driver spi-nor failed with error -110
+
+And, crucially, **boot then continued normally past this point all
+the way to login** -- the timeout doing exactly its job (bounding a
+failure instead of hanging the whole machine).
+
+Root cause, finally nailed down: exactly **1 of 6** requested bytes
+arrives (``remaining`` goes from 6 to 5, then never moves again across
+4 million more iterations). This is opcode ``0x9F`` issued via
+``dw_spi_exec_mem_op()`` in ``DW_SPI_CTRLR0_TMOD_EPROMREAD`` mode
+(hardware auto-continues clocking in ``op->data.nbytes`` frames after
+the command, driven by the ``NDF`` field). On this board's ``ls_spi``
+instance, that auto-continue mechanism appears to only ever clock one
+frame, then stop -- while barebox's own ``c2k_spi.c`` driver
+(``do_write_read_transfer`` / ``do_read_only_transfer8``, full-duplex,
+no EEPROM-read mode at all) reads many bytes from this exact chip
+correctly (the ``crc32 -f /dev/spi0 0+0x100`` test earlier). Combined
+with everything separately confirmed working (pinctrl, clock, reset,
+CS assertion, the opcode byte itself transmitting) this points at a
+genuine limitation/erratum in this SoC's specific "vendor-modified"
+instance of the DW APB SSI IP's EEPROM-read auto-continue logic, not
+a configuration mistake.
+
+Fix: added a ``no_mem_ops`` flag to ``struct dw_spi`` and checked it
+in ``dw_spi_init_mem_ops()`` alongside the existing
+``DW_SPI_CAP_CS_OVERRIDE``/``set_cs`` checks that already gate
+``exec_op`` registration -- when set, ``spi-nor``'s core naturally
+falls back to plain full-duplex (``TMOD_TR``) transfers via the
+ordinary ``dw_spi_transfer_one()``/``dw_spi_poll_transfer()`` path
+instead of ever calling ``dw_spi_exec_mem_op()``. (Deliberately did
+*not* reuse ``DW_SPI_CAP_CS_OVERRIDE`` for this -- that flag makes the
+driver write to a real Amazon-Alpine-specific ``DW_SPI_CS_OVERRIDE``
+register this controller doesn't have.) ``spi-dw-mmio.c`` reads a new
+DT boolean, ``snps,dwc-ssi-broken-eeprom-read``, added to ``&ls_spi``
+in ``ls1024a-wdmycloud.dts`` -- board-specific, doesn't affect any
+other user of this shared driver. A short 6-byte read like JEDEC ID
+fits in a single 8-word FIFO fill regardless of path, so this doesn't
+reintroduce the native-CS/shallow-FIFO refill problem for this
+particular operation; larger reads (actual flash dumps) going through
+the same classic path will need separate verification once this gets
+the device probing at all. Not yet re-tested on hardware.
+
 Toolchain note
 ==============
 

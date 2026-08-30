@@ -167,6 +167,19 @@ struct dw_spi {
 	u32			num_cs;		/* chip select lines */
 	u16			bus_num;
 	void (*set_cs)(struct spi_device *spi, bool enable);
+	/*
+	 * Some vendor-modified DW APB SSI instances don't correctly
+	 * continue clocking past the first data frame in EEPROM-read
+	 * (TMOD_EPROMREAD) mode -- confirmed on the ls1024a board's
+	 * ls_spi controller: a 6-byte JEDEC READ ID only ever returns 1
+	 * byte via dw_spi_exec_mem_op(), then the Rx FIFO never fills
+	 * again, even though the same chip reads many bytes correctly via
+	 * a full-duplex transfer (both from barebox's own driver, and via
+	 * dw_spi_transfer_one()'s TMOD_TR path once this is set). Set to
+	 * skip mem_ops registration and always use the classic
+	 * spi_sync()-based transfer path instead.
+	 */
+	bool			no_mem_ops;
 
 	/* Current message transfer state info */
 	void			*tx;

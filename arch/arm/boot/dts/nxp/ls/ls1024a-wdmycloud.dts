@@ -36,6 +36,21 @@
 	/delete-property/ interrupts;
 
 	/*
+	 * This controller's EEPROM-read (TMOD_EPROMREAD) hardware mode
+	 * only ever clocks in the first data byte of a multi-byte read,
+	 * then stops -- confirmed via register-level tracing (Rx FIFO
+	 * genuinely never refills after byte 1, for millions of poll
+	 * iterations) against a 6-byte JEDEC READ ID. The same chip reads
+	 * many bytes correctly through barebox's own SPI driver, which
+	 * doesn't use this mode, so it's specific to this quirk, not a
+	 * wiring/clock/reset problem (all separately confirmed working --
+	 * see Documentation/arm/ls1024a-wdmycloud.rst). Skip
+	 * dw_spi_exec_mem_op()/mem_ops registration entirely so spi-nor
+	 * falls back to plain full-duplex (TMOD_TR) transfers.
+	 */
+	snps,dwc-ssi-broken-eeprom-read;
+
+	/*
 	 * Likely root cause of the persistent, diagnostic-timeout-proof
 	 * hang documented at length in
 	 * Documentation/arm/ls1024a-wdmycloud.rst: this block was never
