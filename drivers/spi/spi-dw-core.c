@@ -722,13 +722,28 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 		if (dws->rx_len) {
 			struct dw_spi_cfg rd_cfg = *cfg;
 
+			/*
+			 * CTRLR0 (which carries TMOD) is documented across
+			 * the DW SSI family as only safely changeable while
+			 * SSIENR is 0 -- confirmed necessary here: an earlier
+			 * attempt at this same switch without disabling
+			 * first resulted in *zero* Rx bytes ever arriving
+			 * (worse than the plain-TMOD_TR attempt, which at
+			 * least got the command-phase garbage byte), meaning
+			 * the reconfigure wasn't actually taking effect.
+			 * barebox's own driver also always disables
+			 * (SSIENR=0) before writing a new CTRLR0.
+			 */
+			dw_spi_enable_chip(dws, 0);
 			rd_cfg.tmode = DW_SPI_CTRLR0_TMOD_RO;
 			rd_cfg.ndf = dws->rx_len;
 			dw_spi_update_config(dws, spi, &rd_cfg);
+			dw_spi_enable_chip(dws, 1);
 			dev_info(&dws->host->dev,
 				"wtr: switched to TMOD_RO for data phase, "
-				"ndf=%u SSIENR=0x%x\n",
-				rd_cfg.ndf, dw_readl(dws, DW_SPI_SSIENR));
+				"ndf=%u SSIENR=0x%x SER=0x%x\n",
+				rd_cfg.ndf, dw_readl(dws, DW_SPI_SSIENR),
+				dw_readl(dws, DW_SPI_SER));
 		}
 	}
 

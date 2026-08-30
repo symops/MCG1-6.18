@@ -960,7 +960,35 @@ Restructured accordingly:
   write) instead of one dummy byte per byte wanted, then relies purely
   on ``TMOD_RO``'s hardware auto-continue for the rest.
 
-Not yet re-tested on hardware.
+Fourteenth attempt: confirms ``TMOD_TO`` genuinely doesn't populate Rx
+during the opcode phase (``RXFLR=0x0`` at "Tx done" this time, vs
+``0x1`` with ``TMOD_TR`` before -- so the command-phase flush now
+correctly finds nothing, one theory validated) -- but the data phase
+gets *worse*: zero Rx bytes ever arrive at all (not even the one
+"garbage" byte seen before), timing out with ``remaining=6`` unchanged
+across 4 million iterations, even though the single kick-start dummy
+byte visibly transmits (``TXFLR`` back to 0).
+
+Re-read the barebox loop once more, specifically the disable/enable
+sequencing: ``op`` (which ``switch`` case runs) is derived once from
+``mesg->status``, *outside* the per-transfer loop, meaning the
+WRITE_ONLY and READ_ONLY phases barebox uses for a command+data read
+must come from **two separate top-level calls** to
+``c2k_spi_transfer()`` -- and ``writel(0, SSIENR)`` is the first thing
+that function does, every call. So barebox always fully disables the
+controller before writing a new ``CTRLR0``/TMOD, never reconfigures it
+live. That's also simply the standard, documented DW SSI requirement
+(``CTRLR0`` is only safely modified while ``SSIENR`` is 0) -- our
+mid-transaction ``dw_spi_update_config()`` call for the ``TMOD_RO``
+switch never disabled the chip first, so it likely wasn't taking
+proper effect at all.
+
+Added ``dw_spi_enable_chip(dws, 0)`` immediately before, and
+``dw_spi_enable_chip(dws, 1)`` immediately after, the ``TMOD_RO``
+reconfiguration (``SER`` -- chip-select selection -- lives in a
+separate register untouched by ``dw_spi_enable_chip()``, so this
+shouldn't affect which device is selected). Not yet re-tested on
+hardware.
 
 Toolchain note
 ==============
