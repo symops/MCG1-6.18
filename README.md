@@ -26,13 +26,23 @@ Devuan-based) rootfs.
 
 ```
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- ls1024a_defconfig
-make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage dtbs
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= zImage dtbs modules
 cat arch/arm/boot/zImage arch/arm/boot/dts/nxp/ls/ls1024a-wdmycloud.dtb \
     > arch/arm/boot/zImage-w-dtb
 mkimage -A arm -O linux -T kernel -C none -a 0x0F008000 -e 0x0F008000 \
     -n "Linux-6.18.46-ls1024a-wdmycloud" \
     -d arch/arm/boot/zImage-w-dtb arch/arm/boot/uImage
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= \
+    INSTALL_MOD_PATH=/some/staging/dir modules_install
 ```
+
+`ls1024a_defconfig` sets `# CONFIG_LOCALVERSION_AUTO is not set`, which
+drops the `-g<commit>` suffix from `uname -r`, but `scripts/setlocalversion`
+still appends a bare `+` for an uncommitted/dirty tree unless the
+`LOCALVERSION` make variable is explicitly passed (even empty, as
+above) -- that's what makes the release string a clean `6.18.46`
+matching the module directory (`/lib/modules/6.18.46/`) installed
+above.
 
 produces a `uImage` (~5.3 MiB) that, flashed to this board's kernel
 partition, boots all the way to userspace: `md0` (the RAID1 rootfs)
