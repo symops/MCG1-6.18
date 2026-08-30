@@ -213,6 +213,26 @@ sanity check -- it just isn't the artifact to flash on this board.)
 Resulting image: 5.24 MiB, still comfortably under the 10 MiB budget
 from the section above.
 
+The second real-boot attempt with this appended-DTB image produced
+**no output at all** after barebox's own ``arch_number: 1094`` line --
+notably, *not* the "unrecognized machine ID" error from the first
+attempt. Since that error is printed by the same low-level
+``CONFIG_DEBUG_LL`` path in both cases, its disappearance is a strong
+signal the machine lookup now succeeds (DTB found, ``LS1024A``
+matched) and boot proceeds into ``start_kernel()`` -- just silently,
+because the only command line in play was barebox's own ATAG cmdline
+(``CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER``), which has no
+``earlyprintk``, so nothing reaches the console until the real UART
+platform driver probes -- much later in boot, and not guaranteed to
+happen at all if something upstream of it (clk/pinctrl) is wrong.
+
+Fixed by switching to ``CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND``
+(so the DTB's own ``bootargs``, which already had ``earlyprintk``, are
+kept and barebox's real per-unit args get appended after) and adding
+``CONFIG_EARLY_PRINTK=y`` (reuses the already-verified ``DEBUG_LL``
+UART1 code path for a console active from very early boot, long
+before the platform driver probes). Not yet re-tested on hardware.
+
 Toolchain note
 ==============
 
