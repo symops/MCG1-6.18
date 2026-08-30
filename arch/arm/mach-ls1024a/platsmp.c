@@ -6,6 +6,7 @@
 
 #include <linux/io.h>
 #include <linux/delay.h>
+#include <linux/memblock.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/regmap.h>
@@ -76,6 +77,13 @@ static void __init ls1024a_smp_prepare_cpus(unsigned int max_cpus)
 	of_node_put(np);
 	if (!scu_base)
 		return;
+
+	if (!memblock_is_memory(CPU_VECTORS_PHYS)) {
+		pr_warn("ls1024a: reset vector at 0x%x is not backed by RAM, "
+			"secondary CPU bring-up unavailable\n",
+			CPU_VECTORS_PHYS);
+		goto unmap_scu;
+	}
 
 	vectors_base = phys_to_virt(CPU_VECTORS_PHYS);
 	if (!vectors_base)

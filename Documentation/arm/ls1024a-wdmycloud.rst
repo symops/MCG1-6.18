@@ -231,7 +231,37 @@ Fixed by switching to ``CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND``
 kept and barebox's real per-unit args get appended after) and adding
 ``CONFIG_EARLY_PRINTK=y`` (reuses the already-verified ``DEBUG_LL``
 UART1 code path for a console active from very early boot, long
-before the platform driver probes). Not yet re-tested on hardware.
+before the platform driver probes).
+
+Third real-hardware attempt (with both fixes applied) confirmed the
+appended-DTB boot protocol works end to end: the kernel decompresses,
+matches the DT machine (``OF: fdt: Machine model: Western Digital My
+Cloud (Gen 1)``), and runs through RCU/SLUB/scheduler init with full
+console output. It then oopsed and panicked in
+``kernel_init_freeable`` -> ``ls1024a_smp_prepare_cpus``::
+
+    Unable to handle kernel paging request at virtual address b8000000 when write
+    Register r5 information: 0-page vmalloc region ... allocated at ls1024a_smp_prepare_cpus+0x24/0xd0
+
+``arch/arm/mach-ls1024a/platsmp.c`` writes the Cortex-A9 secondary-CPU
+reset vector via ``vectors_base = phys_to_virt(CPU_VECTORS_PHYS)``
+with ``CPU_VECTORS_PHYS = 0x0``, assuming physical address 0 is
+backed by real, linearly-mapped RAM (true on the board the Bonstra
+fork was written against). On this board RAM starts at
+``0x08000000`` (confirmed by the kernel's own
+``Early memory node ranges: [mem 0x08000000-0x0fffffff]``, and by
+``OF: fdt: Ignoring memory range 0x0 - 0x8000000`` earlier in the same
+boot), so ``phys_to_virt(0)`` computes a bogus, unmapped virtual
+address -- and the arithmetic confirms it exactly:
+``0x0 - 0x08000000 + PAGE_OFFSET(0xC0000000) = 0xB8000000``, precisely
+the faulting address. The existing ``if (!vectors_base)`` guard never
+catches this because ``phys_to_virt()`` is pure arithmetic and can't
+return NULL.
+
+Fixed with a ``memblock_is_memory(CPU_VECTORS_PHYS)`` check before
+using the computed pointer: if physical address 0 isn't real RAM on
+this board, secondary-CPU bring-up is skipped (single-CPU boot)
+instead of crashing the kernel. Not yet re-tested on hardware.
 
 Toolchain note
 ==============
