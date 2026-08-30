@@ -615,7 +615,8 @@ static void dw_spi_free_mem_buf(struct dw_spi *dws)
 		kfree(dws->tx);
 }
 
-static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
+static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
+				   const struct dw_spi_cfg *cfg)
 {
 	u32 room, entries, sts;
 	unsigned int len;
@@ -708,6 +709,27 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 			dev_info(&dws->host->dev,
 				"wtr: flushed %u garbage Rx byte(s) from "
 				"command phase\n", flushed);
+
+		/*
+		 * Switch the controller from TMOD_TO (used for the opcode
+		 * phase just completed above) to TMOD_RO for the data
+		 * phase, matching barebox's own driver for this chip, which
+		 * reconfigures CTRLR0 between its WRITE_ONLY and READ_ONLY
+		 * sub-transfers the same way (c2k_spi.c in the vendor GPL
+		 * source). dw_spi_update_config() also (re)writes
+		 * CTRLR1/ndf for TMOD_RO.
+		 */
+		if (dws->rx_len) {
+			struct dw_spi_cfg rd_cfg = *cfg;
+
+			rd_cfg.tmode = DW_SPI_CTRLR0_TMOD_RO;
+			rd_cfg.ndf = dws->rx_len;
+			dw_spi_update_config(dws, spi, &rd_cfg);
+			dev_info(&dws->host->dev,
+				"wtr: switched to TMOD_RO for data phase, "
+				"ndf=%u SSIENR=0x%x\n",
+				rd_cfg.ndf, dw_readl(dws, DW_SPI_SSIENR));
+		}
 	}
 
 	/*
@@ -721,34 +743,24 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	rx_iters = 0;
 	tx_pushed = 0;
 	while (len) {
-		if (dws->no_eeprom_read && tx_pushed < rx_len0) {
+		if (dws->no_eeprom_read && tx_pushed == 0) {
 			/*
-			 * EEPROM-read's hardware auto-continue doesn't work
-			 * on this controller (see struct dw_spi's
-			 * no_eeprom_read comment) -- manually drive the
-			 * clock by pushing dummy 0x00 bytes for however much
-			 * Tx FIFO room is available, same technique
-			 * dw_writer()/dw_spi_poll_transfer() use for regular
-			 * (non-native-CS-atomic) transfers.
-			 *
-			 * Budget against rx_len0 - tx_pushed (total dummy
-			 * bytes pushed so far across all iterations), NOT
-			 * against len (remaining bytes still to be *read*):
-			 * TXFLR reflects only what's currently queued, and
-			 * drains on its own as bytes get clocked out, so
-			 * using it to size "room" against len would let
-			 * already-pushed-but-since-drained slots look free
-			 * again and push extra dummy bytes on a later
-			 * iteration -- clocking in more real data than
-			 * requested and overflowing the Rx FIFO once len
-			 * bytes have been drained but the extra ones keep
-			 * arriving.
+			 * TMOD_RO on this controller apparently still needs
+			 * a nudge to start the clock (exactly matching
+			 * barebox's own driver for this chip -- see
+			 * do_read_only_transfer8() in the vendor GPL source,
+			 * "writew(0, dr); /* start the serial clock *|/" --
+			 * one dummy word, once, then pure Rx draining, no
+			 * further Tx pushes). Unlike the earlier TMOD_TR
+			 * attempt, this relies on TMOD_RO's own hardware
+			 * auto-continue (NDF-driven, same CTRLR1 mechanism
+			 * TMOD_EPROMREAD uses -- see dw_spi_update_config())
+			 * for the rest of the bytes, on the theory that only
+			 * EEPROM-read's specific auto-continue logic is
+			 * broken on this silicon, not RO's.
 			 */
-			entries = readl_relaxed(dws->regs + DW_SPI_TXFLR);
-			room = min3(dws->fifo_len - entries, len,
-				    rx_len0 - tx_pushed);
-			for (; room; --room, ++tx_pushed)
-				dw_write_io_reg(dws, DW_SPI_DR, 0);
+			dw_write_io_reg(dws, DW_SPI_DR, 0);
+			tx_pushed = 1;
 		}
 
 		entries = readl_relaxed(dws->regs + DW_SPI_RXFLR);
@@ -875,12 +887,23 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 		if (dws->no_eeprom_read) {
 			/*
 			 * EEPROM-read's hardware auto-continue is broken on
-			 * this controller instance -- use plain full-duplex
-			 * instead. dw_spi_write_then_read()'s Rx loop drives
-			 * the extra clock cycles itself when this mode is
-			 * set (see struct dw_spi's no_eeprom_read comment).
+			 * this controller instance -- use receive-only mode
+			 * instead, matching barebox's own driver for this
+			 * exact chip (drivers/spi/c2k_spi.c in the vendor
+			 * GPL source: SPI_TRANSFER_MODE_READ_ONLY, CTRLR0
+			 * TMOD field 0x2). Like barebox, use TMOD_TO
+			 * (transmit-only) for *this* initial config -- it
+			 * covers the opcode/address/dummy phase written by
+			 * write_then_read()'s Tx loop below -- and switch to
+			 * TMOD_RO only for the data phase, inside
+			 * write_then_read() itself (see its no_eeprom_read
+			 * handling). cfg.ndf is stashed here for that later
+			 * switch to reuse; dw_spi_update_config() writes
+			 * CTRLR1/ndf identically for TMOD_RO and
+			 * TMOD_EPROMREAD.
 			 */
-			cfg.tmode = DW_SPI_CTRLR0_TMOD_TR;
+			cfg.tmode = DW_SPI_CTRLR0_TMOD_TO;
+			cfg.ndf = op->data.nbytes;
 		} else {
 			cfg.tmode = DW_SPI_CTRLR0_TMOD_EPROMREAD;
 			cfg.ndf = op->data.nbytes;
@@ -940,7 +963,7 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	local_irq_save(flags);
 	preempt_disable();
 
-	ret = dw_spi_write_then_read(dws, mem->spi);
+	ret = dw_spi_write_then_read(dws, mem->spi, &cfg);
 
 	local_irq_restore(flags);
 	preempt_enable();

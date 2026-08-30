@@ -900,7 +900,67 @@ the last one entirely (only ``rx_len`` total bytes get captured).
 Fixed by draining and discarding whatever's sitting in the Rx FIFO
 immediately after the Tx (command) phase completes and before the
 manual-drive Rx loop starts, when ``no_eeprom_read`` is set. Logs how
-many bytes it discarded. Not yet re-tested on hardware.
+many bytes it discarded.
+
+Thirteenth attempt confirmed the flush works exactly as sized (logs
+say "flushed 1 garbage Rx byte(s)" for the 1-byte opcode, "flushed 5"
+for the 5-byte SFDP command+address+dummy phase, matching ``tx_len0``
+in both cases precisely) -- but the final JEDEC ID bytes are *still*
+all zero. So the off-by-one shift is genuinely fixed, and the deeper
+problem is that no real data is arriving during the "read phase" of a
+plain ``TMOD_TR`` full-duplex transfer *at all*, garbage or otherwise.
+
+Went back to barebox's own driver for another look, this time at
+exactly how it structures a command+data read, rather than just
+which chip it reads (``drivers/spi/c2k_spi.c`` in the vendor GPL
+source). Its ``switch (op)`` in the transfer loop uses **three**
+different ``CTRLR0`` TMOD values depending on the transfer type --
+``SPI_TRANSFER_MODE_WRITE_ONLY`` -> TMOD ``0x1`` (transmit-only,
+``do_write_only_transfer8()``), ``SPI_TRANSFER_MODE_READ_ONLY`` ->
+TMOD ``0x2`` (receive-only, ``do_read_only_transfer8()``), and
+``SPI_TRANSFER_MODE_WRITE_READ`` -> TMOD ``0x0`` (TR) only for actual
+simultaneous full-duplex transfers. For a command-then-data read like
+JEDEC ID, it uses **separate WRITE_ONLY then READ_ONLY sub-transfers**
+-- reconfiguring ``CTRLR0`` between them -- not one combined ``TR``
+transfer with manual dummy bytes. And critically,
+``do_read_only_transfer8()`` writes exactly **one** dummy word
+("``/* start the serial clock */``" in its own comment) and then
+*only* drains Rx from then on -- it never pushes a second dummy byte.
+That single write plus ``TMOD_RO``'s own hardware auto-continue
+(driven by the same ``NDF``/``CTRLR1`` mechanism ``TMOD_EPROMREAD``
+uses -- confirmed identical in ``dw_spi_update_config()``) is what
+generates the rest of the clock cycles, successfully, on this exact
+silicon (proven by the working ``crc32`` read).
+
+This gives a concrete, different hypothesis: ``TMOD_RO``'s
+auto-continue may work correctly on this controller even though
+``TMOD_EPROMREAD``'s doesn't -- they're different enum values, and
+the earlier finding only demonstrated the latter is broken.
+
+Restructured accordingly:
+
+- ``dw_spi_exec_mem_op()``'s initial config (covering the opcode/
+  address/dummy phase written by ``write_then_read()``'s existing Tx
+  loop) now uses ``TMOD_TO`` (transmit-only) instead of ``TMOD_RO``,
+  matching barebox's ``WRITE_ONLY`` step -- using ``TMOD_RO`` for the
+  *whole* operation would apply "receive-only" even while the opcode
+  is being sent, which is presumably why byte 0 was garbage in the
+  first place.
+- ``dw_spi_write_then_read()`` now takes the ``struct dw_spi_cfg *``
+  used for the initial config, and right after the Tx phase completes
+  (and the existing command-phase Rx flush -- kept as a safety net,
+  though it should now find nothing to flush if ``TMOD_TO`` truly
+  doesn't populate Rx during transmission), reconfigures the
+  controller to ``TMOD_RO`` with ``ndf = rx_len`` via a second
+  ``dw_spi_update_config()`` call, mirroring barebox's own
+  reconfigure-between-sub-transfers approach.
+- Its Rx loop, when ``no_eeprom_read`` is set, now pushes exactly
+  **one** dummy byte on the very first iteration only (matching
+  ``do_read_only_transfer8()``'s single "start the serial clock"
+  write) instead of one dummy byte per byte wanted, then relies purely
+  on ``TMOD_RO``'s hardware auto-continue for the rest.
+
+Not yet re-tested on hardware.
 
 Toolchain note
 ==============
