@@ -312,8 +312,41 @@ The only actual gap was that this defconfig never built MD/RAID
 support at all. Fixed by enabling ``CONFIG_MD``, ``CONFIG_BLK_DEV_MD``
 and ``CONFIG_MD_RAID1`` (built-in, not modules -- required for root
 autodetection to work with ``noinitrd``, matching
-``raid=autodetect`` in the passed cmdline). Not yet re-tested on
-hardware.
+``raid=autodetect`` in the passed cmdline).
+
+Stage 2 reached: boots to userspace on real hardware
+=======================================================
+
+Sixth real-hardware attempt (with the MD/RAID1 fix) is the first full
+success: ``md0`` auto-assembles from ``sda1``+``sda2``, mounts as the
+real ext3 root filesystem, ``/sbin/init`` (sysvinit 3.14) runs,
+udev/eudev populates ``/dev``, both filesystems (``md0`` and the
+``sda4`` data volume) get fscked and mounted, swap activates, and the
+existing Devuan userspace comes up: cron, Dropbear SSH (generates and
+installs all three host keys and restarts successfully), MD
+monitoring. This is the same rootfs the old 3.2.26 kernel booted
+(``mcg1-devuan.log``), now running unmodified under v6.18.46.
+
+Remaining issues visible in this boot, all expected and separate from
+the kernel-boot work above:
+
+- ``modprobe: FATAL: Module pfe not found`` / ``Cannot find device
+  "eth0"`` / DHCP failure -- the PFE network driver doesn't exist yet
+  (see "Known gaps" above; this is the big Stage 3 item).
+- ``/etc/init.d/wd-leds: line 16: ... No such file or directory`` --
+  no LS1024A PWM/LED driver yet (also already listed above).
+- ``rsyslog: Permission denied`` and ``ntpsec: Permission denied``
+  during service startup -- not yet root-caused; possibly an
+  LSM/capability default that differs from what this rootfs's init
+  scripts expect from the old 3.2.26 kernel. Follow-up.
+- ``Checking root file system...Cannot persist the following output
+  on disc ... failed!`` (fsck's own diagnostic banner, filesystem
+  itself reports clean either time) and an ``/etc/mtab`` symlink
+  warning -- cosmetic, not investigated yet.
+
+None of these block reaching a working shell. Stage 2 (as scoped) is
+done: this kernel boots the real rootfs on the real board over
+serial.
 
 Toolchain note
 ==============

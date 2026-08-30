@@ -22,21 +22,29 @@ Devuan-based) rootfs.
   SoC). This repository forward-ports that work to v6.18.46 and
   adapts it to the WD My Cloud gen1 board specifically.
 
-## Status: Stage 1 -- it builds
+## Status: Stage 2 -- boots to a shell on real hardware
 
 ```
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- ls1024a_defconfig
-make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage dtbs uImage
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage dtbs
+cat arch/arm/boot/zImage arch/arm/boot/dts/nxp/ls/ls1024a-wdmycloud.dtb \
+    > arch/arm/boot/zImage-w-dtb
+mkimage -A arm -O linux -T kernel -C none -a 0x0F008000 -e 0x0F008000 \
+    -n "Linux-6.18.46-ls1024a-wdmycloud" \
+    -d arch/arm/boot/zImage-w-dtb arch/arm/boot/uImage
 ```
 
-produces a working `arch/arm/boot/uImage` (5.23 MiB) and
-`arch/arm/boot/dts/nxp/ls/ls1024a-wdmycloud.dtb`, with
-`Load Address = Entry Point = 0xF008000` -- the same value the
-original 3.2.26 `uImage` for this exact board uses, so it should be a
-drop-in replacement as far as barebox is concerned.
+produces a `uImage` (~5.3 MiB) that, flashed to this board's kernel
+partition, boots all the way to userspace: `md0` (the RAID1 rootfs)
+assembles and mounts, sysvinit runs, udev populates `/dev`, both
+filesystems get fscked, swap activates, cron/Dropbear SSH/MD
+monitoring start -- the *same* Devuan rootfs the old 3.2.26 kernel
+boots, now running under v6.18.46. (Plain `make uImage` still works
+for a quick build check, but doesn't produce a bootable image for
+this board on its own -- see below for why.)
 
-Real-hardware boot testing is under way (Stage 2), and has surfaced
-two bootloader-level constraints so far:
+Getting here surfaced a chain of board-specific fixes, each confirmed
+against real hardware, in order:
 
 1. barebox loads the kernel from a fixed 10 MiB raw region on disk
    (partitions 5/6) regardless of the uImage header's declared size,
@@ -44,20 +52,34 @@ two bootloader-level constraints so far:
    derivative, dozens of unrelated platforms built in) was silently
    truncated and failed its checksum. Fixed by trimming
    `ls1024a_defconfig` and switching the kernel's compressor from
-   gzip to XZ -- down to 5.2 MiB.
+   gzip to XZ.
 2. This board's barebox (2011.06.0, Dec 2013) has no device-tree-aware
    `bootm` at all -- it only ever hands off via the old ATAG protocol,
    which a `DT_MACHINE_START`-only machine (ours) cannot match. Fixed
    with `CONFIG_ARM_APPENDED_DTB` + `CONFIG_ARM_ATAG_DTB_COMPAT`: the
-   DTB is concatenated directly onto `zImage` at build time (not just
-   `make uImage` -- see below), so the kernel finds it itself without
-   any bootloader cooperation.
+   DTB is concatenated directly onto `zImage` at build time, so the
+   kernel finds it itself without any bootloader cooperation.
+3. `CONFIG_DEBUG_LL` + `CONFIG_EARLY_PRINTK` (UART1) added to get
+   visibility into early boot at all -- essential for diagnosing the
+   next two.
+4. `arch/arm/mach-ls1024a/platsmp.c` wrote the Cortex-A9 secondary-CPU
+   reset vector via `phys_to_virt(0)`, assuming physical address 0 is
+   real RAM. On this board RAM starts at `0x08000000`, so that
+   produced an unmapped pointer and oopsed. Guarded with
+   `memblock_is_memory()`; falls back to single-CPU boot instead of
+   crashing.
+5. This SoC's AHCI HBA reads back `PORTS_IMPLEMENTED = 0` from
+   hardware no matter how many ports exist (the old 3.2.26 driver
+   forced this too) -- added `ports-implemented = <0x3>;` to the SATA
+   DT node.
+6. `ls1024a_defconfig` never built MD/RAID at all, and `root=/dev/md0`
+   turns out to be genuinely correct (verified against a live boot log
+   of the real Devuan install) -- enabled `CONFIG_MD`/`BLK_DEV_MD`/
+   `MD_RAID1`.
 
-See `Documentation/arm/ls1024a-wdmycloud.rst` ("Kernel image size
-budget" and "Boot protocol: appended DTB required") for the full
-writeup of both, including the exact build command for the
-DTB-appended image this board actually needs. Boot-to-shell over
-serial has not been confirmed yet.
+See `Documentation/arm/ls1024a-wdmycloud.rst` for the full writeup of
+each, plus what's still not working post-boot (networking, LEDs --
+both already expected/tracked below).
 
 ## What's in this repo
 
@@ -123,6 +145,9 @@ serial has not been confirmed yet.
 - **PCIe**, though the driver compiles and is included: nothing is
   physically connected on this board (the old kernel's boot log shows
   "PCIe0: Link Up Failed"), so it's left disabled in the board DTS.
+- **`rsyslog: Permission denied` / `ntpsec: Permission denied`** at
+  userspace startup -- seen on the real-hardware Stage 2 boot, not yet
+  root-caused. Doesn't block reaching a shell.
 
 See `Documentation/arm/ls1024a-wdmycloud.rst` for the full detail on
 each of these, including the exact register-level behavior of the
