@@ -156,6 +156,63 @@ once ported, will add back some size). Anyone adding drivers to
 ``ls1024a_defconfig`` going forward should keep an eye on
 ``ls-la arch/arm/boot/uImage`` against this 10 MiB ceiling.
 
+Boot protocol: appended DTB required (Stage 2 finding)
+========================================================
+
+The barebox on this board (2011.06.0-svn10510, Dec 2013 build) has
+**no device-tree-aware `bootm`** -- confirmed on real hardware via
+``bootm -h``, which only lists ``-r <initrd>``, ``-a <arch>``,
+``-R <system_rev>``. Its stored boot script (``/env/bin/boot_sata``,
+and the near-identical one actually run from the SATA disk's
+partition 7 via ``sataenv run 7``) does a plain::
+
+    satapart 0x3008000 5 0x5000   # read partition 5 -> RAM
+    bootm /dev/mem.uImage         # no dtb, ever
+
+This is a legacy ATAG-only handoff: barebox builds a real ATAG list
+(ATAG_CORE + cmdline, confirmed by dumping the memory at the ``r2``
+address from the kernel's own error output) and passes it the way it
+always has for the old 3.2.26 board-file kernel. But
+``arch/arm/mach-ls1024a/ls1024a.c`` is ``DT_MACHINE_START``-only --
+matched purely by the FDT's ``compatible`` string -- so it cannot be
+reached via ATAGs alone, no matter what machine/arch number is
+passed. First real-hardware boot attempt hit exactly this, printing
+(thanks to ``CONFIG_DEBUG_LL``, added specifically to surface this)::
+
+    Error: invalid dtb and unrecognized/unsupported machine ID
+      r1=0x00000446, r2=0x00000100
+    Available machine support:
+    ID (hex)        NAME
+    ffffffff        Generic DT based system
+    ffffffff        Freescale LS1024A
+    ...
+
+Upgrading barebox itself is out of scope -- the fix is the standard
+one for exactly this situation: ``CONFIG_ARM_APPENDED_DTB`` (kernel
+looks for a DTB concatenated directly after its own zImage payload
+when no valid FDT pointer arrives via ``r2``) plus
+``CONFIG_ARM_ATAG_DTB_COMPAT`` (imports the bootloader's real ATAG
+list -- memory banks, cmdline -- into that appended DTB at boot).
+Both were already implicitly enabled (inherited from
+``multi_v7_defconfig``) -- the missing piece was simply that
+``make uImage`` never concatenates a DTB on its own. The actual fix
+is a build-time step::
+
+    make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- ls1024a_defconfig
+    make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage dtbs
+    cat arch/arm/boot/zImage \
+        arch/arm/boot/dts/nxp/ls/ls1024a-wdmycloud.dtb \
+        > arch/arm/boot/zImage-w-dtb
+    mkimage -A arm -O linux -T kernel -C none \
+        -a 0x0F008000 -e 0x0F008000 \
+        -n "Linux-6.18.46-ls1024a-wdmycloud" \
+        -d arch/arm/boot/zImage-w-dtb arch/arm/boot/uImage
+
+(plain ``make uImage`` still works and stays useful for a quick build
+sanity check -- it just isn't the artifact to flash on this board.)
+Resulting image: 5.24 MiB, still comfortably under the 10 MiB budget
+from the section above.
+
 Toolchain note
 ==============
 

@@ -35,17 +35,29 @@ produces a working `arch/arm/boot/uImage` (5.23 MiB) and
 original 3.2.26 `uImage` for this exact board uses, so it should be a
 drop-in replacement as far as barebox is concerned.
 
-Real-hardware boot testing is under way (Stage 2). First attempt hit
-a bootloader-level constraint: barebox loads the kernel from a fixed
-10 MiB raw region on disk (partitions 5/6) regardless of the uImage
-header's declared size, so the original 11.8 MiB image (a direct
-`multi_v7_defconfig` derivative, dozens of unrelated platforms built
-in) was silently truncated and failed its checksum. Fixed by trimming
-`ls1024a_defconfig` to just this SoC's platforms/drivers and switching
-the kernel's compressor from gzip to XZ -- see
-`Documentation/arm/ls1024a-wdmycloud.rst` ("Kernel image size budget")
-for the full writeup. Actual boot-to-shell over serial has not been
-confirmed yet.
+Real-hardware boot testing is under way (Stage 2), and has surfaced
+two bootloader-level constraints so far:
+
+1. barebox loads the kernel from a fixed 10 MiB raw region on disk
+   (partitions 5/6) regardless of the uImage header's declared size,
+   so the original 11.8 MiB image (a direct `multi_v7_defconfig`
+   derivative, dozens of unrelated platforms built in) was silently
+   truncated and failed its checksum. Fixed by trimming
+   `ls1024a_defconfig` and switching the kernel's compressor from
+   gzip to XZ -- down to 5.2 MiB.
+2. This board's barebox (2011.06.0, Dec 2013) has no device-tree-aware
+   `bootm` at all -- it only ever hands off via the old ATAG protocol,
+   which a `DT_MACHINE_START`-only machine (ours) cannot match. Fixed
+   with `CONFIG_ARM_APPENDED_DTB` + `CONFIG_ARM_ATAG_DTB_COMPAT`: the
+   DTB is concatenated directly onto `zImage` at build time (not just
+   `make uImage` -- see below), so the kernel finds it itself without
+   any bootloader cooperation.
+
+See `Documentation/arm/ls1024a-wdmycloud.rst` ("Kernel image size
+budget" and "Boot protocol: appended DTB required") for the full
+writeup of both, including the exact build command for the
+DTB-appended image this board actually needs. Boot-to-shell over
+serial has not been confirmed yet.
 
 ## What's in this repo
 
