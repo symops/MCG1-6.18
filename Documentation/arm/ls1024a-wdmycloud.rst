@@ -79,23 +79,24 @@ RTC
     clock source and would need NTP after boot (as the old kernel's
     boot log shows: "Warning: Invalid RTC value so initializing it").
 
-Board LEDs and fan
-    ``drivers/leds/leds-wd.c`` and ``drivers/hwmon/wd-fan.c`` in the
-    old 3.2.26 tree drive these directly through raw register writes
-    rather than gpiolib:
+Board LEDs
+    ``drivers/leds/leds-wd.c`` in the old 3.2.26 tree drives these
+    directly through raw register writes rather than gpiolib:
 
     - ``system_led`` is a tri-color LED combining GPIO 5 (green), 6
       (blue), 7 (red) via ``COMCERTO_GPIO_OUTPUT_REG``, with an
       alternate PWM1/PWM2/PWM3 pulse mode selected through
       ``COMCERTO_GPIO_PIN_SELECT_REG``.
     - ``wifi_led`` combines GPIO 12/13 the same way.
-    - the fan is driven purely through PWM0 duty cycle
-      (``COMCERTO_LOW_DUTY_PWM0`` / ``COMCERTO_MAX_EN_PWM0``), not
-      GPIO toggling.
+
+    (The 3.2.26 tree also has ``drivers/hwmon/wd-fan.c``, PWM0-driven,
+    but this specific board -- WD My Cloud Gen 1 -- has no physical
+    fan; that driver is for a different SKU sharing the same vendor
+    kernel image. Nothing to port here.)
 
     No LS1024A PWM driver exists yet in the Bonstra fork, and the RGB
     combining logic doesn't map cleanly onto the generic
-    ``gpio-leds``/``pwm-fan`` bindings, so these were deliberately
+    ``gpio-leds`` binding, so this was deliberately
     left out of the board DTS rather than describing hardware with no
     driver behind it.
 

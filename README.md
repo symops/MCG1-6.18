@@ -160,11 +160,13 @@ both already expected/tracked below).
   regardless of kernel/driver version.
 - **RTC.** Proprietary "c2k-rtc" block, no driver in mainline or in
   the fork. NTP-only timekeeping for now.
-- **Board LEDs and fan.** Driven by the old kernel through raw
-  register pokes (`drivers/leds/leds-wd.c`, `drivers/hwmon/wd-fan.c`
-  in the 3.2.26 tree) rather than gpiolib/PWM frameworks, and there's
-  no LS1024A PWM driver yet to build on. Left out of the board DTS
-  rather than describing hardware nothing can drive.
+- **Board LEDs.** Driven by the old kernel through raw register pokes
+  (`drivers/leds/leds-wd.c` in the 3.2.26 tree) rather than gpiolib,
+  and there's no LS1024A PWM driver yet to build on. Left out of the
+  board DTS rather than describing hardware nothing can drive. (The
+  3.2.26 tree also has `drivers/hwmon/wd-fan.c`, but this board has no
+  physical fan -- that driver is for a different SKU sharing the same
+  vendor kernel image.)
 - **PCIe**, though the driver compiles and is included: nothing is
   physically connected on this board (the old kernel's boot log shows
   "PCIe0: Link Up Failed"), so it's left disabled in the board DTS.
@@ -174,4 +176,4 @@ both already expected/tracked below).
 
 See `Documentation/arm/ls1024a-wdmycloud.rst` for the full detail on
 each of these, including the exact register-level behavior of the
-LED/fan code for whoever picks that up later.
+LED code for whoever picks that up later.
