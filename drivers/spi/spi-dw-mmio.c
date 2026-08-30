@@ -376,8 +376,8 @@ static int dw_spi_mmio_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to deassert resets\n");
 
-	dws->no_mem_ops = device_property_read_bool(&pdev->dev,
-						     "snps,dwc-ssi-broken-eeprom-read");
+	dws->no_eeprom_read = device_property_read_bool(&pdev->dev,
+							 "snps,dwc-ssi-broken-eeprom-read");
 
 	dws->bus_num = pdev->id;
 

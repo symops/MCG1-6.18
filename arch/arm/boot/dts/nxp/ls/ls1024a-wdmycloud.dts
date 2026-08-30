@@ -40,13 +40,22 @@
 	 * only ever clocks in the first data byte of a multi-byte read,
 	 * then stops -- confirmed via register-level tracing (Rx FIFO
 	 * genuinely never refills after byte 1, for millions of poll
-	 * iterations) against a 6-byte JEDEC READ ID. The same chip reads
-	 * many bytes correctly through barebox's own SPI driver, which
-	 * doesn't use this mode, so it's specific to this quirk, not a
-	 * wiring/clock/reset problem (all separately confirmed working --
-	 * see Documentation/arm/ls1024a-wdmycloud.rst). Skip
-	 * dw_spi_exec_mem_op()/mem_ops registration entirely so spi-nor
-	 * falls back to plain full-duplex (TMOD_TR) transfers.
+	 * iterations) against a 6-byte JEDEC READ ID.
+	 *
+	 * Falling back to the classic spi_sync()-based path doesn't work
+	 * either: it issues the command and data as two separate
+	 * ->transfer_one() calls, and this controller's native chip
+	 * select auto-releases as soon as the Tx FIFO empties between
+	 * them (confirmed: the transfer completes with no hang, but the
+	 * chip returns all-zero garbage -- CS glitched mid-command).
+	 *
+	 * With this set, dw_spi_exec_mem_op() uses plain full-duplex
+	 * (TMOD_TR) instead of EEPROM-read, and manually drives the read
+	 * phase's clock with dummy Tx bytes rather than relying on the
+	 * (here, broken) hardware auto-continue -- while staying inside
+	 * the same atomic, CS-held write-then-read call exec_op already
+	 * provides. See Documentation/arm/ls1024a-wdmycloud.rst for the
+	 * full trace-by-trace derivation.
 	 */
 	snps,dwc-ssi-broken-eeprom-read;
 

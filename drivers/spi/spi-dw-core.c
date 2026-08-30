@@ -693,6 +693,22 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	buf = dws->rx;
 	rx_iters = 0;
 	while (len) {
+		if (dws->no_eeprom_read) {
+			/*
+			 * EEPROM-read's hardware auto-continue doesn't work
+			 * on this controller (see struct dw_spi's
+			 * no_eeprom_read comment) -- manually drive the
+			 * clock by pushing dummy 0x00 bytes for however much
+			 * Tx FIFO room is available, same technique
+			 * dw_writer()/dw_spi_poll_transfer() use for regular
+			 * (non-native-CS-atomic) transfers.
+			 */
+			entries = readl_relaxed(dws->regs + DW_SPI_TXFLR);
+			room = min(dws->fifo_len - entries, len);
+			for (; room; --room)
+				dw_write_io_reg(dws, DW_SPI_DR, 0);
+		}
+
 		entries = readl_relaxed(dws->regs + DW_SPI_RXFLR);
 		if (!entries) {
 			sts = readl_relaxed(dws->regs + DW_SPI_RISR);
@@ -814,8 +830,19 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	cfg.dfs = 8;
 	cfg.freq = clamp(op->max_freq, 0U, dws->max_mem_freq);
 	if (op->data.dir == SPI_MEM_DATA_IN) {
-		cfg.tmode = DW_SPI_CTRLR0_TMOD_EPROMREAD;
-		cfg.ndf = op->data.nbytes;
+		if (dws->no_eeprom_read) {
+			/*
+			 * EEPROM-read's hardware auto-continue is broken on
+			 * this controller instance -- use plain full-duplex
+			 * instead. dw_spi_write_then_read()'s Rx loop drives
+			 * the extra clock cycles itself when this mode is
+			 * set (see struct dw_spi's no_eeprom_read comment).
+			 */
+			cfg.tmode = DW_SPI_CTRLR0_TMOD_TR;
+		} else {
+			cfg.tmode = DW_SPI_CTRLR0_TMOD_EPROMREAD;
+			cfg.ndf = op->data.nbytes;
+		}
 	} else {
 		cfg.tmode = DW_SPI_CTRLR0_TMOD_TO;
 	}
@@ -908,7 +935,7 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 static void dw_spi_init_mem_ops(struct dw_spi *dws)
 {
 	if (!dws->mem_ops.exec_op && !(dws->caps & DW_SPI_CAP_CS_OVERRIDE) &&
-	    !dws->set_cs && !dws->no_mem_ops) {
+	    !dws->set_cs) {
 		dws->mem_ops.adjust_op_size = dw_spi_adjust_mem_op_size;
 		dws->mem_ops.supports_op = dw_spi_supports_mem_op;
 		dws->mem_ops.exec_op = dw_spi_exec_mem_op;

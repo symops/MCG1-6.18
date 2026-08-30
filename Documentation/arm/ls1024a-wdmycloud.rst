@@ -801,7 +801,49 @@ fits in a single 8-word FIFO fill regardless of path, so this doesn't
 reintroduce the native-CS/shallow-FIFO refill problem for this
 particular operation; larger reads (actual flash dumps) going through
 the same classic path will need separate verification once this gets
-the device probing at all. Not yet re-tested on hardware.
+the device probing at all.
+
+Tenth attempt (with mem_ops disabled): the whole transaction now
+completes without hanging or timing out at all -- but::
+
+    poll[0]: pre-write tx_len=1 rx_len=1 ...
+    poll[0]: post-write ... post-read rx_len=0
+    poll[0]: pre-write tx_len=6 rx_len=6 ...
+    poll[0]: post-write ... post-read rx_len=0
+    spi-nor spi0.0: unrecognized JEDEC id bytes: 00 00 00 00 00 00
+
+Two separate ``->transfer_one()`` calls (opcode, then data), each one
+individually clean -- all 6 requested bytes actually get clocked in
+(``RXFLR`` reaching the full count each time, ``post-read rx_len=0``)
+-- yet the data is all zeros. Root cause: the classic path can
+mechanically move the right *number* of bytes, but it cannot keep this
+controller's *native* chip select continuously asserted across two
+separate ``transfer_one()`` calls -- the Tx FIFO fully drains at the
+end of the opcode transfer, which auto-releases CS on this hardware
+(the exact "nasty peculiarity" ``dw_spi_poll_transfer()``'s own
+comment describes), so by the time the data-phase transfer starts, the
+chip sees a fresh, invalid command with no preceding opcode and
+returns undefined/zero data. This is the *reverse* problem from the
+EEPROM-read one: ``dw_spi_exec_mem_op()`` correctly holds CS the whole
+time but its hardware auto-continue is broken; the classic path
+correctly clocks every byte but cannot hold CS across multiple
+transfers at all.
+
+Fix: keep using ``dw_spi_exec_mem_op()`` (revert disabling mem_ops --
+its single atomic, CS-held write-then-read call was the right
+mechanism all along), but stop relying on EEPROM-read's hardware
+auto-continue for the data phase. Renamed the quirk flag
+``no_eeprom_read`` to reflect what it actually now does: when set,
+``dw_spi_exec_mem_op()`` selects ``DW_SPI_CTRLR0_TMOD_TR`` (plain
+full-duplex) instead of ``TMOD_EPROMREAD`` for Data-IN operations, and
+``dw_spi_write_then_read()``'s Rx loop manually pushes dummy ``0x00``
+bytes into the Tx FIFO (as much room as available, same technique
+``dw_writer()`` already uses in the classic path) to drive the clock
+for each byte still wanted, instead of just waiting on Rx FIFO level
+-- all while remaining inside the single CS-held call exec_op already
+provides. This combines the two previously-separate correct halves:
+exec_op's CS continuity, and the classic path's proven-working
+manual-clock-drive technique. Not yet re-tested on hardware.
 
 Toolchain note
 ==============

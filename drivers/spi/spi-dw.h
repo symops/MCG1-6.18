@@ -173,13 +173,29 @@ struct dw_spi {
 	 * (TMOD_EPROMREAD) mode -- confirmed on the ls1024a board's
 	 * ls_spi controller: a 6-byte JEDEC READ ID only ever returns 1
 	 * byte via dw_spi_exec_mem_op(), then the Rx FIFO never fills
-	 * again, even though the same chip reads many bytes correctly via
-	 * a full-duplex transfer (both from barebox's own driver, and via
-	 * dw_spi_transfer_one()'s TMOD_TR path once this is set). Set to
-	 * skip mem_ops registration and always use the classic
-	 * spi_sync()-based transfer path instead.
+	 * again.
+	 *
+	 * Skipping mem_ops entirely and falling back to the classic
+	 * spi_sync()-based transfer path doesn't work either: that path
+	 * issues the command and data phases as two separate
+	 * ->transfer_one() calls, and this controller's *native* chip
+	 * select auto-releases as soon as the Tx FIFO empties between
+	 * them (the same "nasty peculiarity" dw_spi_poll_transfer()'s own
+	 * comment describes) -- confirmed by testing: the transfer
+	 * completes cleanly with no hang, but the chip returns all-zero
+	 * garbage because CS glitched between the opcode and the data
+	 * read.
+	 *
+	 * So instead, when this is set, dw_spi_exec_mem_op() uses
+	 * TMOD_TR (plain full-duplex) instead of TMOD_EPROMREAD, and
+	 * dw_spi_write_then_read()'s Rx loop manually pushes dummy 0x00
+	 * bytes into the Tx FIFO to drive the clock for each byte still
+	 * wanted, rather than relying on the (here, broken) EEPROM-read
+	 * hardware auto-continue -- while remaining inside the same
+	 * native-CS-safe atomic write-then-read call the exec_op path
+	 * already provides.
 	 */
-	bool			no_mem_ops;
+	bool			no_eeprom_read;
 
 	/* Current message transfer state info */
 	void			*tx;
