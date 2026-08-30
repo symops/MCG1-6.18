@@ -170,7 +170,10 @@ both already expected/tracked below).
   `util_c2000.elf`) are opaque microcode and should be reusable as-is
   regardless of kernel/driver version.
 - **RTC.** Proprietary "c2k-rtc" block, no driver in mainline or in
-  the fork. NTP-only timekeeping for now.
+  the fork. NTP-only timekeeping -- and this board has no RTC backup
+  battery, so even a working driver wouldn't retain time across power
+  loss. NTP-after-boot is the correct permanent behavior here, not a
+  gap to close; low priority.
 - **Board LEDs.** Driven by the old kernel through raw register pokes
   (`drivers/leds/leds-wd.c` in the 3.2.26 tree) rather than gpiolib,
   and there's no LS1024A PWM driver yet to build on. Left out of the
@@ -180,7 +183,9 @@ both already expected/tracked below).
   vendor kernel image.)
 - **PCIe**, though the driver compiles and is included: nothing is
   physically connected on this board (the old kernel's boot log shows
-  "PCIe0: Link Up Failed"), so it's left disabled in the board DTS.
+  "PCIe0: Link Up Failed"), so it's left disabled in the board DTS --
+  this SKU doesn't appear to expose a usable PCIe slot/device at all,
+  so treat this as not applicable rather than pending work.
 - **`rsyslog: Permission denied` / `ntpsec: Permission denied`** at
   userspace startup -- seen on the real-hardware Stage 2 boot, not yet
   root-caused. Doesn't block reaching a shell.

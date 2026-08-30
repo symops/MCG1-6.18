@@ -76,8 +76,15 @@ RTC
     The board uses a proprietary "c2k-rtc" block (Mindspeed). No
     driver exists in mainline or in the Bonstra fork. Not wired into
     ``ls1024a-wdmycloud.dts``; the system currently has no persistent
-    clock source and would need NTP after boot (as the old kernel's
-    boot log shows: "Warning: Invalid RTC value so initializing it").
+    clock source and needs NTP after boot (as the old kernel's boot
+    log shows: "Warning: Invalid RTC value so initializing it") --
+    confirmed on real hardware, boot always starts at a fixed
+    build-date-ish time before NTP corrects it.
+
+    This board has no RTC backup battery, so even a working c2k-rtc
+    driver would not retain time across power loss -- NTP-after-boot
+    is the correct permanent behavior here, not a stopgap. Writing
+    this driver is low priority.
 
 Board LEDs
     ``drivers/leds/leds-wd.c`` in the old 3.2.26 tree drives these
@@ -108,7 +115,10 @@ PCIe
     Stage 1 plan had already happened in the fork's own v6.2-era copy
     of this file). It is not wired into ``ls1024a-wdmycloud.dts``:
     the old kernel's boot log shows "PCIe0: Link Up Failed" with
-    nothing physically connected on this board.
+    nothing physically connected on this board -- consistent with
+    this SKU not exposing a usable PCIe slot/device at all, so this
+    is treated as not applicable to this board rather than a pending
+    port item.
 
 Power button
     "Button VAR: btn_status" appears in the barebox boot log and as a
