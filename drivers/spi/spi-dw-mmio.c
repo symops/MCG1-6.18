@@ -7,6 +7,7 @@
 
 #include <linux/clk.h>
 #include <linux/err.h>
+#include <linux/interrupt.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
@@ -340,9 +341,22 @@ static int dw_spi_mmio_probe(struct platform_device *pdev)
 
 	dws->paddr = mem->start;
 
-	dws->irq = platform_get_irq(pdev, 0);
+	/*
+	 * The interrupt is conventionally optional: a controller instance
+	 * whose DT node omits it falls back to polling
+	 * (dw_spi_poll_transfer(), already the correct/supported mode for
+	 * a device wired to the controller's native chip-select -- see the
+	 * comment on that function about IRQ-driven transfers not working
+	 * well with native CS due to automatic CS assertion/de-assertion).
+	 * spi-dw-bt1.c hardcodes IRQ_NOTCONNECTED unconditionally for the
+	 * same underlying reason; this just makes it DT-selectable instead
+	 * of always-off for this glue driver's platforms.
+	 */
+	dws->irq = platform_get_irq_optional(pdev, 0);
+	if (dws->irq < 0 && dws->irq != -ENXIO)
+		return dws->irq;
 	if (dws->irq < 0)
-		return dws->irq; /* -ENXIO */
+		dws->irq = IRQ_NOTCONNECTED;
 
 	dwsmmio->clk = devm_clk_get_enabled(&pdev->dev, NULL);
 	if (IS_ERR(dwsmmio->clk))

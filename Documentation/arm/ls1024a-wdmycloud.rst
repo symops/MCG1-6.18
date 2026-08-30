@@ -517,7 +517,48 @@ reintroducing a hang for a different reason. If the flash now probes
 without hanging but reports a wrong/garbled ID or read errors (not a
 hang -- a normal probe-failure message), that is almost certainly the
 missing GPIO-CS workaround, and finding this board's real CS GPIO is
-the next step. Not yet re-tested on hardware.
+the next step.
+
+The pinctrl fix above was **not sufficient** -- second real-hardware
+attempt hung identically, same point, same message, twice in a row.
+Real root cause found by reading ``drivers/spi/spi-dw-core.c``'s own
+source comment on ``dw_spi_poll_transfer()``::
+
+    Note this method the same way as the IRQ-based transfer won't work
+    well for the SPI devices connected to the controller with native CS
+    due to the automatic CS assertion/de-assertion.
+
+That is precisely tsx31's "shallow FIFO releases CS too early" problem
+restated from the driver's own side, and it's *unconditional for
+IRQ-driven transfers*, independent of pinctrl. ``ls_spi`` has an
+``interrupts`` property, so ``spi-dw-mmio.c`` always took the
+interrupt-driven path (``dws->irq != IRQ_NOTCONNECTED``) rather than
+the polling path that comment recommends -- and that MMIO glue driver
+treats ``platform_get_irq()`` as mandatory, with no way to opt into
+polling via DT as-is.
+
+Cross-checked against WD's own bootloader source (also GPL, bundled
+alongside the kernel source as ``barebox-2011.06.0``):
+``arch/arm/boards/comcerto-asic/c2k_asic.c`` names this exact chip
+("S25FL064A", chip_select 0, mode ``SPI_CPOL | SPI_CPHA``, 4 MHz --
+matching what's already in our flash node) driven by
+``drivers/spi/c2k_spi.c``, a Mindspeed-proprietary, **polling-only**
+driver with no GPIO chip-select anywhere in it (chip select is a pure
+register write, ``ser = 1 << chip_select``). This confirms natively:
+polling + native CS is not a workaround, it's what this hardware
+actually wants -- barebox has been doing exactly that successfully on
+every single boot in this whole project.
+
+Fix: made the interrupt genuinely optional in ``spi-dw-mmio.c``
+(``platform_get_irq_optional()``, falling back to
+``IRQ_NOTCONNECTED`` -- the same value ``drivers/spi/spi-dw-bt1.c``
+hardcodes unconditionally for a different SoC with this same
+limitation, just made DT-selectable here instead of always-off), then
+``/delete-property/ interrupts;`` on ``&ls_spi`` in
+``ls1024a-wdmycloud.dts`` only -- other boards/nodes using this driver
+keep interrupt-driven behavior unaffected. Confirmed in the compiled
+dtb (``fdtget ... interrupts`` now reports ``FDT_ERR_NOTFOUND``, as
+intended). Not yet re-tested on hardware.
 
 Toolchain note
 ==============
