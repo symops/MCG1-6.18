@@ -204,9 +204,15 @@ is a build-time step::
         arch/arm/boot/dts/nxp/ls/ls1024a-wdmycloud.dtb \
         > arch/arm/boot/zImage-w-dtb
     mkimage -A arm -O linux -T kernel -C none \
-        -a 0x0F008000 -e 0x0F008000 \
+        -a 0x00008000 -e 0x00008000 \
         -n "Linux-6.18.46-ls1024a-wdmycloud" \
         -d arch/arm/boot/zImage-w-dtb arch/arm/boot/uImage
+
+(Load address history: earlier builds used ``0x0F008000`` -- the
+address the original 3.2.26 ``uImage`` was built with -- on the
+assumption that matching it made no difference for a DT kernel. It
+does: see "Second CPU core / missing 128 MiB of RAM" below for why
+that address was actually wrong for this kernel and had to change.)
 
 (plain ``make uImage`` still works and stays useful for a quick build
 sanity check -- it just isn't the artifact to flash on this board.)
@@ -343,6 +349,76 @@ the kernel-boot work above:
   on disc ... failed!`` (fsck's own diagnostic banner, filesystem
   itself reports clean either time) and an ``/etc/mtab`` symlink
   warning -- cosmetic, not investigated yet.
+- Only CPU0 is online (``htop`` shows CPU1 permanently offline). See
+  next section -- root-caused and fixed.
+
+Second CPU core / missing 128 MiB of RAM
+===========================================
+
+The oops from the fourth attempt (see the SMP-guard section above)
+was patched by skipping secondary-CPU bring-up whenever
+``CPU_VECTORS_PHYS`` (physical address 0) isn't backed by RAM. That
+made the kernel stop crashing, but it begged the question: *why*
+isn't physical address 0 real RAM here, when the old 3.2.26 vendor
+driver (``arch/arm/mach-comcerto/platsmp.c``, ``boot_secondary()``)
+writes CPU1's reset vector to that exact same address and it works
+fine on this same board? Checking the old kernel's own boot log
+answers it directly::
+
+    [    0.000000] Memory: 44MB 192MB = 236MB total
+
+Two banks. Physical address 0 *is* real, populated RAM -- roughly a
+44 MiB bank starting near 0, plus a ~192 MiB bank higher up. Our
+kernel's own boot log shows only the upper bank::
+
+    OF: fdt: Ignoring memory range 0x0 - 0x8000000
+    Early memory node ranges
+      node   0: [mem 0x0000000008000000-0x000000000fffffff]
+
+Tracing why: ``CONFIG_ARM_ATAG_DTB_COMPAT`` imports memory banks from
+barebox's real ATAGs into the appended DTB at boot time
+(``arch/arm/boot/compressed/atags_to_fdt.c``) -- that part is working
+correctly and *is* passing both banks through. The drop happens later,
+in ``drivers/of/fdt.c:early_init_dt_add_memory_arch()``, which clips
+any bank starting below ``MIN_MEMBLOCK_ADDR`` (== ``PHYS_OFFSET``) --
+and ``PHYS_OFFSET`` here is not derived from the memory banks at all.
+It's set in ``arch/arm/kernel/head.S`` as ``__pa(_text)``: wherever the
+*decompressed* kernel physically ends up running from.
+
+That placement, in turn, is decided earlier still, in the
+self-decompressing stub (``arch/arm/boot/compressed/head.S``, guarded
+by ``CONFIG_AUTO_ZRELADDR=y``, which this defconfig has)::
+
+    mov  r0, pc
+    and  r0, r0, #0xf8000000   @ round down to a 128 MiB boundary
+
+i.e. the decompressor takes wherever it's currently executing from and
+rounds down to the nearest 128 MiB boundary -- that becomes the
+kernel's final physical home, independent of where the *compressed*
+zImage payload itself was loaded, *except* for which 128 MiB window
+that load address falls into. Builds up to this point used
+``LOADADDR=0x0F008000`` (matching the old 3.2.26 image, on the
+assumption it wouldn't matter for a DT kernel). ``0x0F008000 &
+0xf8000000 = 0x08000000`` -- exactly the cutoff seen in the "Ignoring
+memory range" line above. The kernel was quite literally deciding to
+live in the *upper* bank and, by that same stroke, permanently
+excluding the lower one from its own linear memory map -- which is
+also why ``memblock_is_memory(0)`` correctly reported "no" and the
+SMP guard correctly (if only symptomatically) kicked in.
+
+Fix: build with ``LOADADDR=0x00008000`` (and matching ``-e``) instead
+-- see the appended-DTB build command above. ``0x00008000 &
+0xf8000000 = 0x0``, so the kernel settles at the true start of RAM,
+both banks stay in the memory map, ``memblock_is_memory(0)`` now
+correctly returns true, and the original (unguarded) vector-write
+path in ``platsmp.c`` -- the same one the 3.2.26 driver uses -- works
+without needing its own special case. Also recovers the missing ~128
+MiB of RAM (matches the old kernel's "236 MB total" report much more
+closely than the ~128 MiB this kernel could see before). The
+``memblock_is_memory()`` guard in ``platsmp.c`` is left in place as a
+defensive check -- it's a no-op once the memory map is correct, and a
+useful safety net if a future defconfig change reintroduces the
+wrong-bank scenario. Not yet re-tested on hardware.
 
 None of these block reaching a working shell. Stage 2 (as scoped) is
 done: this kernel boots the real rootfs on the real board over

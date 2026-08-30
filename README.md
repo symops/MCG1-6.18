@@ -29,7 +29,7 @@ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- ls1024a_defconfig
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= zImage dtbs modules
 cat arch/arm/boot/zImage arch/arm/boot/dts/nxp/ls/ls1024a-wdmycloud.dtb \
     > arch/arm/boot/zImage-w-dtb
-mkimage -A arm -O linux -T kernel -C none -a 0x0F008000 -e 0x0F008000 \
+mkimage -A arm -O linux -T kernel -C none -a 0x00008000 -e 0x00008000 \
     -n "Linux-6.18.46-ls1024a-wdmycloud" \
     -d arch/arm/boot/zImage-w-dtb arch/arm/boot/uImage
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= \
@@ -74,10 +74,10 @@ against real hardware, in order:
    next two.
 4. `arch/arm/mach-ls1024a/platsmp.c` wrote the Cortex-A9 secondary-CPU
    reset vector via `phys_to_virt(0)`, assuming physical address 0 is
-   real RAM. On this board RAM starts at `0x08000000`, so that
-   produced an unmapped pointer and oopsed. Guarded with
-   `memblock_is_memory()`; falls back to single-CPU boot instead of
-   crashing.
+   real RAM. It oopsed because the kernel's memory map didn't include
+   physical address 0 at boot time -- see item 7 for why. Guarded with
+   `memblock_is_memory()` as defense in depth; falls back to
+   single-CPU boot instead of crashing if this ever recurs.
 5. This SoC's AHCI HBA reads back `PORTS_IMPLEMENTED = 0` from
    hardware no matter how many ports exist (the old 3.2.26 driver
    forced this too) -- added `ports-implemented = <0x3>;` to the SATA
@@ -86,6 +86,18 @@ against real hardware, in order:
    turns out to be genuinely correct (verified against a live boot log
    of the real Devuan install) -- enabled `CONFIG_MD`/`BLK_DEV_MD`/
    `MD_RAID1`.
+7. Physical address 0 *is* real RAM on this board (the old kernel
+   reports "Memory: 44MB 192MB = 236MB total" -- two banks, one
+   starting near 0) and `CONFIG_ARM_ATAG_DTB_COMPAT` correctly imports
+   both from barebox's ATAGs. But `CONFIG_AUTO_ZRELADDR` places the
+   decompressed kernel (and hence `PHYS_OFFSET`) by rounding the
+   *load* address down to a 128 MiB boundary -- with the old
+   `LOADADDR=0x0F008000`, that lands on `0x08000000`, so the lower
+   bank gets silently excluded from the kernel's own memory map (hence
+   item 4's oops, and only ~128 MiB usable). Building with
+   `LOADADDR=0x00008000` instead rounds to `0x0`, recovers the full
+   ~236 MiB, and lets secondary-CPU bring-up work without needing
+   item 4's guard to trigger at all.
 
 See `Documentation/arm/ls1024a-wdmycloud.rst` for the full writeup of
 each, plus what's still not working post-boot (networking, LEDs --
