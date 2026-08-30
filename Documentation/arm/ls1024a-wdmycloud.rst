@@ -1142,7 +1142,24 @@ one ``exec_op()`` call -- to additionally clamp against
 ``DW_SPI_NO_EEPROM_READ_BUF_SIZE - cmd_len`` when ``no_eeprom_read``
 is set, so an oversized request gets automatically split into
 multiple calls that each fit, instead of erroring out on whichever one
-doesn't. Not yet re-tested on hardware.
+doesn't.
+
+Nineteenth attempt: **fully confirmed**. Dozens of consecutive 512-byte
+reads at increasing addresses (``0x0``, ``0x200``, ``0x400``, ... up to
+at least ``0x9200``), every single one ``ret=0`` with the correct
+``cap_len=516``, no errors, no hangs -- and ``dd`` itself completed
+cleanly::
+
+    74+0 records in
+    73+0 records out
+    37376 bytes (37 kB, 36 KiB) copied, 1.51 s, 24.8 kB/s
+
+This closes out the SPI-NOR boot flash saga: pinctrl, chip-select
+timing, the EEPROM-read hardware erratum, the write-then-read
+phase-boundary timing sensitivity, and buffer sizing were each real,
+independent issues on this specific controller/chip/board combination,
+and all are now fixed. ``/dev/mtd0`` reads reliably and repeatedly on
+real hardware, not just as a one-shot probe.
 
 Toolchain note
 ==============

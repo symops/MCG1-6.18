@@ -139,10 +139,18 @@ both already expected/tracked below).
   exact unit match `ls1024a.dtsi` closely enough that it is almost
   certainly the same reference design). Enables UART1 (console), AHCI
   SATA, USB3 (dwc3 + PHY), both DesignWare SPI controllers, I2C, and
-  the boot/env SPI-NOR flash (`S25FL064A`, 8 MiB, identified via
-  barebox's own `devinfo` -- same chip barebox itself boots from) --
-  everything confirmed present in that boot log or barebox's device
-  list.
+  the boot/env SPI-NOR flash (actual chip: Winbond `w25x40`, 512 KiB
+  -- barebox's own vendor driver calls it "S25FL064A"/Spansion, a
+  stale device name from a BOM second-source substitution that was
+  never updated; the real JEDEC ID was read and confirmed live on
+  hardware) -- everything confirmed present in that boot log or
+  barebox's device list. `/dev/mtd0` reads reliably on real hardware
+  (`dd if=/dev/mtd0 ...` tested over many consecutive reads) after
+  fixing a chain of controller-specific quirks in `drivers/spi/
+  spi-dw-*.c` -- see `Documentation/arm/ls1024a-wdmycloud.rst`,
+  "SPI-NOR boot flash access from Linux", for the full story (missing
+  pinctrl, a broken EEPROM-read hardware mode, chip-select timing
+  across the command/data phase boundary, and scratch-buffer sizing).
 - **`arch/arm/configs/ls1024a_defconfig`** -- the config this was all
   built and verified against.
 - **`Documentation/arm/ls1024a-wdmycloud.rst`** -- longer-form porting
