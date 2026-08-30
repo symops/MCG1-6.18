@@ -543,8 +543,28 @@ static void dw_spi_handle_err(struct spi_controller *host,
 
 static int dw_spi_adjust_mem_op_size(struct spi_mem *mem, struct spi_mem_op *op)
 {
+	struct dw_spi *dws = spi_controller_get_devdata(mem->spi->controller);
+
 	if (op->data.dir == SPI_MEM_DATA_IN)
 		op->data.nbytes = clamp_val(op->data.nbytes, 0, DW_SPI_NDF_MASK + 1);
+
+	if (dws->no_eeprom_read && op->data.dir == SPI_MEM_DATA_IN) {
+		/*
+		 * dw_spi_write_then_read() captures the whole command+data
+		 * phase into a single fixed-size scratch buffer (see its
+		 * no_eeprom_read handling) -- cap the data length so the
+		 * combined size always fits, letting the spi-mem core split
+		 * an oversized request (e.g. a multi-KiB MTD read) into
+		 * multiple exec_op() calls that each do instead of us
+		 * erroring out on the first one that doesn't fit.
+		 */
+		unsigned int cmd_len = op->cmd.nbytes + op->addr.nbytes +
+					op->dummy.nbytes;
+		unsigned int max_data = (cmd_len < DW_SPI_NO_EEPROM_READ_BUF_SIZE) ?
+					 DW_SPI_NO_EEPROM_READ_BUF_SIZE - cmd_len : 0;
+
+		op->data.nbytes = clamp_val(op->data.nbytes, 0, max_data);
+	}
 
 	return 0;
 }
@@ -702,7 +722,7 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 	 * transfer is over.
 	 */
 	if (dws->no_eeprom_read && dws->rx_len) {
-		if (cmd_len + dws->rx_len > DW_SPI_BUF_SIZE) {
+		if (cmd_len + dws->rx_len > DW_SPI_NO_EEPROM_READ_BUF_SIZE) {
 			ret = -EIO;
 			goto out;
 		}

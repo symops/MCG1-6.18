@@ -1104,7 +1104,45 @@ bytes out to the caller's actual buffer once the whole capture loop
 has finished. The dummy-byte push budget stays at ``rx_len`` (not
 ``cmd_len + rx_len``): the command phase's clock cycles already
 happened, driven by the opcode bytes themselves; only the data phase
-needs manually-driven dummy bytes. Not yet re-tested on hardware.
+needs manually-driven dummy bytes.
+
+Eighteenth attempt: **success**. JEDEC ID matches ``w25x40``, the chip
+probes cleanly (no SFDP fallback attempt even needed -- matched on the
+first try), and ``/dev/mtd0``, ``/dev/mtd0ro``, ``/dev/mtdblock0`` all
+show up. Confirmed interactively::
+
+    root@MCG1-Devuan:~# ls /dev/mtd
+    mtd0       mtd0ro     mtdblock0
+
+Trying to actually dump the flash (``dd if=/dev/mtd0 of=/mnt/111.img
+status=progress``, no explicit block size -- ``dd`` defaults to 512
+bytes) failed immediately::
+
+    exec_mem_op: enter opcode=0x3 addr.nbytes=3 ... data.nbytes=512
+    wtr: done ret=-5 cmd_len=4 ... cap_len=0 ...
+    dd: error reading '/dev/mtd0': Input/output error
+
+This is opcode ``0x03`` (plain READ), ``cmd_len`` (opcode + 3 address
+bytes) ``= 4``, wanting 512 data bytes -- ``4 + 512 = 516``, over the
+scratch buffer's previous 265-byte size (``DW_SPI_BUF_SIZE``, sized
+for a bare command -- opcode + address + 256 -- never meant to also
+hold an entire data phase). ``cap_len=0`` and the immediate ``-EIO``
+is this driver's own new overflow guard correctly refusing to overrun
+a buffer that size, not a hardware failure.
+
+Split the scratch buffer's sizing out from ``DW_SPI_BUF_SIZE`` (a
+generic constant also used for the plain command-building buffer, not
+board-specific to touch) into its own
+``DW_SPI_NO_EEPROM_READ_BUF_SIZE`` (4096 + 64 bytes -- comfortably
+covers observed 512-byte MTD reads with headroom for a full 4 KiB
+block), and resized ``no_eeprom_read_buf`` to match. Also taught
+``dw_spi_adjust_mem_op_size()`` -- the ``spi-mem`` core's own hook for
+clamping an operation's data length to what the controller can do in
+one ``exec_op()`` call -- to additionally clamp against
+``DW_SPI_NO_EEPROM_READ_BUF_SIZE - cmd_len`` when ``no_eeprom_read``
+is set, so an oversized request gets automatically split into
+multiple calls that each fit, instead of erroring out on whichever one
+doesn't. Not yet re-tested on hardware.
 
 Toolchain note
 ==============

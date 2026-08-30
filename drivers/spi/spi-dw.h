@@ -126,6 +126,16 @@
 #define DW_SPI_BUF_SIZE \
 	(sizeof_field(struct spi_mem_op, cmd.opcode) + \
 	 sizeof_field(struct spi_mem_op, addr.val) + 256)
+/*
+ * Separate, larger size for no_eeprom_read_buf: DW_SPI_BUF_SIZE (above)
+ * only needs to cover a command's own opcode+address+dummy bytes, but
+ * this scratch buffer also has to hold an entire combined command+data
+ * capture in one piece (see dw_spi_write_then_read()) -- observed real
+ * MTD reads (plain `dd` from /dev/mtd0, no explicit block size) request
+ * 512 data bytes at a time. Sized generously for up to a 4 KiB data
+ * phase plus command-phase headroom.
+ */
+#define DW_SPI_NO_EEPROM_READ_BUF_SIZE (4096 + 64)
 #define DW_SPI_GET_BYTE(_val, _idx) \
 	((_val) >> (BITS_PER_BYTE * (_idx)) & 0xff)
 
@@ -210,7 +220,7 @@ struct dw_spi {
 	 * dw_spi_write_then_read()), then the real data is copied out to
 	 * the caller's actual buffer afterwards.
 	 */
-	u8			no_eeprom_read_buf[DW_SPI_BUF_SIZE];
+	u8			no_eeprom_read_buf[DW_SPI_NO_EEPROM_READ_BUF_SIZE];
 	int			dma_mapped;
 	u8			n_bytes;	/* current is a 1/2 bytes op */
 	irqreturn_t		(*transfer_handler)(struct dw_spi *dws);
