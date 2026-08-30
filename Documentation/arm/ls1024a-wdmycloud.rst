@@ -440,6 +440,54 @@ None of these block reaching a working shell. Stage 2 (as scoped) is
 done: this kernel boots the real rootfs on the real board over
 serial.
 
+SPI-NOR boot flash access from Linux
+=======================================
+
+barebox itself lives on, and stores its environment on, a SPI-NOR
+flash chip -- visible in its own boot log ("``c2k_spi_probe``",
+"``Using ENV from SPI Flash``") but never exposed to Linux in any of
+the vendor's board files (``board-c2kasic.c``'s ``spi_board_info``
+table only describes VoIP-reference-design peripherals -- ``proslic``,
+``legerity`` -- that don't exist on this product; it looks like an
+unmodified copy of Mindspeed's generic reference design).
+
+Identified via barebox's own ``devinfo`` on real hardware: the chip is
+attached as ``S25FL064A0`` under ``c2k_spi0`` (the *low-speed*
+DesignWare SPI controller -- ``c2k_fast_spi`` is a separate driver in
+the same listing, confirming this is ``ls_spi``
+(``spi@90498000``), not ``hs_spi``). ``S25FL064A`` is a Spansion/Cypress
+8 MiB SPI-NOR part old enough to predate SFDP; it matches upstream
+``drivers/mtd/spi-nor/spansion.c``'s ``"s25sl064a"`` entry exactly
+(3-byte JEDEC ID ``01 02 16``). Added as a child of ``&ls_spi`` in
+``ls1024a-wdmycloud.dts``::
+
+    &ls_spi {
+        status = "okay";
+        flash@0 {
+            compatible = "spansion,s25sl064a", "jedec,spi-nor";
+            reg = <0>;
+            spi-max-frequency = <20000000>;
+        };
+    };
+
+``CONFIG_MTD``, ``CONFIG_MTD_SPI_NOR``, ``CONFIG_MTD_BLOCK`` and
+``CONFIG_SPI_DESIGNWARE`` were already enabled in ``ls1024a_defconfig``
+(inherited from ``multi_v7_defconfig``), so no config change was
+needed -- should show up as ``/dev/mtd0`` once booted. ``dtc`` prints
+two harmless ``spi_bus_bridge``/``spi_bus_reg`` warnings when building
+this dtb; they're a false positive from an unrelated pinctrl pin-group
+subnode in ``ls1024a.dtsi`` that happens to be named ``spi`` (not an
+actual SPI bus), tripping dtc's name-based heuristic -- unrelated to
+this flash node, which compiles into the dtb correctly (verified with
+``dtc -I dtb -O dts``). Not yet tested on hardware.
+
+**Caution:** this is the same chip barebox boots from and stores its
+environment on. Read access (dumping/verifying) is safe; before
+writing anything back to it, back up the existing contents first
+(``dd if=/dev/mtd0 of=backup.bin``) -- a bad write here risks the
+bootloader itself, unlike the kernel-partition mistakes elsewhere in
+this project which just needed a reflash.
+
 Toolchain note
 ==============
 

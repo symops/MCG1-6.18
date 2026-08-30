@@ -138,8 +138,11 @@ both already expected/tracked below).
   the peripheral MMIO addresses captured from a live boot log on this
   exact unit match `ls1024a.dtsi` closely enough that it is almost
   certainly the same reference design). Enables UART1 (console), AHCI
-  SATA, USB3 (dwc3 + PHY), both DesignWare SPI controllers, and I2C --
-  everything confirmed present in that boot log.
+  SATA, USB3 (dwc3 + PHY), both DesignWare SPI controllers, I2C, and
+  the boot/env SPI-NOR flash (`S25FL064A`, 8 MiB, identified via
+  barebox's own `devinfo` -- same chip barebox itself boots from) --
+  everything confirmed present in that boot log or barebox's device
+  list.
 - **`arch/arm/configs/ls1024a_defconfig`** -- the config this was all
   built and verified against.
 - **`Documentation/arm/ls1024a-wdmycloud.rst`** -- longer-form porting
