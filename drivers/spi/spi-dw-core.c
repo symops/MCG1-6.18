@@ -624,12 +624,25 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 	unsigned int tx_len0, rx_len0;
 	unsigned int tx_iters, rx_iters;
 	unsigned int tx_pushed;
+	unsigned int flushed = 0;
+	int ret = 0;
 
-	dev_info(&dws->host->dev, "wtr: enter tx_len=%u rx_len=%u fifo_len=%u "
-		"SR=0x%x SSIENR=0x%x SER=0x%x\n",
-		dws->tx_len, dws->rx_len, dws->fifo_len,
-		dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_SSIENR),
-		dw_readl(dws, DW_SPI_SER));
+	/*
+	 * No tracing anywhere below this point until the transfer is fully
+	 * complete or has failed: an earlier version of this function had
+	 * dev_info() calls between every phase (prefill/CS-assert/Tx-done/
+	 * Rx-done/etc), and consistently got mechanically perfect transfers
+	 * (right byte counts, no hang, no overflow) that nonetheless
+	 * returned all-zero data. barebox's own driver for this exact chip
+	 * (drivers/spi/c2k_spi_common.c, do_write_read_transfer()) does the
+	 * equivalent write-then-read as two tight back-to-back loops with
+	 * *zero* logging or delay anywhere in between. This SPI-NOR part is
+	 * old and simple enough that a real timing gap between the command
+	 * and data phases -- like the one a synchronous, 115200-baud
+	 * early-console printk() genuinely introduces -- may be exactly
+	 * what was corrupting the response. Diagnostics are now only at
+	 * entry (in dw_spi_exec_mem_op()) and after this function returns.
+	 */
 
 	/*
 	 * At initial stage we just pre-fill the Tx FIFO in with no rush,
@@ -641,9 +654,6 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 	while (len--)
 		dw_write_io_reg(dws, DW_SPI_DR, *buf++);
 
-	dev_info(&dws->host->dev, "wtr: prefilled, SR=0x%x TXFLR=0x%x\n",
-		dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_TXFLR));
-
 	/*
 	 * After setting any bit in the SER register the transmission will
 	 * start automatically. We have to keep up with that procedure
@@ -654,96 +664,34 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 	tx_len0 = len;
 	dw_spi_set_cs(spi, false);
 
-	dev_info(&dws->host->dev, "wtr: CS asserted, remaining tx len=%u "
-		"SR=0x%x SER=0x%x TXFLR=0x%x\n",
-		len, dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_SER),
-		dw_readl(dws, DW_SPI_TXFLR));
-
 	tx_iters = 0;
 	while (len) {
 		entries = readl_relaxed(dws->regs + DW_SPI_TXFLR);
 		if (!entries) {
-			dev_err(&dws->host->dev, "CS de-assertion on Tx\n");
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
 		room = min(dws->fifo_len - entries, len);
 		for (; room; --room, --len)
 			dw_write_io_reg(dws, DW_SPI_DR, *buf++);
 		if (len && ++tx_iters > 2000000) {
-			dev_err(&dws->host->dev,
-				"wtr: Tx loop timeout after %u iters, "
-				"tx_len0=%u remaining=%u "
-				"SR=0x%x RISR=0x%x TXFLR=0x%x RXFLR=0x%x\n",
-				tx_iters, tx_len0, len,
-				dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
-				dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR));
-			return -ETIMEDOUT;
+			ret = -ETIMEDOUT;
+			goto out;
 		}
 	}
 
-	dev_info(&dws->host->dev, "wtr: Tx done, rx_len=%u "
-		"SR=0x%x RXFLR=0x%x\n",
-		dws->rx_len, dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RXFLR));
-
 	if (dws->no_eeprom_read) {
 		/*
-		 * Full duplex means every clock we spent on the command
-		 * phase (the opcode prefill above, before this point)
-		 * *also* shifted a byte into Rx -- garbage, since the chip
-		 * hadn't started responding yet. In real EEPROM-read mode
-		 * the hardware's own command/data phase separation means
-		 * this never reaches software; here it's sitting in the Rx
-		 * FIFO right now, and would otherwise become a spurious
-		 * byte 0 in the result, shifting every real data byte down
-		 * by one (and losing the last one, since we only capture
-		 * rx_len total). Drain and discard it before reading real
-		 * data.
+		 * Full duplex means every clock spent on the command phase
+		 * (the opcode transmission just above) also shifted a byte
+		 * into Rx -- garbage, since the chip hadn't started
+		 * responding yet. Drain and discard it before reading real
+		 * data, or it becomes a spurious byte 0, shifting every
+		 * real data byte down by one (and losing the last one).
 		 */
-		u32 flushed = 0;
-
 		while ((entries = readl_relaxed(dws->regs + DW_SPI_RXFLR))) {
 			for (; entries; --entries, ++flushed)
 				dw_read_io_reg(dws, DW_SPI_DR);
-		}
-		if (flushed)
-			dev_info(&dws->host->dev,
-				"wtr: flushed %u garbage Rx byte(s) from "
-				"command phase\n", flushed);
-
-		/*
-		 * Switch the controller from TMOD_TO (used for the opcode
-		 * phase just completed above) to TMOD_RO for the data
-		 * phase, matching barebox's own driver for this chip, which
-		 * reconfigures CTRLR0 between its WRITE_ONLY and READ_ONLY
-		 * sub-transfers the same way (c2k_spi.c in the vendor GPL
-		 * source). dw_spi_update_config() also (re)writes
-		 * CTRLR1/ndf for TMOD_RO.
-		 */
-		if (dws->rx_len) {
-			struct dw_spi_cfg rd_cfg = *cfg;
-
-			/*
-			 * CTRLR0 (which carries TMOD) is documented across
-			 * the DW SSI family as only safely changeable while
-			 * SSIENR is 0 -- confirmed necessary here: an earlier
-			 * attempt at this same switch without disabling
-			 * first resulted in *zero* Rx bytes ever arriving
-			 * (worse than the plain-TMOD_TR attempt, which at
-			 * least got the command-phase garbage byte), meaning
-			 * the reconfigure wasn't actually taking effect.
-			 * barebox's own driver also always disables
-			 * (SSIENR=0) before writing a new CTRLR0.
-			 */
-			dw_spi_enable_chip(dws, 0);
-			rd_cfg.tmode = DW_SPI_CTRLR0_TMOD_RO;
-			rd_cfg.ndf = dws->rx_len;
-			dw_spi_update_config(dws, spi, &rd_cfg);
-			dw_spi_enable_chip(dws, 1);
-			dev_info(&dws->host->dev,
-				"wtr: switched to TMOD_RO for data phase, "
-				"ndf=%u SSIENR=0x%x SER=0x%x\n",
-				rd_cfg.ndf, dw_readl(dws, DW_SPI_SSIENR),
-				dw_readl(dws, DW_SPI_SER));
 		}
 	}
 
@@ -758,53 +706,37 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 	rx_iters = 0;
 	tx_pushed = 0;
 	while (len) {
-		if (dws->no_eeprom_read && tx_pushed == 0) {
+		if (dws->no_eeprom_read && tx_pushed < rx_len0) {
 			/*
-			 * TMOD_RO on this controller apparently still needs
-			 * a nudge to start the clock (exactly matching
-			 * barebox's own driver for this chip -- see
-			 * do_read_only_transfer8() in the vendor GPL source,
-			 * "writew(0, dr); /* start the serial clock *|/" --
-			 * one dummy word, once, then pure Rx draining, no
-			 * further Tx pushes). Unlike the earlier TMOD_TR
-			 * attempt, this relies on TMOD_RO's own hardware
-			 * auto-continue (NDF-driven, same CTRLR1 mechanism
-			 * TMOD_EPROMREAD uses -- see dw_spi_update_config())
-			 * for the rest of the bytes, on the theory that only
-			 * EEPROM-read's specific auto-continue logic is
-			 * broken on this silicon, not RO's.
+			 * EEPROM-read's hardware auto-continue doesn't work
+			 * on this controller -- manually drive the clock by
+			 * pushing dummy 0x00 bytes for however much Tx FIFO
+			 * room is available. Budget against
+			 * rx_len0 - tx_pushed (total pushed so far), not
+			 * against len (remaining to *read*): TXFLR reflects
+			 * only what's currently queued and drains on its
+			 * own, so sizing against len would let an
+			 * already-pushed-but-since-drained slot look free
+			 * again and push more dummy bytes than rx_len needs,
+			 * overflowing the Rx FIFO.
 			 */
-			dw_write_io_reg(dws, DW_SPI_DR, 0);
-			tx_pushed = 1;
+			entries = readl_relaxed(dws->regs + DW_SPI_TXFLR);
+			room = min3(dws->fifo_len - entries, len,
+				    rx_len0 - tx_pushed);
+			for (; room; --room, ++tx_pushed)
+				dw_write_io_reg(dws, DW_SPI_DR, 0);
 		}
 
 		entries = readl_relaxed(dws->regs + DW_SPI_RXFLR);
 		if (!entries) {
 			sts = readl_relaxed(dws->regs + DW_SPI_RISR);
 			if (sts & DW_SPI_INT_RXOI) {
-				dev_err(&dws->host->dev, "FIFO overflow on Rx\n");
-				return -EIO;
+				ret = -EIO;
+				goto out;
 			}
-			rx_iters++;
-			if ((rx_iters & 0xfffff) == 0)
-				dev_info(&dws->host->dev,
-					"wtr: Rx loop still waiting, iters=%u "
-					"remaining=%u SR=0x%x RISR=0x%x "
-					"TXFLR=0x%x RXFLR=0x%x\n",
-					rx_iters, len,
-					dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
-					dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR));
-			if (rx_iters > 4000000) {
-				dev_err(&dws->host->dev,
-					"wtr: Rx loop timeout after %u iters, "
-					"rx_len0=%u remaining=%u "
-					"SR=0x%x RISR=0x%x TXFLR=0x%x RXFLR=0x%x "
-					"SSIENR=0x%x SER=0x%x\n",
-					rx_iters, rx_len0, len,
-					dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
-					dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR),
-					dw_readl(dws, DW_SPI_SSIENR), dw_readl(dws, DW_SPI_SER));
-				return -ETIMEDOUT;
+			if (++rx_iters > 4000000) {
+				ret = -ETIMEDOUT;
+				goto out;
 			}
 			continue;
 		}
@@ -813,9 +745,15 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 			*buf++ = dw_read_io_reg(dws, DW_SPI_DR);
 	}
 
-	dev_info(&dws->host->dev, "wtr: Rx done\n");
+out:
+	dev_info(&dws->host->dev, "wtr: done ret=%d tx_len0=%u rx_len0=%u "
+		"flushed=%u tx_iters=%u rx_iters=%u SR=0x%x RISR=0x%x "
+		"TXFLR=0x%x RXFLR=0x%x\n",
+		ret, tx_len0, dws->rx_len, flushed, tx_iters, rx_iters,
+		dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
+		dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR));
 
-	return 0;
+	return ret;
 }
 
 static inline bool dw_spi_ctlr_busy(struct dw_spi *dws)
@@ -889,36 +827,24 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	if (ret)
 		return ret;
 
-	dev_info(&dws->host->dev, "exec_mem_op: init_mem_buf done, "
-		"tx_len=%u rx_len=%u\n", dws->tx_len, dws->rx_len);
-
 	/*
 	 * DW SPI EEPROM-read mode is required only for the SPI memory Data-IN
 	 * operation. Transmit-only mode is suitable for the rest of them.
+	 *
+	 * TMOD_EPROMREAD's hardware auto-continue is broken on this
+	 * controller instance (confirmed: only ever clocks in 1 of N
+	 * requested bytes). Falling back to TMOD_TR (plain full-duplex) for
+	 * the whole operation instead -- write_then_read()'s Tx loop sends
+	 * the opcode/address/dummy bytes, then its Rx loop manually drives
+	 * dummy 0x00 bytes to clock in the rest, all in one uninterrupted
+	 * pass with no diagnostic logging in between (see the comment at
+	 * the top of write_then_read() for why that matters here).
 	 */
 	cfg.dfs = 8;
 	cfg.freq = clamp(op->max_freq, 0U, dws->max_mem_freq);
 	if (op->data.dir == SPI_MEM_DATA_IN) {
 		if (dws->no_eeprom_read) {
-			/*
-			 * EEPROM-read's hardware auto-continue is broken on
-			 * this controller instance -- use receive-only mode
-			 * instead, matching barebox's own driver for this
-			 * exact chip (drivers/spi/c2k_spi.c in the vendor
-			 * GPL source: SPI_TRANSFER_MODE_READ_ONLY, CTRLR0
-			 * TMOD field 0x2). Like barebox, use TMOD_TO
-			 * (transmit-only) for *this* initial config -- it
-			 * covers the opcode/address/dummy phase written by
-			 * write_then_read()'s Tx loop below -- and switch to
-			 * TMOD_RO only for the data phase, inside
-			 * write_then_read() itself (see its no_eeprom_read
-			 * handling). cfg.ndf is stashed here for that later
-			 * switch to reuse; dw_spi_update_config() writes
-			 * CTRLR1/ndf identically for TMOD_RO and
-			 * TMOD_EPROMREAD.
-			 */
-			cfg.tmode = DW_SPI_CTRLR0_TMOD_TO;
-			cfg.ndf = op->data.nbytes;
+			cfg.tmode = DW_SPI_CTRLR0_TMOD_TR;
 		} else {
 			cfg.tmode = DW_SPI_CTRLR0_TMOD_EPROMREAD;
 			cfg.ndf = op->data.nbytes;
@@ -927,25 +853,10 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 		cfg.tmode = DW_SPI_CTRLR0_TMOD_TO;
 	}
 
-	dev_info(&dws->host->dev, "exec_mem_op: cfg tmode=%u freq=%u "
-		"max_mem_freq=%u\n", cfg.tmode, cfg.freq, dws->max_mem_freq);
-
 	dw_spi_enable_chip(dws, 0);
-	dev_info(&dws->host->dev, "exec_mem_op: enable_chip(0) done, "
-		"SSIENR=0x%x\n", dw_readl(dws, DW_SPI_SSIENR));
-
 	dw_spi_update_config(dws, mem->spi, &cfg);
-	dev_info(&dws->host->dev, "exec_mem_op: update_config done, "
-		"current_freq=%u\n", dws->current_freq);
-
 	dw_spi_mask_intr(dws, 0xff);
-	dev_info(&dws->host->dev, "exec_mem_op: mask_intr done\n");
-
 	dw_spi_enable_chip(dws, 1);
-	dev_info(&dws->host->dev, "exec_mem_op: enable_chip(1) done, "
-		"SSIENR=0x%x SER=0x%x SR=0x%x\n",
-		dw_readl(dws, DW_SPI_SSIENR), dw_readl(dws, DW_SPI_SER),
-		dw_readl(dws, DW_SPI_SR));
 
 	/*
 	 * DW APB SSI controller has very nasty peculiarities. First originally

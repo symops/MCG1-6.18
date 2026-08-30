@@ -987,8 +987,62 @@ Added ``dw_spi_enable_chip(dws, 0)`` immediately before, and
 ``dw_spi_enable_chip(dws, 1)`` immediately after, the ``TMOD_RO``
 reconfiguration (``SER`` -- chip-select selection -- lives in a
 separate register untouched by ``dw_spi_enable_chip()``, so this
-shouldn't affect which device is selected). Not yet re-tested on
-hardware.
+shouldn't affect which device is selected).
+
+Fifteenth attempt: the transfer is now *mechanically flawless* --
+``wtr: Rx done`` with no timeout, no overflow, correct byte counts,
+``SSIENR``/``SER`` exactly as expected after the switch -- and the
+JEDEC ID is *still* all zero. At this point every register-sequencing
+theory tried so far (pinctrl, reset, IRQ vs polling, CS continuity,
+Rx-shift, FIFO overflow, TMOD_RO vs TMOD_EPROMREAD, disable-before-
+reconfigure) has been individually confirmed correct or irrelevant,
+yet the chip never returns real data.
+
+Went back to ``commands/update_spi.c`` in the vendor barebox source --
+not just *which* chip/registers it uses, but its actual read
+implementation, ``read_bytes_page_addr()`` / ``spi_copy_read()``. It
+builds *one* combined buffer -- opcode + 3 address bytes + N dummy
+zero bytes, e.g. 4+8 = 12 bytes total for its default 8-byte chunk
+size -- and calls barebox's own ``spi_write_then_read(spi, cmd_buf,
+4+N, b, 4+N)`` with **both lengths equal to the full combined size**.
+That in turn reaches ``do_write_read_transfer()``
+(``drivers/spi/c2k_spi_common.c``), which is exactly two tight
+back-to-back loops -- write all ``*wlen`` bytes, then read all
+``*rlen`` bytes -- with **zero logging or delay anywhere in the
+hot path**. The caller then discards the first 4 (command-phase
+garbage) bytes of the result, keeping only the real trailing data --
+structurally the *same* write-all-then-read-all-with-discard shape
+this driver's own ``no_eeprom_read`` path already has.
+
+That structural match, plus everything above already being ruled out,
+points at a much more mundane explanation: **the extensive
+``dev_info()`` tracing added across this whole investigation was
+itself introducing the bug.** Every one of those calls sits squarely
+inside the CS-held, timing-sensitive part of the transfer, and goes
+through the early, synchronous, 115200-baud console -- printk() on
+that path genuinely blocks for real, non-trivial time per line, once
+per register snapshot, several times per byte-phase. This 8-year-old,
+pre-SFDP SPI-NOR part plausibly can't tolerate a multi-millisecond
+pause between its command and data phases without resetting its
+internal state, silently returning nothing useful for the "corrupted"
+transaction rather than erroring out. barebox's own driver, doing the
+mechanically equivalent thing with no logging in the hot path at all,
+has no such gap.
+
+Removed *all* ``dev_info()``/``dev_err()`` calls from inside
+``dw_spi_write_then_read()`` and the register-poking part of
+``dw_spi_exec_mem_op()`` -- kept only a single entry-point trace
+(before any register writes start) and a single summary trace after
+``write_then_read()`` returns (once the transfer, successful or not,
+is already fully over). Reverted the ``TMOD_TO``/``TMOD_RO`` phase
+split back to plain ``TMOD_TR`` for the whole operation (the extra
+disable/reconfigure/enable round trip it required is itself more
+opportunity for a gap, and wasn't earning its keep once logging
+turned out to be the real problem) -- write-then-read's existing Tx
+loop, command-phase Rx flush, and Tx-budget-tracked dummy-byte Rx loop
+are structurally the same shape as barebox's proven
+write-all-then-read-all-with-discard, just without a printk in the
+middle of it this time. Not yet re-tested on hardware.
 
 Toolchain note
 ==============
