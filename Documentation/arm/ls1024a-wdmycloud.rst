@@ -701,7 +701,58 @@ controller.
 Added the same timeout+register-dump pattern used before, but this
 time in the actually-executing function -- both the Tx and Rx
 ``while`` loops in ``dw_spi_write_then_read()``, plus entry/milestone
-``dev_info()`` calls throughout. Not yet re-tested on hardware.
+``dev_info()`` calls throughout.
+
+Seventh attempt: no output from any of the ``wtr:``/``exec_mem_op:``
+tracing either. Since ``dw_spi_exec_mem_op()`` itself (before ever
+calling ``dw_spi_write_then_read()``) had no tracing yet, added it
+there too, plus the ``spi_mem_op`` fields (opcode, address, dummy
+cycles, data direction/length) at entry.
+
+Eighth attempt is the most informative one yet -- full, real trace
+output, right up to::
+
+    exec_mem_op: enter opcode=0x9f addr.nbytes=0 dummy.nbytes=0 data.dir=1 data.nbytes=6 max_freq=4000000
+    exec_mem_op: init_mem_buf done, tx_len=1 rx_len=6
+    exec_mem_op: cfg tmode=3 freq=4000000 max_mem_freq=200000000
+    exec_mem_op: enable_chip(0) done, SSIENR=0x0
+    exec_mem_op: update_config done, current_freq=4000000
+    exec_mem_op: mask_intr done
+    exec_mem_op: enable_chip(1) done, SSIENR=0x1 SER=0x0 SR=0x6
+    wtr: enter tx_len=1 rx_len=6 fifo_len=8 SR=0x6 SSIENR=0x1 SER=0x0
+    wtr: prefilled, SR=0x2 TXFLR=0x1
+    wtr: CS asserted, remaining tx len=0 SR=0x2 SER=0x1 TXFLR=0x1
+    wtr: Tx done, rx_len=6 SR=0xe RXFLR=0x1
+
+This is opcode ``0x9F`` (JEDEC READ ID), no address/dummy bytes, 6
+data bytes expected. Every setup step succeeds; CS asserts (``SER``
+goes 0x0 -> 0x1); the single opcode byte transmits (``TXFLR`` empties,
+``SR`` bit2/TFE sets); and -- critically -- ``SR=0xe`` at "Tx done"
+already has bit3 (RFNE, Rx FIFO Not Empty) set with ``RXFLR=0x1``: one
+byte had *already* arrived. The hardware is unambiguously alive and
+transacting. Then: nothing further at all, not even the Rx loop's own
+timeout/overflow error paths, which should have fired within a
+second.
+
+That last point turned out to be the real bug -- in the diagnostic
+code, not the hardware. ``dw_spi_exec_mem_op()`` wraps the call to
+``dw_spi_write_then_read()`` in ``local_irq_save()`` +
+``preempt_disable()`` (deliberately, to keep the CS-atomic transfer
+from being preempted -- see that function's own comment). ``jiffies``
+is incremented by the periodic timer *interrupt*; with interrupts
+disabled for the whole call, it cannot advance, so a deadline computed
+as ``jiffies + HZ`` at loop entry can never be reached --
+``time_after(jiffies, deadline)`` was silently, permanently false the
+entire time. Both timeouts added in the last two commits (here and in
+``dw_spi_poll_transfer()``) were dead code for this reason -- not
+proof of anything about the hardware.
+
+Replaced all three jiffies-based deadlines with plain loop-iteration
+counters (which don't care whether interrupts are enabled), and added
+a periodic ("every ~1M iterations") progress print to the Rx loop
+specifically, since that's where execution stops. This should finally
+produce a real timeout/diagnostic on the next attempt instead of
+silently spinning past a check that can never trip.
 
 Toolchain note
 ==============

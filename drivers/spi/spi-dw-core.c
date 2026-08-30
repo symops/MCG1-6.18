@@ -391,7 +391,6 @@ static int dw_spi_poll_transfer(struct dw_spi *dws,
 	struct spi_delay delay;
 	u16 nbits;
 	int ret;
-	unsigned long deadline;
 	unsigned int loops = 0;
 	u32 tx_len0 = dws->tx_len, rx_len0 = dws->rx_len;
 
@@ -405,8 +404,15 @@ static int dw_spi_poll_transfer(struct dw_spi *dws,
 	 * change able to explain why -- dump raw controller register state
 	 * instead of hanging forever, so the actual hardware condition at
 	 * the point of failure is visible instead of guessed at.
+	 *
+	 * Bounded by loop iterations, NOT jiffies: this driver's other
+	 * polling path (dw_spi_write_then_read(), used for native-CS
+	 * memory ops) runs its equivalent loop wrapped in
+	 * local_irq_save()/preempt_disable(), during which jiffies never
+	 * advances -- a jiffies-based deadline computed as "jiffies + HZ"
+	 * silently never expires there. Kept the same bound style here for
+	 * consistency even though this particular path isn't IRQ-disabled.
 	 */
-	deadline = jiffies + HZ;
 
 	do {
 		dev_info(&dws->host->dev, "poll[%u]: pre-write tx_len=%u rx_len=%u "
@@ -440,7 +446,7 @@ static int dw_spi_poll_transfer(struct dw_spi *dws,
 			return ret;
 
 		loops++;
-		if (dws->rx_len && time_after(jiffies, deadline)) {
+		if (dws->rx_len && loops > 2000000) {
 			dev_err(&dws->host->dev,
 				"poll_transfer timeout after %u loops: "
 				"tx_len0=%u rx_len0=%u tx_len=%u rx_len=%u "
@@ -614,8 +620,8 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	u32 room, entries, sts;
 	unsigned int len;
 	u8 *buf;
-	unsigned long deadline;
 	unsigned int tx_len0, rx_len0;
+	unsigned int tx_iters, rx_iters;
 
 	dev_info(&dws->host->dev, "wtr: enter tx_len=%u rx_len=%u fifo_len=%u "
 		"SR=0x%x SSIENR=0x%x SER=0x%x\n",
@@ -651,7 +657,7 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 		len, dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_SER),
 		dw_readl(dws, DW_SPI_TXFLR));
 
-	deadline = jiffies + HZ;
+	tx_iters = 0;
 	while (len) {
 		entries = readl_relaxed(dws->regs + DW_SPI_TXFLR);
 		if (!entries) {
@@ -661,11 +667,12 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 		room = min(dws->fifo_len - entries, len);
 		for (; room; --room, --len)
 			dw_write_io_reg(dws, DW_SPI_DR, *buf++);
-		if (len && time_after(jiffies, deadline)) {
+		if (len && ++tx_iters > 2000000) {
 			dev_err(&dws->host->dev,
-				"wtr: Tx loop timeout, tx_len0=%u remaining=%u "
+				"wtr: Tx loop timeout after %u iters, "
+				"tx_len0=%u remaining=%u "
 				"SR=0x%x RISR=0x%x TXFLR=0x%x RXFLR=0x%x\n",
-				tx_len0, len,
+				tx_iters, tx_len0, len,
 				dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
 				dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR));
 			return -ETIMEDOUT;
@@ -684,7 +691,7 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 	len = dws->rx_len;
 	rx_len0 = len;
 	buf = dws->rx;
-	deadline = jiffies + HZ;
+	rx_iters = 0;
 	while (len) {
 		entries = readl_relaxed(dws->regs + DW_SPI_RXFLR);
 		if (!entries) {
@@ -693,12 +700,22 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 				dev_err(&dws->host->dev, "FIFO overflow on Rx\n");
 				return -EIO;
 			}
-			if (time_after(jiffies, deadline)) {
+			rx_iters++;
+			if ((rx_iters & 0xfffff) == 0)
+				dev_info(&dws->host->dev,
+					"wtr: Rx loop still waiting, iters=%u "
+					"remaining=%u SR=0x%x RISR=0x%x "
+					"TXFLR=0x%x RXFLR=0x%x\n",
+					rx_iters, len,
+					dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
+					dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR));
+			if (rx_iters > 4000000) {
 				dev_err(&dws->host->dev,
-					"wtr: Rx loop timeout, rx_len0=%u remaining=%u "
+					"wtr: Rx loop timeout after %u iters, "
+					"rx_len0=%u remaining=%u "
 					"SR=0x%x RISR=0x%x TXFLR=0x%x RXFLR=0x%x "
 					"SSIENR=0x%x SER=0x%x\n",
-					rx_len0, len,
+					rx_iters, rx_len0, len,
 					dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
 					dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR),
 					dw_readl(dws, DW_SPI_SSIENR), dw_readl(dws, DW_SPI_SER));
