@@ -116,6 +116,46 @@ Power button
     to be read and acted on by barebox/userspace scripts only, not the
     kernel. No ``gpio-keys`` node was added.
 
+Kernel image size budget (Stage 2 finding)
+===========================================
+
+barebox on this board loads the kernel from a fixed-size raw region
+on the SATA disk (partitions 5/6), not a filesystem: its boot script
+reads a **fixed 20480 sectors (10 MiB)** into RAM and only then
+runs the uImage header's data-CRC check. The image is not sized from
+the uImage header before the read -- if the actual ``uImage`` is
+larger than 10 MiB, the read is silently truncated and barebox fails
+with ``Verifying Checksum ... Bad Data CRC``. This was hit on first
+real-hardware boot attempt: the initial ``ls1024a_defconfig`` (a
+direct ``multi_v7_defconfig`` derivative, i.e. dozens of unrelated
+SoC platforms and their drivers built in alongside LS1024A) produced
+an 11.8 MiB ``uImage``.
+
+Fix, in two parts:
+
+1. Disabled every ``CONFIG_ARCH_*`` platform switch other than the
+   multiplatform/multi-v7 plumbing and ``ARCH_LS1024A`` itself, plus
+   the built-in (non-modular) subsystems with no use on this board:
+   ``NETDEVICES`` (no net driver exists for this SoC yet -- see PFE
+   above), ``DRM``, ``USB_GADGET``, ``MMC``, ``INPUT_TOUCHSCREEN``,
+   ``WIRELESS``, and ``DEBUG_INFO``. This is a one-way ``olddefconfig``
+   cascade -- Kconfig drops every driver that ``depends on`` a
+   disabled platform automatically.
+2. Switched the kernel's self-decompressing payload from
+   ``CONFIG_KERNEL_GZIP`` to ``CONFIG_KERNEL_XZ``. Note this is
+   independent of barebox: ``make uImage`` on ARM always builds the
+   mkimage header with ``-C none`` (see ``scripts/Makefile.lib``) --
+   the zImage payload decompresses itself, at boot, using the
+   decompressor code linked into ``arch/arm/boot/compressed/``. The
+   bootloader never parses the compression format at all, so
+   barebox's own age/feature set is irrelevant to this choice.
+
+Result: ``uImage`` dropped from 11.8 MiB to **5.23 MiB**, comfortably
+under the 10 MiB budget with room for future growth (a PFE driver,
+once ported, will add back some size). Anyone adding drivers to
+``ls1024a_defconfig`` going forward should keep an eye on
+``ls-la arch/arm/boot/uImage`` against this 10 MiB ceiling.
+
 Toolchain note
 ==============
 
