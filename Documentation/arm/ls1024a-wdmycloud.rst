@@ -558,7 +558,38 @@ limitation, just made DT-selectable here instead of always-off), then
 ``ls1024a-wdmycloud.dts`` only -- other boards/nodes using this driver
 keep interrupt-driven behavior unaffected. Confirmed in the compiled
 dtb (``fdtget ... interrupts`` now reports ``FDT_ERR_NOTFOUND``, as
-intended). Not yet re-tested on hardware.
+intended).
+
+Third real-hardware attempt (with the polling fix) hung **identically**
+-- same message, same point, twice in a row -- proving the IRQ/native-CS
+theory, while real, wasn't the (or the whole) cause. Re-derived the
+register-level pin assignments from the vendor 3.2.26 Linux source
+(``arch/arm/mach-comcerto/include/mach/comcerto-2000/gpio.h``:
+``SPI_MUX_BUS_1``/``SPI_MUX_BUS_2``, confirming SCLK=GPIO31,
+TXD=GPIO30, SS0=GPIO18, RXD=GPIO32 -- note RXD alone lives in the
+*other* 32-bit GPIO bank, ``COMCERTO_GPIO_63_32_PIN_SELECT`` @ 0xdc,
+not ``COMCERTO_GPIO_PIN_SELECT_REG1`` @ 0x5c like the rest) and
+compared it line-by-line against ``pinctrl-ls1024a.c``'s
+``ls1024a_pmx_set_group_mux()``: register offsets match exactly
+(``GPIO_PIN_SELECT_REG1 = 0x5c``, ``GPIO_63_32_PIN_SELECT = 0xdc``),
+the GPIO1-bank pin (``spi_rxd``, mux_idx 0) is handled through a
+correctly distinct code path, and the vendor header's actual per-pin
+mux values (``GPIO18_SPI_SS0_N``, ``GPIO31_SPI_SCLK``,
+``GPIO32_SPI_RXD``, etc.) are *all* literally ``(0x0 << shift)`` --
+matching this driver's uniform ``spi`` function mux_value of 0
+everywhere. No discrepancy found by inspection; the pinctrl driver
+appears to correctly implement what the vendor's own register map
+says it should.
+
+With no further bug found by reading code, added a bounded timeout (1
+second) and raw register dump (``SR``/``RISR``/``TXFLR``/``RXFLR``/
+``SSIENR``) to ``dw_spi_poll_transfer()`` in ``spi-dw-core.c`` in
+place of its unbounded ``while (dws->rx_len)`` loop -- this doesn't
+fix anything by itself, but turns the indefinite hang into a bounded
+failure (boot continues, no more power cycles needed to recover) and
+should print the actual hardware register state at the point of
+failure on the next attempt, which is needed to make further progress
+here without guessing. Not yet re-tested on hardware.
 
 Toolchain note
 ==============

@@ -9,6 +9,7 @@
 #include <linux/bitops.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/preempt.h>
 #include <linux/highmem.h>
@@ -390,9 +391,22 @@ static int dw_spi_poll_transfer(struct dw_spi *dws,
 	struct spi_delay delay;
 	u16 nbits;
 	int ret;
+	unsigned long deadline;
+	unsigned int loops = 0;
+	u32 tx_len0 = dws->tx_len, rx_len0 = dws->rx_len;
 
 	delay.unit = SPI_DELAY_UNIT_SCK;
 	nbits = dws->n_bytes * BITS_PER_BYTE;
+
+	/*
+	 * Diagnostic timeout: this loop otherwise waits on dws->rx_len
+	 * reaching 0 with no bound at all. On the ls1024a board this was
+	 * observed to hang indefinitely (no oops, no panic) with no other
+	 * change able to explain why -- dump raw controller register state
+	 * instead of hanging forever, so the actual hardware condition at
+	 * the point of failure is visible instead of guessed at.
+	 */
+	deadline = jiffies + HZ;
 
 	do {
 		dw_writer(dws);
@@ -405,6 +419,23 @@ static int dw_spi_poll_transfer(struct dw_spi *dws,
 		ret = dw_spi_check_status(dws, true);
 		if (ret)
 			return ret;
+
+		loops++;
+		if (dws->rx_len && time_after(jiffies, deadline)) {
+			dev_err(&dws->host->dev,
+				"poll_transfer timeout after %u loops: "
+				"tx_len0=%u rx_len0=%u tx_len=%u rx_len=%u "
+				"SR=0x%x RISR=0x%x TXFLR=0x%x RXFLR=0x%x "
+				"SSIENR=0x%x\n",
+				loops, tx_len0, rx_len0,
+				dws->tx_len, dws->rx_len,
+				dw_readl(dws, DW_SPI_SR),
+				dw_readl(dws, DW_SPI_RISR),
+				dw_readl(dws, DW_SPI_TXFLR),
+				dw_readl(dws, DW_SPI_RXFLR),
+				dw_readl(dws, DW_SPI_SSIENR));
+			return -ETIMEDOUT;
+		}
 	} while (dws->rx_len);
 
 	return 0;
