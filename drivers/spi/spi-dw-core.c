@@ -409,12 +409,31 @@ static int dw_spi_poll_transfer(struct dw_spi *dws,
 	deadline = jiffies + HZ;
 
 	do {
+		dev_info(&dws->host->dev, "poll[%u]: pre-write tx_len=%u rx_len=%u "
+			"SR=0x%x TXFLR=0x%x RXFLR=0x%x\n",
+			loops, dws->tx_len, dws->rx_len,
+			dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_TXFLR),
+			dw_readl(dws, DW_SPI_RXFLR));
+
 		dw_writer(dws);
+
+		dev_info(&dws->host->dev, "poll[%u]: post-write tx_len=%u "
+			"SR=0x%x TXFLR=0x%x\n",
+			loops, dws->tx_len,
+			dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_TXFLR));
 
 		delay.value = nbits * (dws->rx_len - dws->tx_len);
 		spi_delay_exec(&delay, transfer);
 
+		dev_info(&dws->host->dev, "poll[%u]: pre-read rx_len=%u "
+			"SR=0x%x RXFLR=0x%x\n",
+			loops, dws->rx_len,
+			dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RXFLR));
+
 		dw_reader(dws);
+
+		dev_info(&dws->host->dev, "poll[%u]: post-read rx_len=%u\n",
+			loops, dws->rx_len);
 
 		ret = dw_spi_check_status(dws, true);
 		if (ret)
@@ -463,9 +482,16 @@ static int dw_spi_transfer_one(struct spi_controller *host,
 	/* Ensure the data above is visible for all CPUs */
 	smp_mb();
 
+	dev_info(&host->dev, "transfer_one: entry len=%u speed_hz=%u bpw=%u\n",
+		transfer->len, transfer->speed_hz, transfer->bits_per_word);
+
 	dw_spi_enable_chip(dws, 0);
+	dev_info(&host->dev, "transfer_one: enable_chip(0) done, SSIENR=0x%x\n",
+		dw_readl(dws, DW_SPI_SSIENR));
 
 	dw_spi_update_config(dws, spi, &cfg);
+	dev_info(&host->dev, "transfer_one: update_config done, current_freq=%u\n",
+		dws->current_freq);
 
 	transfer->effective_speed_hz = dws->current_freq;
 
@@ -474,6 +500,7 @@ static int dw_spi_transfer_one(struct spi_controller *host,
 
 	/* For poll mode just disable all interrupts */
 	dw_spi_mask_intr(dws, 0xff);
+	dev_info(&host->dev, "transfer_one: mask_intr done\n");
 
 	if (dws->dma_mapped) {
 		ret = dws->dma_ops->dma_setup(dws, transfer);
@@ -482,11 +509,15 @@ static int dw_spi_transfer_one(struct spi_controller *host,
 	}
 
 	dw_spi_enable_chip(dws, 1);
+	dev_info(&host->dev, "transfer_one: enable_chip(1) done, SSIENR=0x%x SER=0x%x\n",
+		dw_readl(dws, DW_SPI_SSIENR), dw_readl(dws, DW_SPI_SER));
 
 	if (dws->dma_mapped)
 		return dws->dma_ops->dma_transfer(dws, transfer);
-	else if (dws->irq == IRQ_NOTCONNECTED)
+	else if (dws->irq == IRQ_NOTCONNECTED) {
+		dev_info(&host->dev, "transfer_one: entering poll_transfer\n");
 		return dw_spi_poll_transfer(dws, transfer);
+	}
 
 	dw_spi_irq_setup(dws);
 

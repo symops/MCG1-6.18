@@ -624,8 +624,33 @@ necessarily mean sharing a reset bit -- reset and clock gating are
 independent hardware concerns, uart1 may have its own separate reset
 (or barebox may simply leave it deasserted already for its own console
 use, the same way it leaves uart1's pinmux correctly configured
-without Linux ever touching pinctrl for it either). Not yet re-tested
-on hardware.
+without Linux ever touching pinctrl for it either).
+
+Fifth attempt (with the reset fix) hung identically again. Before
+trying another blind DT change, got ground truth directly from
+barebox -- which is, after all, already reading/writing this exact
+chip for its own environment every single boot::
+
+    Barebox-C2K >/ crc32 -f /dev/spi0 0+0x100
+    CRC32 for /dev/spi0 0x00000000 ... 0x000000ff ==> 0xd3d38ff3
+
+barebox reads 256 real bytes from the chip successfully, moments
+before jumping to Linux, in the exact same boot session that then
+hangs. This conclusively rules out a hardware/wiring/silicon fault --
+the chip, bus, and pin wiring are demonstrably fine right up until
+Linux's own driver touches them. The bug is entirely in Linux-side
+configuration or driver behavior.
+
+Since the earlier 1-second timeout in ``dw_spi_poll_transfer()``
+never fired (proving the hang is a blocking MMIO *read* instruction,
+not a loop), added fine-grained ``dev_info()`` tracing at every step
+of ``dw_spi_transfer_one()`` and each write/delay/read/status-check
+sub-step inside ``dw_spi_poll_transfer()``'s loop. Prints emitted
+*before* the hanging instruction will have already reached the
+console (UART output isn't blocked by a stuck SPI MMIO read on the
+same core -- the two are independent bus targets), so whichever trace
+line is the *last* one printed on the next attempt pinpoints the exact
+register access that never returns. Not yet re-tested on hardware.
 
 Toolchain note
 ==============
