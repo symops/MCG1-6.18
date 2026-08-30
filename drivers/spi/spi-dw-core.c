@@ -773,6 +773,12 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	unsigned long flags;
 	int ret;
 
+	dev_info(&dws->host->dev, "exec_mem_op: enter opcode=0x%x addr.nbytes=%u "
+		"addr.val=0x%llx dummy.nbytes=%u data.dir=%d data.nbytes=%u "
+		"max_freq=%u\n",
+		op->cmd.opcode, op->addr.nbytes, op->addr.val,
+		op->dummy.nbytes, op->data.dir, op->data.nbytes, op->max_freq);
+
 	/*
 	 * Collect the outbound data into a single buffer to speed the
 	 * transmission up at least on the initial stage.
@@ -780,6 +786,9 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	ret = dw_spi_init_mem_buf(dws, op);
 	if (ret)
 		return ret;
+
+	dev_info(&dws->host->dev, "exec_mem_op: init_mem_buf done, "
+		"tx_len=%u rx_len=%u\n", dws->tx_len, dws->rx_len);
 
 	/*
 	 * DW SPI EEPROM-read mode is required only for the SPI memory Data-IN
@@ -794,13 +803,25 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 		cfg.tmode = DW_SPI_CTRLR0_TMOD_TO;
 	}
 
+	dev_info(&dws->host->dev, "exec_mem_op: cfg tmode=%u freq=%u "
+		"max_mem_freq=%u\n", cfg.tmode, cfg.freq, dws->max_mem_freq);
+
 	dw_spi_enable_chip(dws, 0);
+	dev_info(&dws->host->dev, "exec_mem_op: enable_chip(0) done, "
+		"SSIENR=0x%x\n", dw_readl(dws, DW_SPI_SSIENR));
 
 	dw_spi_update_config(dws, mem->spi, &cfg);
+	dev_info(&dws->host->dev, "exec_mem_op: update_config done, "
+		"current_freq=%u\n", dws->current_freq);
 
 	dw_spi_mask_intr(dws, 0xff);
+	dev_info(&dws->host->dev, "exec_mem_op: mask_intr done\n");
 
 	dw_spi_enable_chip(dws, 1);
+	dev_info(&dws->host->dev, "exec_mem_op: enable_chip(1) done, "
+		"SSIENR=0x%x SER=0x%x SR=0x%x\n",
+		dw_readl(dws, DW_SPI_SSIENR), dw_readl(dws, DW_SPI_SER),
+		dw_readl(dws, DW_SPI_SR));
 
 	/*
 	 * DW APB SSI controller has very nasty peculiarities. First originally
