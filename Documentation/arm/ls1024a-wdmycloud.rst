@@ -288,7 +288,32 @@ this defconfig) -- that's expected and separate from the AHCI fix;
 the plan is to see the real partition table once SATA actually
 enumerates a disk, and either build a `dm`-free multi-boot ``root=``
 against the correct real partition, or enable MD if the on-disk
-layout turns out to need it. Not yet re-tested on hardware.
+layout turns out to need it.
+
+Fifth attempt (with the AHCI fix) confirmed the disk and full
+partition table now enumerate correctly::
+
+    ahci 9d000000.sata: 2/2 ports implemented (port mask 0x3)
+    sd 0:0:0:0: [sda] 976773168 512-byte logical blocks: (500 GB/466 GiB)
+     sda: sda1 sda2 sda3 sda4 sda5 sda6 sda7 sda8
+
+Cross-checked against a live boot log of the *real* Devuan install on
+this exact disk (``mcg1-devuan.log``): ``root=/dev/md0`` is not stale
+leftover from the old kernel's stored ATAG cmdline -- it is genuinely
+correct and current. ``md0`` is a RAID1 mirror of ``sda1``+``sda2``
+(~20 GiB each) holding the real ext3 rootfs (confirmed:
+``md: created md0`` / ``md/raid1:md0: active with 2 out of 2
+mirrors`` / ``VFS: Mounted root (ext3 filesystem)``); ``sda3`` is
+swap; ``sda4`` (~421 GiB) is the big data volume; ``sda5``/``sda6``
+(~95/96 MiB) are the two kernel slots this port has been using all
+along; ``sda7``/``sda8`` (1/2 MiB) hold the barebox boot scripts.
+
+The only actual gap was that this defconfig never built MD/RAID
+support at all. Fixed by enabling ``CONFIG_MD``, ``CONFIG_BLK_DEV_MD``
+and ``CONFIG_MD_RAID1`` (built-in, not modules -- required for root
+autodetection to work with ``noinitrd``, matching
+``raid=autodetect`` in the passed cmdline). Not yet re-tested on
+hardware.
 
 Toolchain note
 ==============
