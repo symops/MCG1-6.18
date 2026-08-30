@@ -589,7 +589,43 @@ fix anything by itself, but turns the indefinite hang into a bounded
 failure (boot continues, no more power cycles needed to recover) and
 should print the actual hardware register state at the point of
 failure on the next attempt, which is needed to make further progress
-here without guessing. Not yet re-tested on hardware.
+here without guessing.
+
+Fourth attempt (with the timeout) is the most informative result yet,
+precisely because the timeout **never fired**: no diagnostic message,
+identical hang, identical point, twice more. A jiffies-based software
+timeout cannot fire if the CPU itself never retires the instruction
+it's checking after -- which is exactly what an MMIO *read* to a
+peripheral whose bus transaction never gets a response does on ARM
+(unlike a write, which is typically posted). This reframes the whole
+problem: not a driver logic bug, but the SPI block's registers being
+genuinely unreachable over the bus -- most consistent with the block
+still being held in hardware reset.
+
+Checked ``include/dt-bindings/reset/ls1024a.h`` for a reset line
+matching ``ls_spi``'s clock domain (``"dus"``, ``LS1024A_CLK_DUS`` --
+shared with ``uart1``) and found ``LS1024A_AXI_DUS_RST``, previously
+unused anywhere in this tree. ``drivers/spi/spi-dw-mmio.c`` already
+looks up and deasserts an *optional* reset named ``"spi"``
+(``devm_reset_control_get_optional_exclusive(&pdev->dev, "spi")``,
+``reset_control_deassert()`` right after) -- it was simply never given
+one, so this step silently no-ops and the driver proceeds to touch
+registers of a block that may never have come out of reset. Added::
+
+    resets = <&clkreset LS1024A_AXI_DUS_RST>;
+    reset-names = "spi";
+
+to ``&ls_spi``. Confirmed in the compiled dtb (``fdtget ...
+resets`` -> ``4 672`` -- 672 decimal = 0x2a0 =
+``LS1024A_AXI_DUS_RST``, ``reset-names`` -> ``"spi"``).
+
+Sharing a clock gate with a working peripheral (uart1) doesn't
+necessarily mean sharing a reset bit -- reset and clock gating are
+independent hardware concerns, uart1 may have its own separate reset
+(or barebox may simply leave it deasserted already for its own console
+use, the same way it leaves uart1's pinmux correctly configured
+without Linux ever touching pinctrl for it either). Not yet re-tested
+on hardware.
 
 Toolchain note
 ==============

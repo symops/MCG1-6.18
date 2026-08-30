@@ -33,23 +33,24 @@
 	num-cs = <1>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_spi &pinctrl_spi_ss0>;
+	/delete-property/ interrupts;
 
 	/*
-	 * Force polling mode (see spi-dw-mmio.c's platform_get_irq_optional
-	 * patch): this device is wired to the controller's *native*
-	 * (register-based) chip-select, and drivers/spi/spi-dw-core.c's own
-	 * dw_spi_poll_transfer() comment documents that IRQ-driven transfers
-	 * don't work reliably with native CS, due to automatic assert/
-	 * de-assert timing. Confirmed on real hardware: with an interrupts
-	 * property present, the flash@0 probe below hangs solid (no oops,
-	 * no panic) every time, right as the first real transaction starts.
-	 * barebox's own SPI driver for this exact chip (drivers/spi/
-	 * c2k_spi.c in the vendor barebox-2011.06.0 GPL source) is
-	 * poll-only and never used a GPIO chip-select either -- confirming
-	 * native CS + polling is the combination this hardware actually
-	 * wants, not a GPIO-CS workaround.
+	 * Likely root cause of the persistent, diagnostic-timeout-proof
+	 * hang documented at length in
+	 * Documentation/arm/ls1024a-wdmycloud.rst: this block was never
+	 * taken out of hardware reset. spi-dw-mmio.c already knows to look
+	 * up and deassert an optional reset named "spi"
+	 * (devm_reset_control_get_optional_exclusive(&pdev->dev, "spi")) --
+	 * it was just never given one. LS1024A_AXI_DUS_RST is the reset
+	 * line matching this controller's "dus" clock domain (shared with
+	 * uart1, which works without ever needing an explicit reset
+	 * deassert -- but a shared clock gate doesn't imply a shared reset
+	 * bit, and UART likely has its own separate one, or barebox leaves
+	 * it deasserted for its own console use).
 	 */
-	/delete-property/ interrupts;
+	resets = <&clkreset LS1024A_AXI_DUS_RST>;
+	reset-names = "spi";
 
 	/*
 	 * Boot/env SPI-NOR flash (also used by barebox itself, per
