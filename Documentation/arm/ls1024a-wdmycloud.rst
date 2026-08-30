@@ -1042,7 +1042,34 @@ turned out to be the real problem) -- write-then-read's existing Tx
 loop, command-phase Rx flush, and Tx-budget-tracked dummy-byte Rx loop
 are structurally the same shape as barebox's proven
 write-all-then-read-all-with-discard, just without a printk in the
-middle of it this time. Not yet re-tested on hardware.
+middle of it this time.
+
+Sixteenth attempt: **real data**, finally --
+``unrecognized JEDEC id bytes: 00 ef 30 13 00 00``. The timing theory
+was right. ``0xef`` is Winbond's manufacturer ID, and
+``SNOR_ID(0xef, 0x30, 0x13)`` is an exact match in upstream
+``drivers/mtd/spi-nor/winbond.c`` for ``"w25x40"`` (512 KiB, no SFDP,
+no quad -- another old, plain part). Not the ``S25FL064A`` (Spansion,
+8 MiB) barebox's own vendor source names this device -- evidently a
+real BOM second-source substitution on this specific board/unit that
+the vendor firmware's device name was simply never updated for.
+
+The leading ``00`` is a residual one-byte shift -- the command-phase
+Rx flush reported ``flushed=0`` in the trace, meaning it found nothing
+*yet*: transmitting a byte takes real time (~2us at 4 MHz), and
+checking ``RXFLR`` immediately after the Tx loop finishes can
+legitimately still read 0 (the hardware hasn't clocked it out yet at
+the instant of the check), so the flush loop exited immediately
+instead of waiting, and that byte landed as a false byte 0 once the
+main Rx loop's own polling caught up to it. Fixed by capturing the
+original command length (``cmd_len = dws->tx_len``, taken before the
+Tx loop consumes it) and having the flush loop actually *wait* for
+that many bytes (bounded, same iteration-limit style as the other
+loops here) instead of draining once and moving on.
+
+Updated ``&ls_spi``'s flash node to ``compatible = "winbond,w25x40",
+"jedec,spi-nor"`` (mode/frequency unchanged -- already correct, proven
+by the working read). Not yet re-tested on hardware.
 
 Toolchain note
 ==============

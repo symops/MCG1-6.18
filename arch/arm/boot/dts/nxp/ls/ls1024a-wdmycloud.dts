@@ -77,18 +77,23 @@
 	reset-names = "spi";
 
 	/*
-	 * Boot/env SPI-NOR flash (also used by barebox itself, per
-	 * `devinfo` on real hardware: "c2k_spi0" -> "S25FL064A0", and by
-	 * name in barebox's own board file: arch/arm/boards/comcerto-asic/
-	 * c2k_asic.c, "S25FL064A", chip_select 0). Spansion/Cypress
-	 * S25FL064A, 8 MiB, matches upstream spi-nor's "s25sl064a" entry
-	 * (3-byte JEDEC ID 01 02 16, no SFDP/quad support -- an old, plain
-	 * chip). Mode (SPI_CPOL | SPI_CPHA, i.e. mode 3) and frequency
-	 * (4 MHz) copied directly from that same barebox board file's
-	 * spi_board_info entry for this chip.
+	 * Boot/env SPI-NOR flash (also used by barebox itself for its own
+	 * environment storage). barebox's own board file (vendor GPL
+	 * source, arch/arm/boards/comcerto-asic/c2k_asic.c and
+	 * commands/update_spi.c) names this "S25FL064A" (Spansion, 8 MiB),
+	 * but that's evidently just this board's generic/legacy device
+	 * name in the vendor firmware -- read on real hardware, with a
+	 * working driver, this chip's actual JEDEC ID is 0xef 0x30 0x13,
+	 * an exact match for upstream spi-nor's "w25x40" (Winbond, 512 KiB,
+	 * no SFDP/quad support, also an old, plain chip) -- a real BOM
+	 * second-source substitution the vendor firmware's naming was
+	 * simply never updated for. Mode (SPI_CPOL | SPI_CPHA, i.e. mode
+	 * 3) and frequency (4 MHz) still copied from that same barebox
+	 * board file's spi_board_info entry, and still correct (matches
+	 * the working w25x40 read).
 	 */
 	flash@0 {
-		compatible = "spansion,s25sl064a", "jedec,spi-nor";
+		compatible = "winbond,w25x40", "jedec,spi-nor";
 		reg = <0>;
 		spi-max-frequency = <4000000>;
 		spi-cpha;

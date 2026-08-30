@@ -625,6 +625,8 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 	unsigned int tx_iters, rx_iters;
 	unsigned int tx_pushed;
 	unsigned int flushed = 0;
+	unsigned int cmd_len = dws->tx_len;
+	unsigned int flush_iters;
 	int ret = 0;
 
 	/*
@@ -688,8 +690,26 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 		 * responding yet. Drain and discard it before reading real
 		 * data, or it becomes a spurious byte 0, shifting every
 		 * real data byte down by one (and losing the last one).
+		 *
+		 * Must actually *wait* for cmd_len bytes, not just drain
+		 * whatever RXFLR shows right now: transmitting a byte takes
+		 * real time (~2us at 4MHz), and checking immediately after
+		 * the Tx loop above can run fast enough to see RXFLR still
+		 * at 0 -- confirmed on hardware (flushed=0 in the trace)
+		 * with the shifted byte then landing as a false byte 0 in
+		 * the real capture below instead.
 		 */
-		while ((entries = readl_relaxed(dws->regs + DW_SPI_RXFLR))) {
+		flush_iters = 0;
+		while (flushed < cmd_len) {
+			entries = readl_relaxed(dws->regs + DW_SPI_RXFLR);
+			if (!entries) {
+				if (++flush_iters > 4000000) {
+					ret = -ETIMEDOUT;
+					goto out;
+				}
+				continue;
+			}
+			entries = min(entries, cmd_len - flushed);
 			for (; entries; --entries, ++flushed)
 				dw_read_io_reg(dws, DW_SPI_DR);
 		}
