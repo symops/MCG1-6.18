@@ -30,6 +30,9 @@
 
 &ls_spi {
 	status = "okay";
+	num-cs = <1>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_spi &pinctrl_spi_ss0>;
 
 	/*
 	 * Boot/env SPI-NOR flash (also used by barebox itself, per
@@ -37,11 +40,27 @@
 	 * Spansion/Cypress S25FL064A, 8 MiB, matches upstream
 	 * spi-nor's "s25sl064a" entry (3-byte JEDEC ID 01 02 16, no
 	 * SFDP/quad support -- an old, plain chip).
+	 *
+	 * Mode/frequency match ls1024a-tsx31.dts's own SPI-NOR node on
+	 * this same controller (also matches SPI_MODE_3 used throughout
+	 * the vendor 3.2.26 board file's spi_board_info table).
+	 *
+	 * NOTE: tsx31's SPI-NOR node also adds `cs-gpios = <&gpio 18
+	 * ...>` -- a workaround for this controller's native chip-select
+	 * releasing too early (shallow 8-word TX FIFO) once the FIFO
+	 * empties, cutting SPI-NOR commands short. That GPIO number is
+	 * tsx31-board-specific wiring, not verified for this board, so
+	 * it's deliberately left out here; if this flash node shows up
+	 * but reads garbled data (not a hang -- see commit message),
+	 * that's almost certainly why, and the fix is finding this
+	 * board's real CS GPIO and adding the same property.
 	 */
 	flash@0 {
 		compatible = "spansion,s25sl064a", "jedec,spi-nor";
 		reg = <0>;
-		spi-max-frequency = <20000000>;
+		spi-max-frequency = <4000000>;
+		spi-cpha;
+		spi-cpol;
 	};
 };
 

@@ -488,6 +488,37 @@ writing anything back to it, back up the existing contents first
 bootloader itself, unlike the kernel-partition mistakes elsewhere in
 this project which just needed a reflash.
 
+First real-hardware attempt with this node **hung solid** right after
+``dw_spi_mmio_driver_init`` / ``spi-nor spi0.0: supply vcc not found,
+using dummy regulator`` -- no oops, no panic, nothing further at all;
+reproduced identically (same message, same point) on a second boot,
+both times requiring a manual power cycle. Root cause: neither
+``&ls_spi`` nor ``&hs_spi`` in ``ls1024a.dtsi`` set ``pinctrl-0`` at
+all, even though the dtsi defines the needed groups
+(``pinctrl_spi``/``pinctrl_spi_ss0..3``, explicitly commented "Low
+speed SPI"). Console/UART happens to keep working without this
+because barebox already left the UART pins correctly muxed from its
+own use of them; SPI has no such luck, and the DW SPI controller's
+transfer-complete wait spins forever with its clock/pins never
+actually configured for the SPI function.
+
+The sibling ``ls1024a-tsx31.dts`` (same fork, different board) already
+solved exactly this for its own SPI-NOR flash on this same
+controller, including a second, separate issue: this DW SPI IP's
+native chip-select releases as soon as the (only 8-word) TX FIFO
+drains, cutting SPI-NOR command sequences short, worked around there
+with a GPIO-driven ``cs-gpios`` instead of the controller's own CS
+line. Copied its ``pinctrl-0``, ``num-cs``, and SPI mode/frequency
+(4 MHz, mode 3 -- also matches ``SPI_MODE_3`` used throughout the
+vendor 3.2.26 board file) onto our flash node. **Did not** copy its
+``cs-gpios = <&gpio 18 ...>`` -- GPIO 18 is tsx31-specific board
+wiring, unverified for this board, and guessing wrong there risks
+reintroducing a hang for a different reason. If the flash now probes
+without hanging but reports a wrong/garbled ID or read errors (not a
+hang -- a normal probe-failure message), that is almost certainly the
+missing GPIO-CS workaround, and finding this board's real CS GPIO is
+the next step. Not yet re-tested on hardware.
+
 Toolchain note
 ==============
 
