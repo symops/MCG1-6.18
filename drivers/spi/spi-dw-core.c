@@ -621,12 +621,10 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 	u32 room, entries, sts;
 	unsigned int len;
 	u8 *buf;
-	unsigned int tx_len0, rx_len0;
+	unsigned int tx_len0, rx_len0 = 0;
 	unsigned int tx_iters, rx_iters;
 	unsigned int tx_pushed;
-	unsigned int flushed = 0;
 	unsigned int cmd_len = dws->tx_len;
-	unsigned int flush_iters;
 	int ret = 0;
 
 	/*
@@ -682,67 +680,64 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 		}
 	}
 
-	if (dws->no_eeprom_read) {
-		/*
-		 * Full duplex means every clock spent on the command phase
-		 * (the opcode transmission just above) also shifted a byte
-		 * into Rx -- garbage, since the chip hadn't started
-		 * responding yet. Drain and discard it before reading real
-		 * data, or it becomes a spurious byte 0, shifting every
-		 * real data byte down by one (and losing the last one).
-		 *
-		 * Must actually *wait* for cmd_len bytes, not just drain
-		 * whatever RXFLR shows right now: transmitting a byte takes
-		 * real time (~2us at 4MHz), and checking immediately after
-		 * the Tx loop above can run fast enough to see RXFLR still
-		 * at 0 -- confirmed on hardware (flushed=0 in the trace)
-		 * with the shifted byte then landing as a false byte 0 in
-		 * the real capture below instead.
-		 */
-		flush_iters = 0;
-		while (flushed < cmd_len) {
-			entries = readl_relaxed(dws->regs + DW_SPI_RXFLR);
-			if (!entries) {
-				if (++flush_iters > 4000000) {
-					ret = -ETIMEDOUT;
-					goto out;
-				}
-				continue;
-			}
-			entries = min(entries, cmd_len - flushed);
-			for (; entries; --entries, ++flushed)
-				dw_read_io_reg(dws, DW_SPI_DR);
-		}
-	}
-
 	/*
 	 * Data fetching will start automatically if the EEPROM-read mode is
 	 * activated. We have to keep up with the incoming data pace to
 	 * prevent the Rx FIFO overflow causing the inbound data loss.
+	 *
+	 * For no_eeprom_read: full duplex means the command phase above
+	 * already shifted cmd_len garbage bytes into Rx (the chip hadn't
+	 * started responding yet) -- they're sitting in the FIFO right now,
+	 * unread. An earlier version of this drained and discarded them in
+	 * a *separate* phase before starting a fresh capture for the real
+	 * data; that introduced its own small timing gap (confirmed on
+	 * hardware: mechanically correct byte counts, but a residual
+	 * one-byte shift in the result). Instead, capture the *whole*
+	 * cmd_len + rx_len run as a single unbroken pass -- matching
+	 * barebox's own structurally identical approach in
+	 * commands/update_spi.c (one combined write_then_read covering
+	 * command+dummy+data, caller discards the command-phase prefix
+	 * afterwards) -- into the scratch buffer, then copy just the real
+	 * trailing data out to the caller's actual buffer once the whole
+	 * transfer is over.
 	 */
-	len = dws->rx_len;
+	if (dws->no_eeprom_read && dws->rx_len) {
+		if (cmd_len + dws->rx_len > DW_SPI_BUF_SIZE) {
+			ret = -EIO;
+			goto out;
+		}
+		buf = dws->no_eeprom_read_buf;
+		len = cmd_len + dws->rx_len;
+	} else {
+		buf = dws->rx;
+		len = dws->rx_len;
+	}
 	rx_len0 = len;
-	buf = dws->rx;
 	rx_iters = 0;
 	tx_pushed = 0;
 	while (len) {
-		if (dws->no_eeprom_read && tx_pushed < rx_len0) {
+		if (dws->no_eeprom_read && tx_pushed < dws->rx_len) {
 			/*
 			 * EEPROM-read's hardware auto-continue doesn't work
-			 * on this controller -- manually drive the clock by
-			 * pushing dummy 0x00 bytes for however much Tx FIFO
-			 * room is available. Budget against
-			 * rx_len0 - tx_pushed (total pushed so far), not
-			 * against len (remaining to *read*): TXFLR reflects
-			 * only what's currently queued and drains on its
-			 * own, so sizing against len would let an
-			 * already-pushed-but-since-drained slot look free
-			 * again and push more dummy bytes than rx_len needs,
+			 * on this controller -- manually drive the clock for
+			 * the data phase by pushing dummy 0x00 bytes for
+			 * however much Tx FIFO room is available. Only
+			 * dws->rx_len total pushes are needed (not
+			 * cmd_len + rx_len): the command phase's clock
+			 * cycles already happened, driven by the opcode
+			 * bytes themselves, above. Budget against
+			 * dws->rx_len - tx_pushed (total pushed so far), not
+			 * against len (remaining to *read*, which still
+			 * includes the not-yet-drained command-phase bytes):
+			 * TXFLR reflects only what's currently queued and
+			 * drains on its own, so sizing against len would let
+			 * an already-pushed-but-since-drained slot look free
+			 * again and push more dummy bytes than needed,
 			 * overflowing the Rx FIFO.
 			 */
 			entries = readl_relaxed(dws->regs + DW_SPI_TXFLR);
 			room = min3(dws->fifo_len - entries, len,
-				    rx_len0 - tx_pushed);
+				    dws->rx_len - tx_pushed);
 			for (; room; --room, ++tx_pushed)
 				dw_write_io_reg(dws, DW_SPI_DR, 0);
 		}
@@ -765,11 +760,14 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi,
 			*buf++ = dw_read_io_reg(dws, DW_SPI_DR);
 	}
 
+	if (dws->no_eeprom_read && dws->rx_len)
+		memcpy(dws->rx, dws->no_eeprom_read_buf + cmd_len, dws->rx_len);
+
 out:
-	dev_info(&dws->host->dev, "wtr: done ret=%d tx_len0=%u rx_len0=%u "
-		"flushed=%u tx_iters=%u rx_iters=%u SR=0x%x RISR=0x%x "
-		"TXFLR=0x%x RXFLR=0x%x\n",
-		ret, tx_len0, dws->rx_len, flushed, tx_iters, rx_iters,
+	dev_info(&dws->host->dev, "wtr: done ret=%d cmd_len=%u tx_len0=%u "
+		"rx_len0=%u cap_len=%u tx_iters=%u rx_iters=%u SR=0x%x "
+		"RISR=0x%x TXFLR=0x%x RXFLR=0x%x\n",
+		ret, cmd_len, tx_len0, dws->rx_len, rx_len0, tx_iters, rx_iters,
 		dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RISR),
 		dw_readl(dws, DW_SPI_TXFLR), dw_readl(dws, DW_SPI_RXFLR));
 

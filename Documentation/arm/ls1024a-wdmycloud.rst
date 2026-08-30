@@ -1069,7 +1069,42 @@ loops here) instead of draining once and moving on.
 
 Updated ``&ls_spi``'s flash node to ``compatible = "winbond,w25x40",
 "jedec,spi-nor"`` (mode/frequency unchanged -- already correct, proven
-by the working read). Not yet re-tested on hardware.
+by the working read).
+
+Seventeenth attempt regressed: ``flushed=1`` now correctly matches
+``cmd_len`` (the wait-for-the-right-count fix worked, exactly as
+intended) -- but the JEDEC ID came back all-zero again, worse than the
+shifted-but-real ``ef 30 13`` seen the attempt before. The fix was
+locally correct and made things worse anyway, which is a strong signal
+the whole *two-phase* design (drain-and-discard, *then* start a fresh
+capture) is itself the problem, independent of how carefully each
+phase is bounded -- any gap between "last command-phase byte drained"
+and "first data-phase dummy byte pushed", however small, is apparently
+enough to lose the chip's internal state on this old, timing-sensitive
+part.
+
+Went back to barebox's ``read_bytes_page_addr()`` one more time,
+looking at structure rather than register values: it builds *one*
+combined buffer (command + address + dummy zero bytes) and calls
+``spi_write_then_read()`` with a *single* ``n_tx == n_rx`` covering
+the whole thing -- there is no separate "discard" phase inside the
+transfer at all; the caller only slices the result apart with a plain
+``memcpy()`` *after* the hardware transaction is entirely finished.
+Rebuilt this driver's ``no_eeprom_read`` path the same way instead of
+matching that shape indirectly: added a fixed ``no_eeprom_read_buf[DW_SPI_BUF_SIZE]``
+scratch array to ``struct dw_spi`` (sized the same as the existing
+``buf`` field, no allocation needed), and restructured the Rx section
+of ``dw_spi_write_then_read()`` to capture ``cmd_len + rx_len`` bytes
+as one unbroken run into it -- the first ``cmd_len`` of those are the
+command-phase bytes already sitting in the Rx FIFO from the opcode
+transmission (no separate drain step, no gap: the *same* loop just
+keeps reading past them into the real data with no phase boundary in
+between) -- then ``memcpy()``'s only the real trailing ``rx_len``
+bytes out to the caller's actual buffer once the whole capture loop
+has finished. The dummy-byte push budget stays at ``rx_len`` (not
+``cmd_len + rx_len``): the command phase's clock cycles already
+happened, driven by the opcode bytes themselves; only the data phase
+needs manually-driven dummy bytes. Not yet re-tested on hardware.
 
 Toolchain note
 ==============

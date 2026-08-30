@@ -203,6 +203,14 @@ struct dw_spi {
 	void			*rx;
 	unsigned int		rx_len;
 	u8			buf[DW_SPI_BUF_SIZE];
+	/*
+	 * Scratch capture buffer for the no_eeprom_read path: the command
+	 * phase's garbage byte(s) and the real data are captured as one
+	 * unbroken run into here (no phase boundary, no gap -- see
+	 * dw_spi_write_then_read()), then the real data is copied out to
+	 * the caller's actual buffer afterwards.
+	 */
+	u8			no_eeprom_read_buf[DW_SPI_BUF_SIZE];
 	int			dma_mapped;
 	u8			n_bytes;	/* current is a 1/2 bytes op */
 	irqreturn_t		(*transfer_handler)(struct dw_spi *dws);
