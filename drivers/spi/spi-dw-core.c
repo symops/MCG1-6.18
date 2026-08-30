@@ -684,6 +684,32 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
 		"SR=0x%x RXFLR=0x%x\n",
 		dws->rx_len, dw_readl(dws, DW_SPI_SR), dw_readl(dws, DW_SPI_RXFLR));
 
+	if (dws->no_eeprom_read) {
+		/*
+		 * Full duplex means every clock we spent on the command
+		 * phase (the opcode prefill above, before this point)
+		 * *also* shifted a byte into Rx -- garbage, since the chip
+		 * hadn't started responding yet. In real EEPROM-read mode
+		 * the hardware's own command/data phase separation means
+		 * this never reaches software; here it's sitting in the Rx
+		 * FIFO right now, and would otherwise become a spurious
+		 * byte 0 in the result, shifting every real data byte down
+		 * by one (and losing the last one, since we only capture
+		 * rx_len total). Drain and discard it before reading real
+		 * data.
+		 */
+		u32 flushed = 0;
+
+		while ((entries = readl_relaxed(dws->regs + DW_SPI_RXFLR))) {
+			for (; entries; --entries, ++flushed)
+				dw_read_io_reg(dws, DW_SPI_DR);
+		}
+		if (flushed)
+			dev_info(&dws->host->dev,
+				"wtr: flushed %u garbage Rx byte(s) from "
+				"command phase\n", flushed);
+	}
+
 	/*
 	 * Data fetching will start automatically if the EEPROM-read mode is
 	 * activated. We have to keep up with the incoming data pace to

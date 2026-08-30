@@ -869,7 +869,38 @@ Fixed by tracking total dummy bytes pushed in a separate ``tx_pushed``
 counter (persisting across iterations, only ever incremented) and
 budgeting ``room`` against ``rx_len0 - tx_pushed`` (the true remaining
 allowance) in addition to ``len`` and available FIFO space, via
-``min3()``. Not yet re-tested on hardware.
+``min3()``.
+
+Twelfth attempt: no more overflow -- ``wtr: Rx done`` completes
+cleanly on the first try. But ``spi_nor_detect()`` then falls back to
+an SFDP read (opcode ``0x5A``, also completes cleanly through the same
+path) since the JEDEC ID it got didn't match anything, and ultimately
+reports (still)::
+
+    spi-nor spi0.0: unrecognized JEDEC id bytes: 00 00 00 00 00 00
+
+Checked ``spi_nor_detect()`` in ``drivers/mtd/spi-nor/core.c``: this
+final error always dumps the buffer from the *first* read (the
+``0x9F`` command) -- the SFDP attempt is just ``spi_nor_match_id()``'s
+normal fallback when the ID doesn't match, not a separate bug. So the
+first, 6-byte JEDEC ID read is still coming back all zero, mechanics
+aside.
+
+Root cause: full duplex means *every* clock edge shifts a byte into
+Rx, including the ones spent transmitting the opcode itself -- before
+the chip has had any chance to respond. In real EEPROM-read hardware
+mode, the command and data phases are separated internally and this
+never reaches software; with plain ``TMOD_TR``, it does. That garbage
+byte was sitting in the Rx FIFO the whole time (visible in every trace
+as ``RXFLR=0x1`` right after "Tx done", *before* the manual-drive Rx
+loop ever runs) and was being read as if it were the first real data
+byte -- shifting every actual ID byte down by one position and losing
+the last one entirely (only ``rx_len`` total bytes get captured).
+
+Fixed by draining and discarding whatever's sitting in the Rx FIFO
+immediately after the Tx (command) phase completes and before the
+manual-drive Rx loop starts, when ``no_eeprom_read`` is set. Logs how
+many bytes it discarded. Not yet re-tested on hardware.
 
 Toolchain note
 ==============
