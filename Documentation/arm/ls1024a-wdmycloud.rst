@@ -1564,8 +1564,29 @@ Stage P8 (Tx/Rx traffic path for GEM0)
     past the "disabling unused clocks" mark (independently verified for
     a full minute via the same debug timer used to find the clock bug),
     and TX submission surviving real IPv6 multicast-report traffic
-    without deadlocking. DHCP+ping itself (the plan's actual round #5
-    bar) not yet separately confirmed as a follow-up step.
+    without deadlocking.
+
+    **Link-up itself confirmed on the very next boot** (no cable/switch
+    change from earlier attempts -- only these two fixes)::
+
+        [    9.890000] fsl-ls1024a-pfe 90500000.pfe eth0: Link is Up - 1Gbps/Full - flow control off
+
+    ``ethtool eth0`` shows real, populated link-partner autonegotiation
+    data (not just this side's own advertised modes) -- ``Link partner
+    advertised link modes: 10baseT/Half 10baseT/Full 100baseT/Half
+    100baseT/Full 1000baseT/Full``, ``Speed: 1000Mb/s``, ``Duplex:
+    Full``, ``Link detected: yes`` -- and ``ifconfig`` shows the
+    ``RUNNING`` flag (carrier present) with ``TX packets 10``, zero
+    errors, zero drops. No RCU stall, no crash, clean boot to login as
+    before.
+
+    Not yet separately confirmed: an actual DHCP lease and a successful
+    ``ping`` (the plan's literal round #5 bar) -- this same boot's
+    ``ping 8.8.8.8`` still failed with "Network is unreachable" simply
+    because no DHCP client had been run yet in that session (no IPv4
+    address configured at all), not a driver problem. A follow-up round
+    running ``dhclient``/``ifup`` against a real DHCP server would close
+    this out.
 
 Watchdog reset-control conflict with syscon
 ============================================
