@@ -607,6 +607,12 @@ static const struct net_device_ops pfe_netdev_ops = {
 	.ndo_start_xmit = pfe_eth_send_packet,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
+	/* SIOCGMIIPHY/SIOCGMIIREG/SIOCSMIIREG -- phy_do_ioctl() dispatches
+	 * to phy_mii_ioctl() when a phydev is attached. Wired up for raw
+	 * MII register access (mii-tool and similar), not otherwise used
+	 * by this driver.
+	 */
+	.ndo_eth_ioctl = phy_do_ioctl,
 };
 
 /*
