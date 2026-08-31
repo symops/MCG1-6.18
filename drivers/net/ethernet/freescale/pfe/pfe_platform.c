@@ -3,11 +3,12 @@
  * PFE (Packet Forwarding Engine) platform driver for the Freescale/
  * Mindspeed LS1024A (Comcerto 2000) SoC.
  *
- * Stage P1 of the port (see Documentation/arm/ls1024a-wdmycloud.rst):
- * bring up the "apb"/"axi" MMIO windows, the "pfe"/"pfe_sys" clocks and
- * the "axi"/"core" resets, and request (but do not yet arm) the "hif"
- * IRQ. None of the actual PFE hardware blocks (CLASS/TMU/UTIL/HIF/EMAC)
- * are touched yet -- that starts in later stages.
+ * Stage P3 of the port (see Documentation/arm/ls1024a-wdmycloud.rst):
+ * on top of the Stage P1/P2 resource/clock/reset skeleton, map the
+ * "ddr" packet-buffer carve-out and "iram" window, and bring up the
+ * BMU/GPI/CLASS/TMU/UTIL hardware blocks via pfe_hw_init() (see
+ * pfe_hw.c/pfe_hw_lib.c). HIF, firmware loading and the net_device
+ * layer are still not touched -- that starts in Stage P4 onward.
  */
 
 #include <linux/clk.h>
@@ -15,10 +16,14 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 
 #include "pfe_mod.h"
+#include "pfe_hw.h"
+#include "pfe_hw_lib.h"
 
 static irqreturn_t pfe_hif_isr(int irq, void *dev_id)
 {
@@ -90,8 +95,55 @@ static int pfe_platform_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to request hif IRQ\n");
 
-	dev_info(dev, "PFE platform skeleton probed (apb=%p cbus=%p hif_irq=%d)\n",
-		 pfe->apb_baseaddr, pfe->cbus_baseaddr, pfe->hif_irq);
+	pfe->iram_baseaddr = devm_platform_ioremap_resource_byname(pdev, "iram");
+	if (IS_ERR(pfe->iram_baseaddr))
+		return dev_err_probe(dev, PTR_ERR(pfe->iram_baseaddr),
+				      "Failed to map iram resource\n");
+
+	{
+		struct device_node *mem_np;
+		struct reserved_mem *rmem;
+
+		mem_np = of_parse_phandle(dev->of_node, "memory-region", 0);
+		if (!mem_np)
+			return dev_err_probe(dev, -ENODEV,
+					      "Missing memory-region (ddr carve-out)\n");
+
+		rmem = of_reserved_mem_lookup(mem_np);
+		of_node_put(mem_np);
+		if (!rmem)
+			return dev_err_probe(dev, -ENODEV,
+					      "Failed to look up ddr reserved-memory region\n");
+
+		pfe->ddr_phys_baseaddr = rmem->base;
+		pfe->ddr_size = rmem->size;
+
+		/*
+		 * Plain cacheable system DRAM (packet buffers/route table),
+		 * not a device MMIO window -- memremap(), not ioremap().
+		 * No live cross-master DMA happens yet at this stage (that
+		 * starts in Stage P5), so this stage doesn't need to answer
+		 * the cache-coherency question between the ARM cores and
+		 * the PFE's own bus master; Stage P5 does and must revisit
+		 * this mapping if real traffic shows corruption.
+		 */
+		pfe->ddr_baseaddr = devm_memremap(dev, pfe->ddr_phys_baseaddr,
+						   pfe->ddr_size, MEMREMAP_WB);
+		if (IS_ERR(pfe->ddr_baseaddr))
+			return dev_err_probe(dev, PTR_ERR(pfe->ddr_baseaddr),
+					      "Failed to map ddr carve-out\n");
+	}
+
+	pfe_lib_init(pfe->cbus_baseaddr, pfe->ddr_baseaddr, pfe->ddr_phys_baseaddr,
+		     pfe->ddr_size);
+
+	ret = pfe_hw_init(pfe);
+	if (ret)
+		return dev_err_probe(dev, ret, "pfe_hw_init failed\n");
+
+	dev_info(dev, "PFE platform probed (apb=%p cbus=%p ddr=%pa/%u iram=%p hif_irq=%d)\n",
+		 pfe->apb_baseaddr, pfe->cbus_baseaddr, &pfe->ddr_phys_baseaddr,
+		 pfe->ddr_size, pfe->iram_baseaddr, pfe->hif_irq);
 
 	return 0;
 }
@@ -99,6 +151,8 @@ static int pfe_platform_probe(struct platform_device *pdev)
 static void pfe_platform_remove(struct platform_device *pdev)
 {
 	struct pfe *pfe = platform_get_drvdata(pdev);
+
+	pfe_hw_exit(pfe);
 
 	reset_control_assert(pfe->rst_core);
 	reset_control_assert(pfe->rst_axi);
