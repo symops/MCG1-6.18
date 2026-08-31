@@ -1305,6 +1305,57 @@ Cosmetic, rootfs-side, not a kernel issue
     loadable module. Harmless -- boot continues -- and out of scope
     for this kernel repo to fix (rootfs-side init script).
 
+Watchdog reset-control conflict with syscon
+============================================
+
+Every real-hardware boot log since the very first Stage 2 capture
+showed this, unrelated to any of the PFE work above -- root-caused and
+fixed while working through this doc:
+
+::
+
+    WARNING: CPU: ... at drivers/reset/core.c:799 __reset_control_get_internal+0x108/0x198
+    ...
+    __reset_control_get_internal from __of_reset_control_get+0x168/0x1cc
+    __of_reset_control_get from __devm_reset_control_get+0x68/0xf0
+    __devm_reset_control_get from ls1024a_wdt_probe+0xa0/0x2e8
+    ...
+    ls1024a-wdt 90450000.timer:watchdog: Failed to get watchdog reset control
+    ls1024a-wdt 90450000.timer:watchdog: probe with driver ls1024a-wdt failed with error -16
+
+Root cause: ``ls1024a_wdt_probe()``'s own
+``syscon_node_to_regmap(dev->of_node->parent)`` call (needed to reach
+the "timer" node's registers, and the line immediately before the
+failing one) triggers, as a side effect, the generic syscon
+framework's registration of that same parent node
+(``drivers/mfd/syscon.c``, ``of_syscon_register()`` with
+``check_res=true``): it does its own
+``of_reset_control_get_optional_exclusive()`` +
+``reset_control_deassert()`` on the node's reset line and, on the
+success path, never calls ``reset_control_put()`` -- that handle sits
+in the reset framework's list forever, held exclusively. The
+watchdog driver's very next lines then ask for the *same* reset line
+again (``devm_reset_control_get_shared()``, same parent node), which
+always collides with the permanently-held exclusive syscon handle --
+shared or not doesn't matter, ``drivers/reset/core.c``'s
+``__reset_control_get_internal()`` only allows a second handle on an
+already-held line when both sides are shared, or via a narrow
+unshared-and-unacquired carve-out a shared request doesn't qualify
+for.
+
+Fix: since syscon's own registration already deasserts this reset
+before ``ls1024a_wdt_probe()`` reaches the ``syscon_node_to_regmap()``
+call, there was nothing left for the watchdog driver to legitimately
+request or deassert -- removed entirely from
+``drivers/watchdog/ls1024a_wdt.c`` (the ``struct reset_control *``
+field, the get+deassert in probe, the assert in remove). The DT
+``resets``/``reset-names`` property stays on the "timer" node itself
+(still genuinely needed, by syscon's own registration).
+
+**Confirmed on real hardware**: the warning and the two error lines
+are completely gone from the boot log, with no regression to the rest
+of boot.
+
 Toolchain note
 ==============
 
