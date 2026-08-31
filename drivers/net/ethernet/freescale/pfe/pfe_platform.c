@@ -5,10 +5,10 @@
  *
  * Stage P3 of the port (see Documentation/arm/ls1024a-wdmycloud.rst):
  * on top of the Stage P1/P2 resource/clock/reset skeleton, map the
- * "ddr" packet-buffer carve-out and "iram" window, and bring up the
- * BMU/GPI/CLASS/TMU/UTIL hardware blocks via pfe_hw_init() (see
- * pfe_hw.c/pfe_hw_lib.c). HIF, firmware loading and the net_device
- * layer are still not touched -- that starts in Stage P4 onward.
+ * "ddr" packet-buffer carve-out and bring up the BMU/GPI/CLASS/TMU/UTIL
+ * hardware blocks via pfe_hw_init() (see pfe_hw.c/pfe_hw_lib.c). IRAM
+ * access, HIF, firmware loading and the net_device layer are still not
+ * touched -- that starts in Stage P4 onward.
  */
 
 #include <linux/clk.h>
@@ -95,10 +95,13 @@ static int pfe_platform_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to request hif IRQ\n");
 
-	pfe->iram_baseaddr = devm_platform_ioremap_resource_byname(pdev, "iram");
-	if (IS_ERR(pfe->iram_baseaddr))
-		return dev_err_probe(dev, PTR_ERR(pfe->iram_baseaddr),
-				      "Failed to map iram resource\n");
+	/*
+	 * IRAM is deliberately not mapped here -- see the comment on the
+	 * pfe DT node for why (the region is already owned by the
+	 * existing generic mmio-sram node, a second ioremap conflicts).
+	 * pfe->iram_baseaddr stays NULL until Stage P4 wires up proper
+	 * access through that node's genalloc pool.
+	 */
 
 	{
 		struct device_node *mem_np;
@@ -141,9 +144,9 @@ static int pfe_platform_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "pfe_hw_init failed\n");
 
-	dev_info(dev, "PFE platform probed (apb=%p cbus=%p ddr=%pa/%u iram=%p hif_irq=%d)\n",
+	dev_info(dev, "PFE platform probed (apb=%p cbus=%p ddr=%pa/%u hif_irq=%d)\n",
 		 pfe->apb_baseaddr, pfe->cbus_baseaddr, &pfe->ddr_phys_baseaddr,
-		 pfe->ddr_size, pfe->iram_baseaddr, pfe->hif_irq);
+		 pfe->ddr_size, pfe->hif_irq);
 
 	return 0;
 }

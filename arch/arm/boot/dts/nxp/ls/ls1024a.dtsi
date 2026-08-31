@@ -444,11 +444,21 @@
 		 * The old 3.2.26 vendor board file also lists an "ipsec"
 		 * resource for hardware IPsec offload -- intentionally not
 		 * carried forward here (not porting that offload path).
+		 *
+		 * No "iram" MMIO resource here: the IRAM window is already
+		 * owned by the generic mmio-sram node above (&iram) --
+		 * a second, separate devm_ioremap_resource() on the same
+		 * physical range from this node fails with -EBUSY (confirmed
+		 * on real hardware). Nothing in this driver actually needs
+		 * direct IRAM access yet; when firmware loading does (Stage
+		 * P4), it should go through &iram's own genalloc pool (see
+		 * clk_bypass_bug@fc00 above for the existing child-node
+		 * pattern), not a raw competing ioremap.
 		 */
 		pfe: pfe@90500000 {
 			compatible = "fsl,ls1024a-pfe";
-			reg = <0x90500000 0x10000>, <0x9c000000 0x1000000>, <0x83000000 0x2000>;
-			reg-names = "apb", "axi", "iram";
+			reg = <0x90500000 0x10000>, <0x9c000000 0x1000000>;
+			reg-names = "apb", "axi";
 			memory-region = <&pfe_ddr>;
 			interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "hif";
