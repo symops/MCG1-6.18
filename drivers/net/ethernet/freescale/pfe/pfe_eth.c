@@ -8,7 +8,14 @@
  *
  * Stage P7 confirmed on real hardware: PHY address 0 (Broadcom
  * BCM54612E), MDIO bus and PHY connect both working (see
- * Documentation/arm/ls1024a-wdmycloud.rst).
+ * Documentation/arm/ls1024a-wdmycloud.rst). Getting there needed one
+ * fix not obvious from the vendor source: each GEM has its own
+ * "extphy" reference clock (LS1024A_CLK_EXTPHY0/1/2), separate from
+ * the pfe node's shared "gemtx", that this port never requested --
+ * without it, the kernel's own "disabling unused clocks" late-boot
+ * step gates it off a couple seconds in, and every MDIO transaction
+ * after that silently returns stale data instead of erroring (see
+ * pfe_eth_probe_gem()).
  *
  * Stage P8 adds the actual Tx/Rx path:
  *
@@ -481,12 +488,6 @@ static int pfe_eth_open(struct net_device *dev)
 		return rc;
 	}
 
-	rc = clk_prepare_enable(priv->gemtx_clk);
-	if (rc) {
-		netdev_err(dev, "failed to enable gemtx clock: %d\n", rc);
-		goto err_clk;
-	}
-
 	pfe_gemac_init(priv);
 
 	if (!is_valid_ether_addr(dev->dev_addr)) {
@@ -521,8 +522,6 @@ static int pfe_eth_open(struct net_device *dev)
 	return 0;
 
 err_addr:
-	clk_disable_unprepare(priv->gemtx_clk);
-err_clk:
 	hif_lib_client_unregister(client);
 	return rc;
 }
@@ -537,8 +536,6 @@ static int pfe_eth_close(struct net_device *dev)
 
 	if (priv->phydev)
 		pfe_phy_exit(dev);
-
-	clk_disable_unprepare(priv->gemtx_clk);
 
 	/*
 	 * Force-flush every Tx descriptor still in flight before releasing
@@ -571,9 +568,15 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 		return NETDEV_TX_OK;
 	}
 
-	hif_tx_lock(&priv->pfe->hif);
-
 	/*
+	 * No external tx_lock here: hif_lib_xmit_pkt() calls hif_xmit_pkt()
+	 * (pfe_hif.c, Stage P5), which already takes hif->tx_lock itself
+	 * (and already calls hif_tx_dma_start() on the success path) --
+	 * wrapping this call in another hif_tx_lock()/hif_tx_unlock() pair
+	 * self-deadlocked on real hardware the first time real traffic (an
+	 * IPv6 MLD report) actually reached this path, since spin_lock_bh()
+	 * isn't reentrant.
+	 *
 	 * No hardware checksum offload wired up (NETIF_F_IP_CSUM isn't a
 	 * declared feature, so skb->ip_summed should never actually be
 	 * CHECKSUM_PARTIAL here) and no queue-full backpressure -- ring is
@@ -583,15 +586,10 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 	 * returning NETDEV_TX_BUSY with nothing to ever un-stick it.
 	 */
 	if (hif_lib_xmit_pkt(&priv->client, PFE_ETH_TXQ, skb->data, skb->len, 0, skb)) {
-		hif_tx_unlock(&priv->pfe->hif);
 		dev_kfree_skb_any(skb);
 		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
 	}
-
-	hif_tx_dma_start();
-
-	hif_tx_unlock(&priv->pfe->hif);
 
 	dev->stats.tx_packets++;
 	dev->stats.tx_bytes += skb->len;
@@ -631,16 +629,62 @@ static const struct ethtool_ops pfe_ethtool_ops = {
 	.set_link_ksettings = phy_ethtool_set_link_ksettings,
 };
 
+static void pfe_eth_extphy_clk_release(void *data)
+{
+	struct clk *clk = data;
+
+	clk_disable_unprepare(clk);
+	clk_put(clk);
+}
+
 static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 {
 	struct pfe_eth_priv_s *priv;
 	struct net_device *dev;
+	struct clk *extphy_clk;
 	u32 id;
 	int rc;
 
 	if (of_property_read_u32(np, "reg", &id) || id > 2) {
 		dev_err(pfe->dev, "%pOF: missing/invalid reg property\n", np);
 		return -EINVAL;
+	}
+
+	/*
+	 * Each GEM has its own "extphy" reference clock line
+	 * (LS1024A_CLK_EXTPHY0/1/2 in clk-ls1024a.c) distinct from the pfe
+	 * node's shared "gemtx" -- confirmed on real hardware to be required
+	 * for this GEM's PHY management (MDIO) to keep working at all. Without
+	 * it, MDIO reads/writes still complete (the bus protocol handshake
+	 * itself doesn't need it) but every read past the first ~1-2s of
+	 * boot silently returns the last successfully-read value instead of
+	 * the register actually requested, regardless of which PHY/register
+	 * is addressed -- traced to the kernel's own "clk: Disabling unused
+	 * clocks" late boot step physically gating this line off, since
+	 * nothing had ever requested it before. gem0 isn't its own struct
+	 * device (no of_platform_populate() for pfe's child nodes), so
+	 * of_clk_get_by_name() rather than devm_clk_get() -- cleanup is tied
+	 * to the parent pfe device's lifetime via devm_add_action_or_reset()
+	 * instead, since nothing currently unbinds a single GEM's node
+	 * independently of the whole pfe device.
+	 */
+	extphy_clk = of_clk_get_by_name(np, "extphy");
+	if (IS_ERR(extphy_clk)) {
+		dev_warn(pfe->dev, "%pOF: no extphy clock (rc=%ld) -- MDIO may stop working after boot\n",
+			 np, PTR_ERR(extphy_clk));
+	} else {
+		rc = clk_prepare_enable(extphy_clk);
+		if (rc) {
+			dev_warn(pfe->dev, "%pOF: failed to enable extphy clock: %d\n", np, rc);
+			clk_put(extphy_clk);
+		} else {
+			rc = devm_add_action_or_reset(pfe->dev, pfe_eth_extphy_clk_release, extphy_clk);
+			if (rc) {
+				clk_disable_unprepare(extphy_clk);
+				clk_put(extphy_clk);
+				return rc;
+			}
+		}
 	}
 
 	if (pfe_gem_netdevs[id]) {
@@ -668,7 +712,6 @@ static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 	priv->id = id;
 	priv->of_node = np;
 	priv->mii_bus = pfe_mii_bus;
-	priv->gemtx_clk = pfe->clk_gem_tx;
 	spin_lock_init(&priv->lock);
 
 	switch (id) {
@@ -717,10 +760,24 @@ int pfe_eth_init(struct pfe *pfe)
 	struct device_node *np;
 	int rc;
 
-	pfe->clk_gem_tx = devm_clk_get(pfe->dev, "gemtx");
+	/*
+	 * Enabled for the platform device's whole lifetime, not scoped to
+	 * .ndo_open/.ndo_stop like the vendor driver's own clk_enable()/
+	 * clk_disable() calls in pfe_eth_open()/pfe_eth_close() -- a plain
+	 * devm_clk_get() here left the clock unprepared/disabled between
+	 * probe (~1.2s) and the first .ndo_open() (~10s, whenever ifup
+	 * actually runs), and the kernel's own late_initcall "clk: Disabling
+	 * unused clocks" (~2.2s) physically gates off exactly this kind of
+	 * still-unused clock in that window. Confirmed on real hardware:
+	 * every MDIO transaction after that gate-then-open cycle returned
+	 * the same stuck stale value regardless of which register was
+	 * requested, as if the GEMAC's MDIO management sub-block never
+	 * recovered from losing (and later regaining) its clock mid-boot.
+	 */
+	pfe->clk_gem_tx = devm_clk_get_enabled(pfe->dev, "gemtx");
 	if (IS_ERR(pfe->clk_gem_tx))
 		return dev_err_probe(pfe->dev, PTR_ERR(pfe->clk_gem_tx),
-				      "failed to get gemtx clock\n");
+				      "failed to get/enable gemtx clock\n");
 
 	mdio_np = of_get_child_by_name(pfe_np, "mdio");
 	if (!mdio_np) {

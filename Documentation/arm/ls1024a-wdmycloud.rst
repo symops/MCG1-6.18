@@ -1518,8 +1518,54 @@ Stage P8 (Tx/Rx traffic path for GEM0)
     actually occur; ``pfe_eth_rx_drain()`` drops defensively (with a
     rate-limited warning) rather than mishandle it if it ever does.
 
-    Build-verified; hardware round-trip (the plan's round #5, DHCP+ping)
-    pending.
+    **Two real-hardware bugs found and fixed during the round #5
+    round-trip** (both invisible in a build-only check -- neither has
+    any effect until MDIO keeps working past early boot, or until a
+    real packet actually reaches ``.ndo_start_xmit``):
+
+    - **Missing per-GEM "extphy" clock breaks MDIO a couple seconds
+      after boot.** Each GEM has its own reference clock line
+      (``LS1024A_CLK_EXTPHY0/1/2`` in ``clk-ls1024a.c``), separate from
+      the ``pfe`` node's shared ``"gemtx"`` -- this port never requested
+      it. Symptom, confirmed via a temporary raw-register debug build:
+      MDIO reads kept completing (the bus protocol handshake itself
+      doesn't need this clock) but silently returned the *previous*
+      successful read's value for any register/PHY address, forever,
+      starting right around when the kernel's own "``clk: Disabling
+      unused clocks``" late-boot step runs -- it physically gated this
+      line off, since nothing had ever asked for it. Traced with a
+      from-scratch, timestamped, independent MDIO poll (a kernel timer
+      unrelated to this driver's own open()/close() call sequence) to
+      pin the exact moment against every other boot-time log line,
+      after two earlier hypotheses (a PHY-mode-select register write
+      disrupting the MDIO block; the already-known ``"gemtx"`` clock
+      being gated) were each build-tested and real-hardware-tested and
+      ruled out in turn. Fixed by requesting and enabling ``"extphy"``
+      in ``pfe_eth_probe_gem()`` (``of_clk_get_by_name()``, since a GEM
+      child node isn't its own ``struct device`` -- cleanup wired to the
+      parent ``pfe`` device's lifetime via
+      ``devm_add_action_or_reset()``).
+    - **``pfe_eth_send_packet()`` self-deadlocked on the very first real
+      packet.** It wrapped its call to ``hif_lib_xmit_pkt()`` in
+      ``hif_tx_lock()``/``hif_tx_unlock()``, but ``hif_lib_xmit_pkt()``
+      already calls ``hif_xmit_pkt()`` (Stage P5, ``pfe_hif.c``), which
+      takes the *same* ``hif->tx_lock`` itself (and already calls
+      ``hif_tx_dma_start()`` on success, making the outer call's own
+      ``hif_tx_dma_start()`` redundant too). ``spin_lock_bh()`` isn't
+      reentrant, so the second acquire spun forever -- surfaced as an
+      ``rcu: INFO: rcu_sched self-detected stall on CPU`` with CPU 1
+      stuck at ``_raw_spin_lock_bh`` inside ``hif_xmit_pkt()``, called
+      from a ``kworker`` thread's ``mld_ifc_work`` (the kernel's own
+      IPv6 multicast-listener report going out over eth0 -- not
+      DHCP/ping traffic, but real enough to hit the same TX path).
+      Fixed by removing the redundant outer lock and DMA-start call.
+
+    Confirmed on real hardware after both fixes: sustained MDIO health
+    past the "disabling unused clocks" mark (independently verified for
+    a full minute via the same debug timer used to find the clock bug),
+    and TX submission surviving real IPv6 multicast-report traffic
+    without deadlocking. DHCP+ping itself (the plan's actual round #5
+    bar) not yet separately confirmed as a follow-up step.
 
 Watchdog reset-control conflict with syscon
 ============================================

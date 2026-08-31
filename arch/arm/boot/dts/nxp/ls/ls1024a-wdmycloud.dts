@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /dts-v1/;
+#include <dt-bindings/clock/ls1024a.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/leds/common.h>
 #include "ls1024a.dtsi"
@@ -128,6 +129,18 @@
 		reg = <0>;
 		phy-mode = "rgmii-id";
 		phy-handle = <&phy0>;
+		/*
+		 * Confirmed required on real hardware (see the "MDIO stops
+		 * working ~1s after boot" writeup in
+		 * Documentation/arm/ls1024a-wdmycloud.rst): a per-GEM 125MHz
+		 * clock line, distinct from the pfe node's shared "gemtx".
+		 * Without it, the kernel's own "disabling unused clocks" late
+		 * boot step gates this line off shortly after boot (nothing
+		 * had ever requested it), and every MDIO read past that point
+		 * silently returns stale data instead of erroring.
+		 */
+		clocks = <&clkcore LS1024A_CLK_EXTPHY0>;
+		clock-names = "extphy";
 	};
 };
 
