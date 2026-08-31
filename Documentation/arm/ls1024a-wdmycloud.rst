@@ -1185,6 +1185,50 @@ independent issues on this specific controller/chip/board combination,
 and all are now fixed. ``/dev/mtd0`` reads reliably and repeatedly on
 real hardware, not just as a one-shot probe.
 
+PFE (Packet Forwarding Engine) network driver port
+====================================================
+
+Staged port of the 3.2.26 vendor ``pfe`` driver
+(``kmodules/mspd-c2k/pfe/pfe_ctrl/`` in symops/MCG1-3.2.26), following
+the plan recorded when this stage began (see git history for the full
+staged plan -- Stage P1 through P10). Progress so far:
+
+Stage P1 (platform_driver skeleton) and P2 (enabled on the board)
+    ``drivers/net/ethernet/freescale/pfe/`` brings up the ``apb``/
+    ``axi`` (cbus) MMIO windows, the ``pfe``/``pfe_sys`` clocks and
+    the ``axi``/``core`` resets, and requests (unarmed) the ``hif``
+    IRQ. **Confirmed on real hardware**: ``fsl-ls1024a-pfe
+    90500000.pfe: PFE platform skeleton probed`` at 1.1s into boot,
+    clean probe, no crash, no regression to the rest of boot (root
+    filesystem, userspace, login all unaffected).
+
+    The pre-existing ``ls1024a-wdt: Failed to get watchdog reset
+    control`` / ``probe ... failed with error -16`` warning some
+    hardware round-trips show near this point in the log is **not**
+    caused by this driver -- confirmed present in an earlier boot log
+    captured before any PFE work started. Unrelated, already-known,
+    non-fatal.
+
+Interesting finding for later stages
+    **barebox itself already initializes PFE at boot**, before Linux
+    ever runs: every real-hardware boot log shows barebox's own
+    ``pfe_hw_init: done`` / ``pfe_firmware_init`` / ``pfe_load_elf``
+    (class/tmu/util firmware loaded) lines during its own startup,
+    well before the kernel's ``Kernel command line:`` line. By the
+    time Stage P4 (this port's own firmware loader) runs, the PFE
+    hardware may already be running barebox's firmware. Whether
+    Stage P4 needs to reset the blocks first, can reuse the
+    already-loaded state, or needs some other handling is an open
+    question to resolve when that stage is implemented, not assumed
+    now.
+
+Cosmetic, rootfs-side, not a kernel issue
+    The Devuan rootfs's init scripts still try ``modprobe pfe`` (the
+    old vendor kernel's module name) and fail with ``Module pfe not
+    found`` since this port's driver is built in (``=y``), not a
+    loadable module. Harmless -- boot continues -- and out of scope
+    for this kernel repo to fix (rootfs-side init script).
+
 Toolchain note
 ==============
 
