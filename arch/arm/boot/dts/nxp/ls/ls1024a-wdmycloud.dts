@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /dts-v1/;
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
 #include "ls1024a.dtsi"
 
 / {
@@ -9,6 +11,75 @@
 	chosen {
 		bootargs = "console=ttyS0,115200n8 earlyprintk";
 		stdout-path = &uart1;
+	};
+
+	/*
+	 * Both LEDs are plain GPIO output bits on the SoC's own GPIO
+	 * controller (drivers/leds/leds-wd.c in the 3.2.26 vendor tree
+	 * drives them by poking COMCERTO_GPIO_OUTPUT_REG directly, at the
+	 * same bit positions gpio-ls1024a.c already exposes as GPIO lines
+	 * 5-7 and 12-13 -- 1 = LED on, matching GPIO_ACTIVE_HIGH). No
+	 * pinmux group is needed: the vendor board init code never
+	 * switches these pins away from GPIO by default (only the
+	 * currently-unported PWM breathing/pulse mode does, via
+	 * COMCERTO_GPIO_PIN_SELECT_REG).
+	 */
+	system_leds: system-leds {
+		compatible = "gpio-leds";
+
+		led_system_red: led-0 {
+			gpios = <&gpio 7 GPIO_ACTIVE_HIGH>;
+			color = <LED_COLOR_ID_RED>;
+			function = LED_FUNCTION_STATUS;
+		};
+
+		led_system_green: led-1 {
+			gpios = <&gpio 5 GPIO_ACTIVE_HIGH>;
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_STATUS;
+		};
+
+		led_system_blue: led-2 {
+			gpios = <&gpio 6 GPIO_ACTIVE_HIGH>;
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_STATUS;
+		};
+	};
+
+	system_led: multi-led-0 {
+		compatible = "leds-group-multicolor";
+		color = <LED_COLOR_ID_RGB>;
+		function = LED_FUNCTION_STATUS;
+		leds = <&led_system_red>, <&led_system_green>, <&led_system_blue>;
+	};
+
+	/*
+	 * wifi_led is two separately-colored LEDs (not R/G/B primaries),
+	 * combined the same way the vendor driver did for its "white"
+	 * state (both on at once) -- LED_COLOR_ID_MULTI rather than
+	 * LED_COLOR_ID_RGB since these aren't RGB primaries.
+	 */
+	wifi_leds: wifi-leds {
+		compatible = "gpio-leds";
+
+		led_wifi_yellow: led-0 {
+			gpios = <&gpio 12 GPIO_ACTIVE_HIGH>;
+			color = <LED_COLOR_ID_YELLOW>;
+			function = LED_FUNCTION_WLAN;
+		};
+
+		led_wifi_blue: led-1 {
+			gpios = <&gpio 13 GPIO_ACTIVE_HIGH>;
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_WLAN;
+		};
+	};
+
+	wifi_led: multi-led-1 {
+		compatible = "leds-group-multicolor";
+		color = <LED_COLOR_ID_MULTI>;
+		function = LED_FUNCTION_WLAN;
+		leds = <&led_wifi_yellow>, <&led_wifi_blue>;
 	};
 };
 
@@ -87,14 +158,15 @@
  *    kmodules/mspd-c2k/pfe sources and firmware blobs in
  *    symops/MCG1-3.2.26) driving EMAC1-3/EGPI/HGPI/BMU/CLASS/TMU/UTIL/HIF.
  *  - RTC (c2k-rtc): proprietary Mindspeed block, no driver in mainline
- *    or in this fork. Board boots with NTP-only timekeeping for now.
- *  - Board LEDs (system_led RGB via GPIO 5/6/7, wifi_led via GPIO 12/13):
- *    the old kernel drove these with direct register pokes
- *    (drivers/leds/leds-wd.c in the 3.2.26 tree), not through
- *    gpio-leds. No LS1024A PWM driver exists yet in this fork, and
- *    the RGB LED combining logic doesn't map cleanly onto plain
- *    gpio-leds. Left out of this DTS rather than describing hardware
- *    with no driver behind it. (This board has no fan.)
+ *    or in this fork. Board has no RTC backup battery, so NTP-only
+ *    timekeeping is the permanent behavior here, not a gap.
+ *  - Board LED breathing/pulse effect: the vendor driver's "pulse"
+ *    mode drives these LEDs through hardware PWM1-3 instead of plain
+ *    GPIO (see system_leds/wifi_leds above for the plain on/off
+ *    support, which is wired up). No LS1024A PWM driver exists yet in
+ *    this fork, so only software-side blink (via LED triggers) is
+ *    available for now, not the smooth hardware pulse. (This board
+ *    has no fan, unlike some other SKUs sharing the vendor image.)
  *  - PCIe (pcie0/pcie1, inherited disabled from ls1024a.dtsi): PCIe0
  *    reported "Link Up Failed" in the old kernel's boot log -- nothing
  *    is physically connected on this board.
