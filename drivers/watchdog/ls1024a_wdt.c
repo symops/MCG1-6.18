@@ -3,7 +3,6 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
-#include <linux/reset.h>
 #include <linux/watchdog.h>
 #include <linux/mfd/syscon.h>
 
@@ -24,7 +23,6 @@ struct ls1024a_wdt {
 	struct watchdog_device wdt;
 	struct clk *clk;
 	unsigned long clk_rate; /* Cached value */
-	struct reset_control *rst;
 	struct regmap *regs;
 	struct regmap *clkcore;
 };
@@ -229,23 +227,28 @@ static int ls1024a_wdt_probe(struct platform_device *pdev)
 		return PTR_ERR(priv->clkcore);
 	}
 
-	priv->rst = devm_reset_control_get_shared(dev->parent, NULL);
-	if (IS_ERR(priv->rst)) {
-		dev_err(dev, "Failed to get watchdog reset control\n");
-		return PTR_ERR(priv->rst);
-	}
-
 	priv->clk = devm_clk_get(dev->parent, NULL);
 	if (IS_ERR(priv->clk)) {
 		dev_err(dev, "Failed to get watchdog clock\n");
 		return PTR_ERR(priv->clk);
 	}
 
-	res = reset_control_deassert(priv->rst);
-	if (res) {
-		dev_err(dev, "Failed to put watchdog out of reset\n");
-		return res;
-	}
+	/*
+	 * No reset_control_get() here: this block's reset line
+	 * (LS1024A_AXI_RTC_TIM_RST, on the parent "timer" node) is already
+	 * deasserted as a side effect of syscon_node_to_regmap() above --
+	 * the generic syscon framework itself does an exclusive
+	 * of_reset_control_get_optional_exclusive() + reset_control_deassert()
+	 * on that same node during registration (drivers/mfd/syscon.c,
+	 * check_res path) and never releases the handle. A second,
+	 * independent get here (shared or not) always collided with that
+	 * permanently-held exclusive one -- confirmed on real hardware as
+	 * a "WARNING: ... __reset_control_get_internal" + "Failed to get
+	 * watchdog reset control" + probe failure (-EBUSY) on every boot,
+	 * present from the very first Stage 2 boot log, long before this
+	 * project's own driver work started elsewhere. There is nothing
+	 * left for this driver to legitimately deassert.
+	 */
 
 	res = clk_prepare_enable(priv->clk);
 	if (res) {
@@ -292,7 +295,6 @@ static void ls1024a_wdt_remove(struct platform_device *pdev)
 {
 	struct ls1024a_wdt *priv = platform_get_drvdata(pdev);
 	clk_disable_unprepare(priv->clk);
-	reset_control_assert(priv->rst);
 }
 
 static const struct of_device_id ls1024a_wdt_of_match[] = {
