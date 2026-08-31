@@ -101,11 +101,25 @@ Board LEDs
     fan; that driver is for a different SKU sharing the same vendor
     kernel image. Nothing to port here.)
 
-    No LS1024A PWM driver exists yet in the Bonstra fork, and the RGB
-    combining logic doesn't map cleanly onto the generic
-    ``gpio-leds`` binding, so this was deliberately
-    left out of the board DTS rather than describing hardware with no
-    driver behind it.
+    Plain on/off support (not the PWM pulse mode) is now wired up in
+    ``ls1024a-wdmycloud.dts``: ``gpio-ls1024a.c`` already exposes GPIO
+    lines 5-7 and 12-13 at the exact bit positions the vendor driver
+    pokes, active-high, with no pinmux group needed (these pins
+    default to GPIO mode -- only the PWM pulse mode switches them away
+    from it, via ``COMCERTO_GPIO_PIN_SELECT_REG``, which this port
+    doesn't do). ``system_led`` is three ``gpio-leds`` single-color
+    LEDs (red/green/blue) combined via ``leds-group-multicolor``
+    (``LED_COLOR_ID_RGB``) into one ``/sys/class/leds/system_led``
+    with a ``multi_intensity`` channel per color. ``wifi_led`` is the
+    same idea with two non-primary colors (yellow, blue) and
+    ``LED_COLOR_ID_MULTI`` instead, matching the vendor driver's
+    "white" state (both on at once). Not yet re-verified against real
+    hardware as of this writing -- see the commit history for status.
+
+    No LS1024A PWM driver exists yet in the Bonstra fork, so the
+    breathing/pulse effect itself remains unported; only the generic
+    software-side LED triggers (``linux,default-trigger`` etc.) are
+    available for blinking for now.
 
 PCIe
     ``pcie-ls1024a.c`` was ported and compiles (it turned out to need

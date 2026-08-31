@@ -174,13 +174,16 @@ both already expected/tracked below).
   battery, so even a working driver wouldn't retain time across power
   loss. NTP-after-boot is the correct permanent behavior here, not a
   gap to close; low priority.
-- **Board LEDs.** Driven by the old kernel through raw register pokes
-  (`drivers/leds/leds-wd.c` in the 3.2.26 tree) rather than gpiolib,
-  and there's no LS1024A PWM driver yet to build on. Left out of the
-  board DTS rather than describing hardware nothing can drive. (The
-  3.2.26 tree also has `drivers/hwmon/wd-fan.c`, but this board has no
-  physical fan -- that driver is for a different SKU sharing the same
-  vendor kernel image.)
+- **Board LED breathing/pulse effect.** Plain on/off LED support
+  (`system_led`, `wifi_led` under `/sys/class/leds`) is wired up via
+  `gpio-leds` + `leds-group-multicolor`, matching the GPIO bit
+  positions the old kernel's `drivers/leds/leds-wd.c` poked directly.
+  Only the vendor driver's hardware PWM "pulse"/breathing mode is
+  still missing -- no LS1024A PWM driver exists yet in this fork, so
+  only software-side LED triggers are available for smooth fades.
+  (The 3.2.26 tree also has `drivers/hwmon/wd-fan.c`, but this board
+  has no physical fan -- that driver is for a different SKU sharing
+  the same vendor kernel image.)
 - **PCIe**, though the driver compiles and is included: nothing is
   physically connected on this board (the old kernel's boot log shows
   "PCIe0: Link Up Failed"), so it's left disabled in the board DTS --
