@@ -184,4 +184,22 @@ void class_pe_lmem_memset(u32 dst, int val, unsigned int len);
 
 int pe_load_elf_section(int id, const void *data, const Elf32_Shdr *shdr);
 
+/**************************** HIF (copy) block ***************************/
+
+void hif_init(void);
+void hif_tx_enable(void);
+void hif_tx_disable(void);
+void hif_rx_enable(void);
+void hif_rx_disable(void);
+
+static inline void hif_rx_dma_start(void)
+{
+	writel(HIF_CTRL_DMA_EN | HIF_CTRL_BDP_CH_START_WSTB, HIF_RX_CTRL);
+}
+
+static inline void hif_tx_dma_start(void)
+{
+	writel(HIF_CTRL_DMA_EN | HIF_CTRL_BDP_CH_START_WSTB, HIF_TX_CTRL);
+}
+
 #endif /* _PFE_HW_LIB_H_ */

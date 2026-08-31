@@ -449,6 +449,47 @@ int pe_load_elf_section(int id, const void *data, const Elf32_Shdr *shdr)
 	return 0;
 }
 
+/**************************** HIF (copy) block ***************************/
+
+void hif_init(void)
+{
+	writel((HIF_RX_POLL_CTRL_CYCLE << 16) | HIF_TX_POLL_CTRL_CYCLE, HIF_POLL_CTRL);
+}
+
+void hif_tx_enable(void)
+{
+	writel(HIF_CTRL_DMA_EN, HIF_TX_CTRL);
+	writel((readl(HIF_INT_ENABLE) | HIF_INT_EN | HIF_TXPKT_INT_EN), HIF_INT_ENABLE);
+}
+
+void hif_tx_disable(void)
+{
+	u32 hif_int;
+
+	writel(0, HIF_TX_CTRL);
+
+	hif_int = readl(HIF_INT_ENABLE);
+	hif_int &= HIF_TXPKT_INT_EN;
+	writel(hif_int, HIF_INT_ENABLE);
+}
+
+void hif_rx_enable(void)
+{
+	hif_rx_dma_start();
+	writel((readl(HIF_INT_ENABLE) | HIF_INT_EN | HIF_RXPKT_INT_EN), HIF_INT_ENABLE);
+}
+
+void hif_rx_disable(void)
+{
+	u32 hif_int;
+
+	writel(0, HIF_RX_CTRL);
+
+	hif_int = readl(HIF_INT_ENABLE);
+	hif_int &= HIF_RXPKT_INT_EN;
+	writel(hif_int, HIF_INT_ENABLE);
+}
+
 /**************************** BMU ***************************/
 
 void bmu_reset(void __iomem *base)
