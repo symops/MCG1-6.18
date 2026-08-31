@@ -1241,13 +1241,38 @@ Interesting finding for later stages
     ever runs: every real-hardware boot log shows barebox's own
     ``pfe_hw_init: done`` / ``pfe_firmware_init`` / ``pfe_load_elf``
     (class/tmu/util firmware loaded) lines during its own startup,
-    well before the kernel's ``Kernel command line:`` line. By the
-    time Stage P4 (this port's own firmware loader) runs, the PFE
-    hardware may already be running barebox's firmware. Whether
-    Stage P4 needs to reset the blocks first, can reuse the
-    already-loaded state, or needs some other handling is an open
-    question to resolve when that stage is implemented, not assumed
-    now.
+    well before the kernel's ``Kernel command line:`` line. Stage P4's
+    own firmware loader (below) simply reloads all three PEs from
+    scratch on top of whatever barebox left running, the same way the
+    vendor driver always did -- **confirmed working on real hardware**,
+    no special reset/reuse handling was needed after all.
+
+Stage P4 (firmware loader)
+    ``pfe_firmware_init()`` (``pfe_firmware.c``) loads class/tmu/util
+    via ``request_firmware()`` against the three ELF blobs built into
+    the kernel image (``CONFIG_EXTRA_FIRMWARE`` -- necessary since this
+    board has no initramfs and the pfe platform_driver probes at ~1.1s,
+    well before the ~2.5-3.4s root mount; see the commit history for
+    the full reasoning). **Confirmed on real hardware**: all three
+    loads report real section addresses (``class firmware loaded 0xbc0
+    0xc3010000``, ``tmu firmware loaded 0x1a0``, ``util firmware loaded
+    0x1220`` -- ``0xc3010000`` exactly matches ``PE_LMEM_BASE_ADDR``,
+    a good sanity check that the ELF section classification logic is
+    correct), the ``.version`` ELF section parses correctly
+    (``PFE binary version: pfe_nas_2_00_3``), and the full
+    ``PFE platform probed`` message appears with no regression to the
+    rest of boot.
+
+    Also confirmed on real hardware: this board's ``system_rev`` really
+    is ``0``, which per the vendor driver's own logic would select the
+    ``util_c2000_revA0.elf`` firmware variant -- a file this GPL source
+    drop doesn't actually contain (only the non-revA0 ``util_c2000.elf``
+    is present). The driver logs a warning and loads ``util_c2000.elf``
+    anyway; it loaded and enabled without error, but whether it behaves
+    correctly for revA0 silicon specifically is unverified and won't
+    surface until UTIL's actual runtime behavior is exercised in a
+    later stage. If util-related packet processing misbehaves once
+    traffic flows, this substitution is the first thing to revisit.
 
 Cosmetic, rootfs-side, not a kernel issue
     The Devuan rootfs's init scripts still try ``modprobe pfe`` (the
