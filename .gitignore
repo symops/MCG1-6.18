@@ -24,6 +24,7 @@
 *.dwo
 *.dylib
 *.elf
+!/firmware/**/*.elf
 *.gcno
 *.gcda
 *.gz
