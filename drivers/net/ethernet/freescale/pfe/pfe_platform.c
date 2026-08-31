@@ -3,12 +3,27 @@
  * PFE (Packet Forwarding Engine) platform driver for the Freescale/
  * Mindspeed LS1024A (Comcerto 2000) SoC.
  *
- * Stage P4 of the port (see Documentation/arm/ls1024a-wdmycloud.rst):
- * on top of the Stage P1-P3 resource/clock/reset/hw-block skeleton,
- * load the class/tmu/util firmware and enable those PE cores via
- * pfe_firmware_init() (see pfe_firmware.c). IRAM access, HIF and the
- * net_device layer are still not touched -- that starts in Stage P5
- * onward.
+ * Stage P5 of the port (see Documentation/arm/ls1024a-wdmycloud.rst):
+ * on top of the Stage P1-P4 resource/clock/reset/hw-block/firmware
+ * skeleton, bring up the HIF DMA descriptor rings and ISR (see
+ * pfe_hif.c/pfe_hif_lib.c). The IRQ is now requested by pfe_hif_init()
+ * itself, once the ring/NAPI state it touches actually exists --
+ * Stage P1-P4 requested it early with an always-IRQ_NONE stub
+ * specifically because nothing was initialized yet; that stub and its
+ * early devm_request_irq() call are gone now that there's a real
+ * handler with real state to hand it (matches the vendor driver's own
+ * ordering: pfe_hif_init() does its own request_irq() internally).
+ *
+ * Probe ordering also now matches the vendor's pfe_probe() exactly:
+ * hw_init -> hif_lib_init -> hif_init -> firmware_init. This matters
+ * because pfe_firmware_init() ends by enabling the class/tmu/util PE
+ * cores (class_enable()/tmu_enable()/util_enable()) -- once enabled,
+ * firmware can start driving HIF traffic, so HIF must already be
+ * initialized and ready to receive before that happens. Stage P4 had
+ * firmware_init running right after hw_init, before HIF existed at
+ * all; reordered now, before real traffic is possible, rather than
+ * leaving a latent bug for whenever Stage P7-P9 exercises real
+ * traffic to discover the hard way.
  */
 
 #include <linux/clk.h>
@@ -23,18 +38,12 @@
 
 #include "pfe_mod.h"
 #include "pfe_firmware.h"
+#include "pfe_hif.h"
+#include "pfe_hif_lib.h"
 #include "pfe_hw.h"
 #include "pfe_hw_lib.h"
 
-static irqreturn_t pfe_hif_isr(int irq, void *dev_id)
-{
-	/*
-	 * Nothing in the PFE hardware is initialized yet at this stage,
-	 * so this interrupt should never actually fire -- if it does,
-	 * that is itself a diagnostic finding, not expected operation.
-	 */
-	return IRQ_NONE;
-}
+struct pfe *g_pfe;
 
 static int pfe_platform_probe(struct platform_device *pdev)
 {
@@ -91,16 +100,11 @@ static int pfe_platform_probe(struct platform_device *pdev)
 	if (pfe->hif_irq < 0)
 		return pfe->hif_irq;
 
-	ret = devm_request_irq(dev, pfe->hif_irq, pfe_hif_isr, 0,
-				"pfe_hif", pfe);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to request hif IRQ\n");
-
 	/*
 	 * IRAM is deliberately not mapped here -- see the comment on the
 	 * pfe DT node for why (the region is already owned by the
 	 * existing generic mmio-sram node, a second ioremap conflicts).
-	 * pfe->iram_baseaddr stays NULL until Stage P4 wires up proper
+	 * pfe->iram_baseaddr stays NULL until a later stage wires up proper
 	 * access through that node's genalloc pool.
 	 */
 
@@ -138,12 +142,29 @@ static int pfe_platform_probe(struct platform_device *pdev)
 					      "Failed to map ddr carve-out\n");
 	}
 
+	/* Every function from here on that doesn't take a struct pfe *
+	 * parameter of its own reaches this same instance via g_pfe.
+	 */
+	g_pfe = pfe;
+
 	pfe_lib_init(pfe->cbus_baseaddr, pfe->ddr_baseaddr, pfe->ddr_phys_baseaddr,
 		     pfe->ddr_size);
 
 	ret = pfe_hw_init(pfe);
 	if (ret)
 		return dev_err_probe(dev, ret, "pfe_hw_init failed\n");
+
+	ret = pfe_hif_lib_init(pfe);
+	if (ret) {
+		dev_err_probe(dev, ret, "pfe_hif_lib_init failed\n");
+		goto err_hif_lib;
+	}
+
+	ret = pfe_hif_init(pfe);
+	if (ret) {
+		dev_err_probe(dev, ret, "pfe_hif_init failed\n");
+		goto err_hif;
+	}
 
 	ret = pfe_firmware_init(pfe);
 	if (ret) {
@@ -158,6 +179,10 @@ static int pfe_platform_probe(struct platform_device *pdev)
 	return 0;
 
 err_fw:
+	pfe_hif_exit(pfe);
+err_hif:
+	pfe_hif_lib_exit(pfe);
+err_hif_lib:
 	pfe_hw_exit(pfe);
 	return ret;
 }
@@ -167,6 +192,8 @@ static void pfe_platform_remove(struct platform_device *pdev)
 	struct pfe *pfe = platform_get_drvdata(pdev);
 
 	pfe_firmware_exit(pfe);
+	pfe_hif_exit(pfe);
+	pfe_hif_lib_exit(pfe);
 	pfe_hw_exit(pfe);
 
 	reset_control_assert(pfe->rst_core);

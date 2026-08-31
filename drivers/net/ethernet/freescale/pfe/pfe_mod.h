@@ -8,6 +8,14 @@
 #include <linux/sizes.h>
 
 #include "pfe_cbus.h"
+#include "pfe_hif.h"
+
+/* Client library's own struct (pfe_hif_lib.h, Stage P7-P9); only ever
+ * referenced here as a pointer, so a forward declaration avoids a
+ * circular include (that header embeds a "struct pfe *pfe" pointer
+ * right back).
+ */
+struct hif_client_s;
 
 /*
  * DDR carve-out sub-layout, ported from the 3.2.26 vendor tree's
@@ -81,6 +89,35 @@ struct pfe {
 	unsigned long tmu_dmem_sh;
 	unsigned long util_dmem_sh;
 	unsigned long util_ddr_sh;
+
+	struct pfe_hif hif;
+
+	/* Registered clients, indexed by HIF_CLIENTS_MAX id (PFE_CL_GEM0,
+	 * ...). Populated by hif_lib_client_register() (Stage P7-P9);
+	 * hif_lib_indicate_client() (Stage P5) already needs to look this
+	 * up from the Rx path, so the array itself is needed now even
+	 * though nothing populates it yet.
+	 */
+	struct hif_client_s *hif_client[HIF_CLIENTS_MAX];
 };
+
+/*
+ * This SoC only ever has one PFE instance, and the vendor driver's own
+ * HIF/HIF-lib/GEMAC code is written throughout assuming direct access
+ * to a single global instance rather than threading a pointer through
+ * every call (e.g. hif_lib_indicate_client(), __hif_lib_xmit_pkt()).
+ * Fighting that pattern would mean touching a very large fraction of
+ * this port for no real benefit on hardware that can never have a
+ * second instance, so it's kept -- but named g_pfe, not the vendor's
+ * bare "pfe": every function in this port that already takes a
+ * struct pfe * has been using the parameter name "pfe" since Stage P1
+ * (confirmed working on real hardware many times over), and reusing
+ * that exact name for the global would silently shadow it in every one
+ * of those functions instead of raising a redeclaration error -- a
+ * correctness trap for zero benefit. Only code with no local "pfe" of
+ * its own (i.e. genuinely needs the single global instance) uses
+ * g_pfe. Set once in pfe_platform_probe().
+ */
+extern struct pfe *g_pfe;
 
 #endif /* _PFE_MOD_H_ */
