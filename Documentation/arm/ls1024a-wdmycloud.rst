@@ -1274,6 +1274,30 @@ Stage P4 (firmware loader)
     later stage. If util-related packet processing misbehaves once
     traffic flows, this substitution is the first thing to revisit.
 
+Stage P5 (HIF DMA descriptor ring + ISR)
+    ``pfe_hif.c``/``pfe_hif_lib.c`` bring up the HIF Rx/Tx descriptor
+    rings, the shared-memory Rx buffer pool, and the real ISR/NAPI Rx
+    path -- the highest-risk file in this whole port going in (a fully
+    custom host<->firmware DMA protocol, no mainline equivalent). Also
+    fixed a latent ordering bug from Stage P4: probe() now matches the
+    vendor's hw_init -> hif_lib_init -> hif_init -> firmware_init
+    sequence, since firmware_init's last step enables the PE cores and
+    they can only usefully drive HIF traffic once HIF is ready to
+    receive it (Stage P4 had firmware_init running immediately after
+    hw_init, before HIF existed at all).
+
+    **Confirmed on real hardware, first attempt** -- no crash, no hang,
+    despite this being the stage the plan flagged as most likely to
+    need retries: ``pfe_hif_lib_init: pkt size 1544, rx buffers 256``
+    (the shared buffer pool, real values matching PFE_PKT_SIZE and
+    HIF_RX_DESC_NT), the full ring/NAPI/IRQ setup inside
+    ``pfe_hif_init()`` completes, and ``PFE platform probed`` appears
+    with no regression to the rest of boot (reached login normally).
+    Not yet exercised: no client is registered (Stage P7-P9), so no
+    real Rx/Tx traffic has actually flowed through the ring yet -- this
+    confirms the ring initializes cleanly, not that packets survive it
+    end to end.
+
 Cosmetic, rootfs-side, not a kernel issue
     The Devuan rootfs's init scripts still try ``modprobe pfe`` (the
     old vendor kernel's module name) and fail with ``Module pfe not
