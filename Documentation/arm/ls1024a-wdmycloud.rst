@@ -1454,9 +1454,24 @@ Stage P7 (``pfe_eth.c`` -- net_device/MDIO/PHY for GEM0)
     ``ls1024a_defconfig`` given the board file's own identification of
     a Broadcom part -- if the ID doesn't match that driver's table,
     Generic PHY remains the fallback, so this can't regress link-up
-    either way. Link-up itself (with a real PHY driver bound and
-    ``pfe_eth_adjust_link()`` actually firing) is unconfirmed and is the
-    next thing a hardware boot should show.
+    either way.
+
+    **PHY connect confirmed on the very next boot** (``putty.log.37``,
+    same session): with the ``phy-handle`` now wired, ``of_phy_get_and_
+    connect()`` succeeded and the guessed ``CONFIG_BROADCOM_PHY=y`` paid
+    off -- the ID (``0362:5e6a``) resolves to a real, named part::
+
+        [   10.220000] Broadcom BCM54612E ls1024a-pfe-mdio:00: attached PHY driver (mii_bus:phy_addr=ls1024a-pfe-mdio:00, irq=POLL)
+
+    No crash, no regression, clean boot to login as before. Not yet
+    seen: an actual ``phy_print_status()`` "Link is Up" line --
+    ``pfe_eth_adjust_link()`` only prints on a state *transition*, and
+    the initial callback with the link still down doesn't count as one
+    (see the function's own logic), so this is consistent with no
+    Ethernet cable being plugged into this GEM0 port on the test bench
+    for this particular boot, not a driver problem. Worth a cabled
+    round trip before or alongside Stage P8 to see the transition print
+    and confirmed autoneg speed/duplex, but doesn't block starting P8.
 
 Watchdog reset-control conflict with syscon
 ============================================
