@@ -99,6 +99,10 @@
 	status = "okay";
 };
 
+&pfe {
+	status = "okay";
+};
+
 &ls_spi {
 	status = "okay";
 	num-cs = <1>;
