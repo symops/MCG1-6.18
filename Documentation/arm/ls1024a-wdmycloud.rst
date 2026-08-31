@@ -1419,18 +1419,44 @@ Stage P7 (``pfe_eth.c`` -- net_device/MDIO/PHY for GEM0)
     this SoC's clock rates, so getting it exactly right isn't safety-
     critical the way the PHY address is.
 
-    **Build-verified; hardware round-trip pending** -- this stage's own
-    checkpoint is specifically about observing the MDIO scan results (the
-    plan's round #4), not confirmed traffic (that's Stage P8's DHCP+ping
-    round). ``select PHYLIB`` was added to this driver's Kconfig entry
+    ``select PHYLIB`` was added to this driver's Kconfig entry
     (``CONFIG_MDIO_BUS``/``CONFIG_OF_MDIO`` follow automatically, no new
-    ``ls1024a_defconfig`` lines needed); a stray ``CONFIG_WIRELESS``/
-    ``CONFIG_PTP_1588_CLOCK`` reordering that showed up in a
-    ``savedefconfig`` pass while checking this was confirmed to reproduce
-    identically with the ``select PHYLIB`` line removed entirely --
-    pre-existing scratch-tree-vs-defconfig drift unrelated to this
-    stage (the same class of issue as Stage P1's defconfig bloat bug),
-    left untouched rather than folded into this change.
+    ``ls1024a_defconfig`` lines needed for those); a stray
+    ``CONFIG_WIRELESS``/``CONFIG_PTP_1588_CLOCK`` reordering that showed
+    up in a ``savedefconfig`` pass while checking this was confirmed to
+    reproduce identically with the ``select PHYLIB`` line removed
+    entirely -- pre-existing scratch-tree-vs-defconfig drift unrelated
+    to this stage (the same class of issue as Stage P1's defconfig
+    bloat bug), left untouched rather than folded into this change.
+
+    **Confirmed on real hardware** -- the plan's round #4, specifically
+    about observing the MDIO scan results rather than confirmed traffic
+    (that's Stage P8's DHCP+ping round). Full boot to login, no crash,
+    no regression to any earlier stage::
+
+        fsl-ls1024a-pfe 90500000.pfe: mdio: PHY responding at address 0 (id 0362:5e6a)
+        fsl-ls1024a-pfe 90500000.pfe: gem0 registered as eth0 (phy-mode rgmii-id)
+        fsl-ls1024a-pfe 90500000.pfe: PFE platform probed (apb=(ptrval) cbus=(ptrval) ddr=0x03400000/12582912 hif_irq=27)
+        ...
+        fsl-ls1024a-pfe 90500000.pfe eth0: no phy-handle in DT yet -- link will stay down
+
+    Exactly one PHY responded, at address 0 -- matching the
+    ``board-c2kevm.c`` comment's crossed-out ``phy_id=4`` -> ``phy_id=0``
+    identified above, now with real evidence instead of a decade-old
+    comment. The last line confirms the deliberate no-``phy-handle``
+    fallback path worked exactly as designed: ``pfe_eth_open()`` (run
+    from the rootfs's own ``ifup`` during boot) logged and skipped
+    ``pfe_phy_init()`` rather than guessing an address or failing.
+
+    Followed up in the same round (no code change needed, exactly as
+    planned above): added ``ethernet-phy@0``/``phy-handle`` to the DTS
+    now that address 0 is confirmed, and ``CONFIG_BROADCOM_PHY=y`` to
+    ``ls1024a_defconfig`` given the board file's own identification of
+    a Broadcom part -- if the ID doesn't match that driver's table,
+    Generic PHY remains the fallback, so this can't regress link-up
+    either way. Link-up itself (with a real PHY driver bound and
+    ``pfe_eth_adjust_link()`` actually firing) is unconfirmed and is the
+    next thing a hardware boot should show.
 
 Watchdog reset-control conflict with syscon
 ============================================

@@ -106,23 +106,28 @@
 
 	/*
 	 * Stage P7 (see Documentation/arm/ls1024a-wdmycloud.rst): GEM0
-	 * only, for now. The PHY address on this board is unconfirmed
-	 * (no mainline driver or board file exists for it) -- the mdio
-	 * node deliberately has no ethernet-phy child yet, so pfe_eth.c
-	 * registers the bus with a full address scan and logs whatever
-	 * responds instead of guessing. Once a real hardware boot confirms
-	 * an address, add an ethernet-phy@<addr> child here and a
-	 * phy-handle on gem0 -- no driver code change needed for that.
+	 * only, for now. PHY address 0 confirmed on real hardware -- the
+	 * mdio bus's full address scan (pfe_eth.c, added specifically
+	 * because this address was unconfirmed) found exactly one PHY
+	 * responding, at address 0 (id 0362:5e6a), matching the only real
+	 * data point in the GPL source drop (a hand-edited comment in the
+	 * old board-c2kevm.c crossing out phy_id=4 for phy_id=0 and
+	 * identifying a Broadcom PHY).
 	 */
 	mdio {
 		#address-cells = <1>;
 		#size-cells = <0>;
+
+		phy0: ethernet-phy@0 {
+			reg = <0>;
+		};
 	};
 
 	gem0: ethernet@0 {
 		compatible = "fsl,ls1024a-pfe-gem";
 		reg = <0>;
 		phy-mode = "rgmii-id";
+		phy-handle = <&phy0>;
 	};
 };
 
