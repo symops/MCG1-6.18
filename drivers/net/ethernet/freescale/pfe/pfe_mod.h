@@ -72,6 +72,7 @@ struct pfe {
 
 	struct clk *clk_pfe;
 	struct clk *clk_pfe_sys;
+	struct clk *clk_gem_tx; /* shared GEM TX reference clock (Stage P7) */
 
 	struct reset_control *rst_axi;
 	struct reset_control *rst_core;

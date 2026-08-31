@@ -30,6 +30,11 @@
  * firmware_init/before firmware_exit, again matching the vendor's own
  * ordering, since the mailbox addresses it uses are only known once
  * pfe_firmware_init() has parsed the firmware ELFs' symbol tables.
+ *
+ * Stage P7 adds pfe_eth_init()/pfe_eth_exit() (GEM0's net_device/MDIO/
+ * PHY, see pfe_eth.h) last, after everything the HIF client-registration
+ * path it drives (hif_lib_client_register(), Stage P7's own addition to
+ * pfe_hif_lib.c) depends on already exists.
  */
 
 #include <linux/clk.h>
@@ -44,6 +49,7 @@
 
 #include "pfe_mod.h"
 #include "pfe_ctrl.h"
+#include "pfe_eth.h"
 #include "pfe_firmware.h"
 #include "pfe_hif.h"
 #include "pfe_hif_lib.h"
@@ -185,12 +191,20 @@ static int pfe_platform_probe(struct platform_device *pdev)
 		goto err_ctrl;
 	}
 
+	ret = pfe_eth_init(pfe);
+	if (ret) {
+		dev_err_probe(dev, ret, "pfe_eth_init failed\n");
+		goto err_eth;
+	}
+
 	dev_info(dev, "PFE platform probed (apb=%p cbus=%p ddr=%pa/%u hif_irq=%d)\n",
 		 pfe->apb_baseaddr, pfe->cbus_baseaddr, &pfe->ddr_phys_baseaddr,
 		 pfe->ddr_size, pfe->hif_irq);
 
 	return 0;
 
+err_eth:
+	pfe_ctrl_exit(pfe);
 err_ctrl:
 	pfe_firmware_exit(pfe);
 err_fw:
@@ -206,6 +220,7 @@ static void pfe_platform_remove(struct platform_device *pdev)
 {
 	struct pfe *pfe = platform_get_drvdata(pdev);
 
+	pfe_eth_exit(pfe);
 	pfe_ctrl_exit(pfe);
 	pfe_firmware_exit(pfe);
 	pfe_hif_exit(pfe);

@@ -14,6 +14,7 @@
  * Documentation/arm/ls1024a-wdmycloud.rst).
  */
 
+#include <linux/ethtool.h>
 #include <linux/kernel.h>
 #include <linux/io.h>
 #include <linux/string.h>
@@ -760,4 +761,206 @@ void util_disable(void)
 void util_init(UTIL_CFG *cfg)
 {
 	writel(cfg->pe_sys_clk_ratio, UTIL_PE_SYS_CLK_RATIO);
+}
+
+/**************************** GEMAC ***************************/
+
+void gemac_set_mode(void __iomem *base, int mode)
+{
+	u32 ctrl = readl(base + EMAC_CONTROL) & ~EMAC_MODE_MASK;
+	u32 cfg = readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_SGMII_MODE_ENABLE;
+
+	switch (mode) {
+	case GMII:
+		writel(ctrl | EMAC_GMII_MODE_ENABLE, base + EMAC_CONTROL);
+		writel(cfg, base + EMAC_NETWORK_CONFIG);
+		break;
+	case RGMII:
+		writel(ctrl | EMAC_RGMII_MODE_ENABLE, base + EMAC_CONTROL);
+		writel(cfg, base + EMAC_NETWORK_CONFIG);
+		break;
+	case RMII:
+		writel(ctrl | EMAC_RMII_MODE_ENABLE, base + EMAC_CONTROL);
+		writel(cfg, base + EMAC_NETWORK_CONFIG);
+		break;
+	case SGMII:
+		writel(ctrl | EMAC_RMII_MODE_DISABLE | EMAC_RGMII_MODE_DISABLE,
+		       base + EMAC_CONTROL);
+		writel(cfg | EMAC_SGMII_MODE_ENABLE, base + EMAC_NETWORK_CONFIG);
+		break;
+	case MII:
+	default:
+		writel(ctrl | EMAC_MII_MODE_ENABLE, base + EMAC_CONTROL);
+		writel(cfg, base + EMAC_NETWORK_CONFIG);
+		break;
+	}
+}
+
+void gemac_set_speed(void __iomem *base, MAC_SPEED gem_speed)
+{
+	u32 val = readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_SPEED_MASK & ~EMAC_PCS_ENABLE;
+
+	switch (gem_speed) {
+	case SPEED_100M:
+		val |= EMAC_SPEED_100;
+		break;
+	case SPEED_1000M:
+		val |= EMAC_SPEED_1000;
+		break;
+	case SPEED_1000M_PCS:
+		val |= EMAC_SPEED_1000 | EMAC_PCS_ENABLE;
+		break;
+	case SPEED_10M:
+	default:
+		break;
+	}
+
+	writel(val, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_set_duplex(void __iomem *base, int duplex)
+{
+	u32 val = readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_DUPLEX_MASK;
+
+	val |= (duplex == DUPLEX_HALF) ? EMAC_HALF_DUP : EMAC_FULL_DUP;
+
+	writel(val, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_set_config(void __iomem *base, GEMAC_CFG *cfg)
+{
+	gemac_set_mode(base, cfg->mode);
+	gemac_set_speed(base, cfg->speed);
+	gemac_set_duplex(base, cfg->duplex);
+}
+
+void gemac_enable(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONTROL) | EMAC_TX_ENABLE | EMAC_RX_ENABLE,
+	       base + EMAC_NETWORK_CONTROL);
+}
+
+void gemac_disable(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONTROL) & ~(EMAC_TX_ENABLE | EMAC_RX_ENABLE),
+	       base + EMAC_NETWORK_CONTROL);
+}
+
+void gemac_set_laddrN(void __iomem *base, MAC_ADDR *address, unsigned int entry_index)
+{
+	if (entry_index < 1 || entry_index > EMAC_SPEC_ADDR_MAX)
+		return;
+
+	entry_index--;
+
+	if (entry_index < 4) {
+		writel(address->bottom, base + (entry_index * 8) + EMAC_SPEC1_ADD_BOT);
+		writel(address->top, base + (entry_index * 8) + EMAC_SPEC1_ADD_TOP);
+	} else {
+		writel(address->bottom, base + ((entry_index - 4) * 8) + EMAC_SPEC5_ADD_BOT);
+		writel(address->top, base + ((entry_index - 4) * 8) + EMAC_SPEC5_ADD_TOP);
+	}
+}
+
+void gemac_allow_broadcast(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_NO_BROADCAST, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_disable_unicast(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_ENABLE_UNICAST, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_disable_multicast(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_ENABLE_MULTICAST, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_disable_fcs_rx(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_ENABLE_FCS_RX, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_enable_1536_rx(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) | EMAC_ENABLE_1536_RX, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_set_bus_width(void __iomem *base, int width)
+{
+	u32 val = readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_DATA_BUS_WIDTH_MASK;
+
+	switch (width) {
+	case 32:
+		val |= EMAC_DATA_BUS_WIDTH_32;
+		break;
+	case 128:
+		val |= EMAC_DATA_BUS_WIDTH_128;
+		break;
+	case 64:
+	default:
+		val |= EMAC_DATA_BUS_WIDTH_64;
+		break;
+	}
+
+	writel(val, base + EMAC_NETWORK_CONFIG);
+}
+
+/*
+ * Rx checksum offload also needs a CLASS-side switch (CLASS_L4_CHKSUM_ADDR)
+ * telling the firmware to drop frames with a bad IPv4 checksum instead of
+ * passing them up -- not just a GEMAC-side bit. Not called from Stage P7
+ * (no NETIF_F_RXCSUM feature bit is declared on the net_device yet), but
+ * ported now alongside the rest of pfe_gemac_init()'s register writes
+ * rather than split across stages for no reason.
+ */
+void gemac_enable_rx_checksum_offload(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) | EMAC_ENABLE_CHKSUM_RX, base + EMAC_NETWORK_CONFIG);
+	writel(readl(CLASS_L4_CHKSUM_ADDR) | IPV4_CHKSUM_DROP, CLASS_L4_CHKSUM_ADDR);
+}
+
+void gemac_disable_rx_checksum_offload(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_ENABLE_CHKSUM_RX, base + EMAC_NETWORK_CONFIG);
+	writel(readl(CLASS_L4_CHKSUM_ADDR) & ~IPV4_CHKSUM_DROP, CLASS_L4_CHKSUM_ADDR);
+}
+
+void gemac_set_mdc_div(void __iomem *base, int mdc_div)
+{
+	u32 val = readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_MDC_DIV_MASK;
+	u32 div;
+
+	switch (mdc_div) {
+	case 8:
+		div = 0;
+		break;
+	case 16:
+		div = 1;
+		break;
+	case 32:
+		div = 2;
+		break;
+	case 48:
+		div = 3;
+		break;
+	case 96:
+		div = 5;
+		break;
+	case 128:
+		div = 6;
+		break;
+	case 224:
+		div = 7;
+		break;
+	case 64:
+	default:
+		div = 4;
+		break;
+	}
+
+	val |= div << 18;
+
+	writel(val, base + EMAC_NETWORK_CONFIG);
 }

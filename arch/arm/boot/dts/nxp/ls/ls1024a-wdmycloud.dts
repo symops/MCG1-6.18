@@ -101,6 +101,29 @@
 
 &pfe {
 	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	/*
+	 * Stage P7 (see Documentation/arm/ls1024a-wdmycloud.rst): GEM0
+	 * only, for now. The PHY address on this board is unconfirmed
+	 * (no mainline driver or board file exists for it) -- the mdio
+	 * node deliberately has no ethernet-phy child yet, so pfe_eth.c
+	 * registers the bus with a full address scan and logs whatever
+	 * responds instead of guessing. Once a real hardware boot confirms
+	 * an address, add an ethernet-phy@<addr> child here and a
+	 * phy-handle on gem0 -- no driver code change needed for that.
+	 */
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+	gem0: ethernet@0 {
+		compatible = "fsl,ls1024a-pfe-gem";
+		reg = <0>;
+		phy-mode = "rgmii-id";
+	};
 };
 
 &ls_spi {
@@ -156,11 +179,16 @@
 
 /*
  * Not yet ported (Stage 2+):
- *  - PFE (Comcerto Packet Forwarding Engine / eth0): no mainline or
- *    Bonstra/linux-ls1024a driver exists for this block yet. The old
- *    3.2.26 kernel used a custom "pfe" module (see the imported
+ *  - PFE (Comcerto Packet Forwarding Engine): no mainline or Bonstra/
+ *    linux-ls1024a driver exists for this block, so this fork ports one
+ *    from scratch (see the &pfe node above and
+ *    Documentation/arm/ls1024a-wdmycloud.rst's Stage P1-P10 log) --
+ *    in progress, staged: GEM0's net_device/MDIO/PHY skeleton exists
+ *    (Stage P7) but doesn't pass traffic yet (Stage P8), and GEM1/GEM2
+ *    aren't wired up at all yet (Stage P9). Reference for all of this is
+ *    the old 3.2.26 kernel's custom "pfe" module (see the imported
  *    kmodules/mspd-c2k/pfe sources and firmware blobs in
- *    symops/MCG1-3.2.26) driving EMAC1-3/EGPI/HGPI/BMU/CLASS/TMU/UTIL/HIF.
+ *    symops/MCG1-3.2.26).
  *  - RTC (c2k-rtc): proprietary Mindspeed block, no driver in mainline
  *    or in this fork. Board has no RTC backup battery, so NTP-only
  *    timekeeping is the permanent behavior here, not a gap.

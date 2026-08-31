@@ -4,13 +4,13 @@
  * 3.2.26 vendor tree's pfe_ctrl/pfe_hif_lib.h (kmodules/mspd-c2k/pfe/ in
  * symops/MCG1-3.2.26).
  *
- * Stage P5 scope: only what pfe_hif.c's init/exit/ISR/NAPI path actually
- * needs (the shared-memory rx buffer pool, and the client event
- * indication used by the Rx path). The client-registration API
- * (hif_lib_client_register() and friends), TX path (hif_lib_xmit_pkt(),
- * TSO), and TX credit/QoS accounting are all only ever called by a
- * registered client -- i.e. pfe_eth.c, Stage P7-P9 -- and are added
- * there instead of guessing their shape ahead of time.
+ * Stage P5 added what pfe_hif.c's init/exit/ISR/NAPI path itself needs
+ * (the shared-memory rx buffer pool, and the client event indication
+ * used by the Rx path). Stage P7 adds the client-registration API
+ * (hif_lib_client_register()/unregister()) that pfe_eth.c calls from
+ * its .ndo_open/.ndo_stop. Still out of scope: the TX submission path
+ * (hif_lib_xmit_pkt(), TSO) and TX credit/QoS accounting, both only
+ * reachable once Stage P8 adds a working .ndo_start_xmit.
  */
 #ifndef _PFE_HIF_LIB_H_
 #define _PFE_HIF_LIB_H_
@@ -127,5 +127,17 @@ extern unsigned int pfe_pkt_headroom;
 int pfe_hif_lib_init(struct pfe *pfe);
 void pfe_hif_lib_exit(struct pfe *pfe);
 void hif_lib_indicate_client(int cl_id, int event, int data);
+
+/*
+ * Client registration API (Stage P7) -- lets a net_device driver
+ * (pfe_eth.c) hand the HIF driver its Rx/Tx shared-memory queues and
+ * become reachable via hif_lib_indicate_client() above. The Tx
+ * submission path itself (hif_lib_xmit_pkt() and friends) stays out of
+ * scope until Stage P8 actually needs to send a packet.
+ */
+int hif_lib_client_register(struct hif_client_s *client);
+int hif_lib_client_unregister(struct hif_client_s *client);
+int hif_lib_tmu_queue_start(struct hif_client_s *client, int qno);
+int hif_lib_tmu_queue_stop(struct hif_client_s *client, int qno);
 
 #endif /* _PFE_HIF_LIB_H_ */

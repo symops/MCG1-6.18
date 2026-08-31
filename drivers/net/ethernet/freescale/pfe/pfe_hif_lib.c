@@ -85,6 +85,171 @@ void hif_lib_indicate_client(int client_id, int event_type, int qno)
 		client->event_handler(client->priv, event_type, qno);
 }
 
+static int hif_lib_event_dummy(void *priv, int event_type, int qno)
+{
+	return 0;
+}
+
+/*
+ * Allocate and pre-fill a client's Rx queue descriptors -- ownership of
+ * every slot starts with the HIF driver (CL_DESC_OWN) so it can start
+ * filling them in as soon as hif_process_client_req(REQUEST_CL_REGISTER)
+ * below hands the queue addresses over.
+ */
+static int hif_lib_client_init_rx_buffers(struct hif_client_s *client, int q_size)
+{
+	struct hif_client_rx_queue *queue;
+	struct rx_queue_desc *desc;
+	int qno, i;
+
+	client->rx_qbase = kcalloc(client->rx_qn * q_size, sizeof(struct rx_queue_desc), GFP_KERNEL);
+	if (!client->rx_qbase)
+		return -ENOMEM;
+
+	for (qno = 0; qno < client->rx_qn; qno++) {
+		queue = &client->rx_q[qno];
+		queue->base = client->rx_qbase + qno * q_size * sizeof(struct rx_queue_desc);
+		queue->size = q_size;
+		queue->read_idx = 0;
+		queue->write_idx = 0;
+	}
+
+	for (qno = 0; qno < client->rx_qn; qno++) {
+		queue = &client->rx_q[qno];
+		desc = queue->base;
+
+		for (i = 0; i < queue->size; i++, desc++)
+			desc->ctrl = CL_DESC_BUF_LEN(pfe_pkt_size) | CL_DESC_OWN;
+	}
+
+	return 0;
+}
+
+static void hif_lib_client_release_rx_buffers(struct hif_client_s *client)
+{
+	struct rx_queue_desc *desc;
+	int qno, i;
+	void *buf;
+
+	for (qno = 0; qno < client->rx_qn; qno++) {
+		desc = client->rx_q[qno].base;
+
+		for (i = 0; i < client->rx_q[qno].size; i++, desc++) {
+			buf = desc->data;
+			if (buf)
+				kfree(buf - pfe_pkt_headroom);
+		}
+	}
+
+	kfree(client->rx_qbase);
+}
+
+static int hif_lib_client_init_tx_buffers(struct hif_client_s *client, int q_size)
+{
+	struct hif_client_tx_queue *queue;
+	int qno;
+
+	client->tx_qbase = kcalloc(client->tx_qn * q_size, sizeof(struct tx_queue_desc), GFP_KERNEL);
+	if (!client->tx_qbase)
+		return -ENOMEM;
+
+	for (qno = 0; qno < client->tx_qn; qno++) {
+		queue = &client->tx_q[qno];
+		queue->base = client->tx_qbase + qno * q_size * sizeof(struct tx_queue_desc);
+		queue->size = q_size;
+		queue->read_idx = 0;
+		queue->write_idx = 0;
+		queue->tx_pending = 0;
+	}
+
+	return 0;
+}
+
+static void hif_lib_client_release_tx_buffers(struct hif_client_s *client)
+{
+	int qno;
+
+	for (qno = 0; qno < client->tx_qn; qno++) {
+		if (client->tx_q[qno].tx_pending)
+			pr_err("%s: client %d queue %d has pending tx packets\n",
+			       __func__, client->id, qno);
+	}
+
+	kfree(client->tx_qbase);
+}
+
+int hif_lib_client_register(struct hif_client_s *client)
+{
+	struct hif_client_shm *client_shm;
+	struct hif_shm *hif_shm;
+	int rc;
+
+	if (!client->pfe || client->id >= HIF_CLIENTS_MAX || g_pfe->hif_client[client->id])
+		return -EINVAL;
+
+	hif_shm = client->pfe->hif.shm;
+
+	rc = hif_lib_client_init_rx_buffers(client, client->rx_qsize);
+	if (rc)
+		return rc;
+
+	rc = hif_lib_client_init_tx_buffers(client, client->tx_qsize);
+	if (rc) {
+		hif_lib_client_release_rx_buffers(client);
+		return rc;
+	}
+
+	if (!client->event_handler)
+		client->event_handler = hif_lib_event_dummy;
+
+	client_shm = &hif_shm->client[client->id];
+	client_shm->rx_qbase = (u32)client->rx_qbase;
+	client_shm->rx_qsize = client->rx_qsize;
+	client_shm->tx_qbase = (u32)client->tx_qbase;
+	client_shm->tx_qsize = client->tx_qsize;
+	client_shm->ctrl = (client->tx_qn << CLIENT_CTRL_TX_Q_CNT_OFST) |
+			   (client->rx_qn << CLIENT_CTRL_RX_Q_CNT_OFST);
+
+	memset(client->queue_mask, 0, sizeof(client->queue_mask));
+
+	hif_process_client_req(&client->pfe->hif, REQUEST_CL_REGISTER, client->id, 0);
+
+	g_pfe->hif_client[client->id] = client;
+
+	return 0;
+}
+
+int hif_lib_client_unregister(struct hif_client_s *client)
+{
+	struct pfe *pfe = client->pfe;
+
+	hif_process_client_req(&pfe->hif, REQUEST_CL_UNREGISTER, client->id, 0);
+
+	hif_lib_client_release_tx_buffers(client);
+	hif_lib_client_release_rx_buffers(client);
+
+	g_pfe->hif_client[client->id] = NULL;
+
+	return 0;
+}
+
+/*
+ * Both no-ops in the vendor driver itself (TMU-level per-queue enable/
+ * disable was apparently never implemented there either) -- ported as
+ * the same no-ops rather than silently dropped, so pfe_eth.c's
+ * open/close can call them in the right place for whichever future
+ * stage might give them a real body.
+ */
+int hif_lib_tmu_queue_start(struct hif_client_s *client, int qno)
+{
+	return 0;
+}
+
+int hif_lib_tmu_queue_stop(struct hif_client_s *client, int qno)
+{
+	return 0;
+}
+
 int pfe_hif_lib_init(struct pfe *pfe)
 {
 	int rc;

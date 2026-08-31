@@ -1359,6 +1359,79 @@ Stage P6 (``pfe_ctrl.c`` -- control-message channel to the PE firmware)
     so it's checked by a clean build rather than its own hardware round
     trip -- treated as one combined checkpoint with Stage P7.
 
+Stage P7 (``pfe_eth.c`` -- net_device/MDIO/PHY for GEM0)
+    New files ``pfe_eth.c``/``pfe_eth.h`` add a ``net_device`` for GEM0,
+    the GEMAC hardware bring-up it needs (a new GEMAC block in
+    ``pfe_hw_lib.c``, ported from the vendor's shared ``pfe.c`` HAL same
+    as the BMU/GPI/CLASS/TMU/UTIL blocks in Stage P3), an MDIO bus, and
+    PHY connect/link handling. Also added: ``hif_lib_client_register()``/
+    ``hif_lib_client_unregister()`` in ``pfe_hif_lib.c`` -- the missing
+    other half of the client registration Stage P5 already built the
+    HIF-driver side of (``pfe_hif.c``'s own ``pfe_hif_client_register()``
+    was already complete from P5; only the *client library* side that a
+    real client calls was missing).
+
+    Ported from the vendor's ``pfe_ctrl/pfe_eth.c`` (2846 lines) -- almost
+    none of that file's size carried over; see ``pfe_eth.h``'s banner
+    comment for the itemized list of what's structurally out of scope
+    (ethtool/sysfs stats, VLAN offload, and everything already dropped in
+    earlier stages). Two things worth calling out specifically:
+
+    - **No per-GEM NAPI.** The vendor driver gives each net_device its
+      own lro/low/high NAPI triple. This port centralized Rx polling at
+      the HIF level back in Stage P5 (a single shared
+      ``struct pfe_hif.napi``, since there's only one physical Rx DMA
+      ring shared by every client, demultiplexed by client id in the
+      descriptor header) -- a cleaner match for the actual hardware than
+      the vendor's per-client design, and it means Stage P7 doesn't need
+      a second NAPI layer at all. ``hif_lib_client_register()`` is what
+      makes GEM0 reachable from the existing Rx path; actually consuming
+      what lands in its client Rx queue into real skbs is Stage P8's job.
+    - **``.ndo_start_xmit`` is a stub that drops.** It has to exist --
+      ``dev_hard_start_xmit()`` calls it unconditionally once a netdev is
+      ``IFF_UP`` (e.g. for an outgoing ARP the instant link comes up) --
+      but the real HIF Tx submission path is Stage P8, not P7.
+
+    **PHY address unconfirmed for this board (plan's own "open risk
+    #1").** No mainline driver or board file exists for this exact unit.
+    The only real data point found anywhere in the GPL source drop is in
+    ``arch/arm/mach-comcerto/board-c2kevm.c``, which has been hand-edited
+    with initials-attributed comments crossing out the EVM template's
+    ``phy_id = 4`` in favor of ``phy_id = 0``, identifying a Broadcom PHY,
+    and widening the MDIO probe mask to addresses 0-7 -- circumstantial
+    (can't prove it's this exact board's own edit vs. some other
+    Comcerto-derived product sharing the same GPL drop), but the only
+    real evidence available. Rather than trust a decade-old comment, the
+    DTS deliberately ships with **no ``phy-handle``** on the ``gem0``
+    node yet: ``pfe_eth.c`` registers the MDIO bus with a full address
+    scan (``phy_mask = 0``, addresses 0-31) and logs every response via
+    ``mdiobus_read()`` of ``MII_PHYSID1``/``MII_PHYSID2`` directly, so the
+    real address gets confirmed empirically from a hardware boot log --
+    the same way the SPI-NOR chip ID was settled earlier in this project
+    -- rather than guessed. Once confirmed, adding an ``ethernet-phy@N``
+    child node and a ``phy-handle`` on ``gem0`` needs no driver code
+    change. Without a PHY connected, link simply stays down for this
+    first round trip -- expected, not a failure.
+
+    The MDC clock divisor (96) is a second, much lower-stakes data point
+    from that same board file comment block -- any of the GEMAC's valid
+    divisor settings keeps MDC well under a PHY's maximum clock spec at
+    this SoC's clock rates, so getting it exactly right isn't safety-
+    critical the way the PHY address is.
+
+    **Build-verified; hardware round-trip pending** -- this stage's own
+    checkpoint is specifically about observing the MDIO scan results (the
+    plan's round #4), not confirmed traffic (that's Stage P8's DHCP+ping
+    round). ``select PHYLIB`` was added to this driver's Kconfig entry
+    (``CONFIG_MDIO_BUS``/``CONFIG_OF_MDIO`` follow automatically, no new
+    ``ls1024a_defconfig`` lines needed); a stray ``CONFIG_WIRELESS``/
+    ``CONFIG_PTP_1588_CLOCK`` reordering that showed up in a
+    ``savedefconfig`` pass while checking this was confirmed to reproduce
+    identically with the ``select PHYLIB`` line removed entirely --
+    pre-existing scratch-tree-vs-defconfig drift unrelated to this
+    stage (the same class of issue as Stage P1's defconfig bloat bug),
+    left untouched rather than folded into this change.
+
 Watchdog reset-control conflict with syscon
 ============================================
 

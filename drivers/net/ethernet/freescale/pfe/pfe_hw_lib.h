@@ -102,6 +102,33 @@ void util_reset(void);
 void util_enable(void);
 void util_disable(void);
 
+/**************************** GEMAC ***************************/
+
+/*
+ * Subset of the vendor pfe.c's GEMAC block needed for Stage P7 (net_device/
+ * MDIO/PHY bring-up for GEM0, no traffic path yet). gemac_reset() is a
+ * no-op in the vendor driver itself (nothing to port); the full 4-entry
+ * gemac_set_address()/gemac_get_address() and single-entry
+ * gemac_set_laddr1..4()/gemac_clear_laddr*() accessors aren't needed since
+ * pfe_eth.c only ever uses the parametrized gemac_set_laddrN().
+ */
+void gemac_set_mode(void __iomem *base, int mode);
+void gemac_set_speed(void __iomem *base, MAC_SPEED gem_speed);
+void gemac_set_duplex(void __iomem *base, int duplex);
+void gemac_set_config(void __iomem *base, GEMAC_CFG *cfg);
+void gemac_enable(void __iomem *base);
+void gemac_disable(void __iomem *base);
+void gemac_set_laddrN(void __iomem *base, MAC_ADDR *address, unsigned int entry_index);
+void gemac_allow_broadcast(void __iomem *base);
+void gemac_disable_unicast(void __iomem *base);
+void gemac_disable_multicast(void __iomem *base);
+void gemac_disable_fcs_rx(void __iomem *base);
+void gemac_enable_1536_rx(void __iomem *base);
+void gemac_set_bus_width(void __iomem *base, int width);
+void gemac_enable_rx_checksum_offload(void __iomem *base);
+void gemac_disable_rx_checksum_offload(void __iomem *base);
+void gemac_set_mdc_div(void __iomem *base, int mdc_div);
+
 /*
  * PE (packet-processor core) memory map and per-PE identification, ported
  * from pfe/pfe/c2000/pfe/pfe.h. This board's config matches the vendor
