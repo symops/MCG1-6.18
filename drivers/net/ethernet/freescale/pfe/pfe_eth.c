@@ -37,6 +37,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/ethtool.h>
 #include <linux/etherdevice.h>
 #include <linux/io.h>
 #include <linux/mii.h>
@@ -608,6 +609,22 @@ static const struct net_device_ops pfe_netdev_ops = {
 	.ndo_validate_addr = eth_validate_addr,
 };
 
+/*
+ * Without this, `ethtool eth0` (link/speed/duplex/autoneg query) fails
+ * outright with "No data available" instead of reporting phydev's real
+ * state -- there's no core-kernel fallback for the settings ioctl the
+ * way there is for driver-info (which is why `ethtool -i eth0` worked
+ * even before this was added). phy_ethtool_get/set_link_ksettings() are
+ * the standard phylib-backed helpers used by most mainline drivers with
+ * an attached PHY; .get_link falls back to netif_carrier_ok() when
+ * there's no phydev.
+ */
+static const struct ethtool_ops pfe_ethtool_ops = {
+	.get_link = ethtool_op_get_link,
+	.get_link_ksettings = phy_ethtool_get_link_ksettings,
+	.set_link_ksettings = phy_ethtool_set_link_ksettings,
+};
+
 static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 {
 	struct pfe_eth_priv_s *priv;
@@ -631,6 +648,7 @@ static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 
 	SET_NETDEV_DEV(dev, pfe->dev);
 	dev->netdev_ops = &pfe_netdev_ops;
+	dev->ethtool_ops = &pfe_ethtool_ops;
 	/* hif_lib_xmit_pkt() writes struct hif_hdr in place just before
 	 * skb->data -- ask the stack to reserve room for it up front so
 	 * pfe_eth_send_packet()'s pskb_expand_head() fallback is only ever
