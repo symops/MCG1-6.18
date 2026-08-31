@@ -6,11 +6,14 @@
  * pfe/pfe/c2000/pfe.c and pfe/pfe/c2000/pfe/pfe.h (kmodules/mspd-c2k/pfe/
  * in symops/MCG1-3.2.26). Only the subset needed so far (block init/
  * enable/disable/reset for BMU/GPI/CLASS/TMU/UTIL) is ported; the
- * PE-memory-access, ELF-loading and GEMAC pieces of the original files
- * are deferred to the stages that need them (Stage P4, P7-P9).
+ * PE-memory-access and ELF section loading are now ported too (Stage
+ * P4, for pfe_firmware.c); the GEMAC pieces are still deferred to the
+ * stages that need them (P7-P9).
  */
 #ifndef _PFE_HW_LIB_H_
 #define _PFE_HW_LIB_H_
+
+#include <linux/elf.h>
 
 #include <asm/system_info.h>
 
@@ -97,5 +100,88 @@ void util_init(UTIL_CFG *cfg);
 void util_reset(void);
 void util_enable(void);
 void util_disable(void);
+
+/*
+ * PE (packet-processor core) memory map and per-PE identification, ported
+ * from pfe/pfe/c2000/pfe/pfe.h. This board's config matches the vendor
+ * tree's non-PCI, non-dummy-TMU, UTIL-enabled branch throughout (6 CLASS
+ * PEs, 4 TMU PEs, 1 UTIL PE -- UTIL confirmed active by the util firmware
+ * actually loading on real hardware, see Documentation/arm/ls1024a-wdmycloud.rst).
+ */
+#define CLASS_DMEM_BASE_ADDR(i)	(0x00000000 | ((i) << 20))
+#define CLASS_IMEM_BASE_ADDR(i)	(0x00000000 | ((i) << 20))
+#define CLASS_DMEM_SIZE		0x00002000
+#define CLASS_IMEM_SIZE		0x00008000
+
+#define TMU_DMEM_BASE_ADDR(i)	(0x00000000 + ((i) << 20))
+#define TMU_IMEM_BASE_ADDR(i)	(0x00000000 + ((i) << 20))
+#define TMU_DMEM_SIZE		0x00000800
+#define TMU_IMEM_SIZE		0x00002000
+
+#define UTIL_DMEM_BASE_ADDR	0x00000000
+#define UTIL_DMEM_SIZE		0x00002000
+
+#define PE_LMEM_BASE_ADDR	0xc3010000
+#define PE_LMEM_SIZE		0x8000
+#define PE_LMEM_END		(PE_LMEM_BASE_ADDR + PE_LMEM_SIZE)
+
+#define DMEM_BASE_ADDR		0x00000000
+#define DMEM_SIZE		0x2000
+#define DMEM_END		(DMEM_BASE_ADDR + DMEM_SIZE)
+
+#define PMEM_BASE_ADDR		0x00010000
+#define PMEM_SIZE		0x8000
+#define PMEM_END		(PMEM_BASE_ADDR + PMEM_SIZE)
+
+#define IS_DMEM(addr, len)	(((unsigned long)(addr) >= DMEM_BASE_ADDR) && (((unsigned long)(addr) + (len)) <= DMEM_END))
+#define IS_PMEM(addr, len)	(((unsigned long)(addr) >= PMEM_BASE_ADDR) && (((unsigned long)(addr) + (len)) <= PMEM_END))
+#define IS_PE_LMEM(addr, len)	(((unsigned long)(addr) >= PE_LMEM_BASE_ADDR) && (((unsigned long)(addr) + (len)) <= PE_LMEM_END))
+#define IS_PFE_LMEM(addr, len)	(((unsigned long)(addr) >= CBUS_VIRT_TO_PFE(LMEM_BASE_ADDR)) && (((unsigned long)(addr) + (len)) <= CBUS_VIRT_TO_PFE(LMEM_END)))
+#define IS_PHYS_DDR(addr, len)	(((unsigned long)(addr) >= DDR_PHYS_BASE_ADDR) && (((unsigned long)(addr) + (len)) <= DDR_PHYS_BASE_ADDR + DDR_SIZE))
+
+enum {
+	CLASS0_ID = 0,
+	CLASS1_ID,
+	CLASS2_ID,
+	CLASS3_ID,
+	CLASS4_ID,
+	CLASS5_ID,
+	TMU0_ID,
+	TMU1_ID,
+	TMU2_ID,
+	TMU3_ID,
+	UTIL_ID,
+	MAX_PE
+};
+
+#define CLASS_MASK	((1 << CLASS0_ID) | (1 << CLASS1_ID) | (1 << CLASS2_ID) | \
+			 (1 << CLASS3_ID) | (1 << CLASS4_ID) | (1 << CLASS5_ID))
+#define TMU_MASK	((1 << TMU0_ID) | (1 << TMU1_ID) | (1 << TMU2_ID) | (1 << TMU3_ID))
+#define UTIL_MASK	(1 << UTIL_ID)
+
+/* PE information: virtual addresses of a PE's indirect memory-access
+ * registers, needed by the generic pe_*_memcpy/pe_dmem_* helpers below.
+ */
+struct pe_info {
+	u32 dmem_base_addr;
+	u32 pmem_base_addr;
+	u32 pmem_size;
+
+	void __iomem *mem_access_wdata;
+	void __iomem *mem_access_addr;
+	void __iomem *mem_access_rdata;
+};
+
+void pe_dmem_memcpy_to32(int id, u32 dst, const void *src, unsigned int len);
+void pe_pmem_memcpy_to32(int id, u32 dst, const void *src, unsigned int len);
+u32 pe_pmem_read(int id, u32 addr, u8 size);
+void pe_dmem_write(int id, u32 val, u32 addr, u8 size);
+u32 pe_dmem_read(int id, u32 addr, u8 size);
+void class_bus_write(u32 val, u32 addr, u8 size);
+u32 class_bus_read(u32 addr, u8 size);
+void class_pe_lmem_memcpy_to32(u32 dst, const void *src, unsigned int len);
+void class_pe_lmem_memset(u32 dst, int val, unsigned int len);
+
+int pe_load_elf_section(int id, const void *data, const Elf32_Shdr *shdr);
 
 #endif /* _PFE_HW_LIB_H_ */

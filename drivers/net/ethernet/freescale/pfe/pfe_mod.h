@@ -68,6 +68,19 @@ struct pfe {
 	struct reset_control *rst_core;
 
 	int hif_irq;
+
+	/*
+	 * ELF section addresses discovered while loading firmware (Stage
+	 * P4), needed later to talk to each PE's "shared" memory region.
+	 * Vendor driver keeps these in a separate struct pfe_ctrl ctrl;
+	 * member -- move them there once Stage P6 introduces it, rather
+	 * than inventing that struct's shape ahead of actually needing it.
+	 */
+	unsigned long class_dmem_sh;
+	unsigned long class_pe_lmem_sh;
+	unsigned long tmu_dmem_sh;
+	unsigned long util_dmem_sh;
+	unsigned long util_ddr_sh;
 };
 
 #endif /* _PFE_MOD_H_ */

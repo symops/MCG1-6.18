@@ -3,12 +3,12 @@
  * PFE (Packet Forwarding Engine) platform driver for the Freescale/
  * Mindspeed LS1024A (Comcerto 2000) SoC.
  *
- * Stage P3 of the port (see Documentation/arm/ls1024a-wdmycloud.rst):
- * on top of the Stage P1/P2 resource/clock/reset skeleton, map the
- * "ddr" packet-buffer carve-out and bring up the BMU/GPI/CLASS/TMU/UTIL
- * hardware blocks via pfe_hw_init() (see pfe_hw.c/pfe_hw_lib.c). IRAM
- * access, HIF, firmware loading and the net_device layer are still not
- * touched -- that starts in Stage P4 onward.
+ * Stage P4 of the port (see Documentation/arm/ls1024a-wdmycloud.rst):
+ * on top of the Stage P1-P3 resource/clock/reset/hw-block skeleton,
+ * load the class/tmu/util firmware and enable those PE cores via
+ * pfe_firmware_init() (see pfe_firmware.c). IRAM access, HIF and the
+ * net_device layer are still not touched -- that starts in Stage P5
+ * onward.
  */
 
 #include <linux/clk.h>
@@ -22,6 +22,7 @@
 #include <linux/reset.h>
 
 #include "pfe_mod.h"
+#include "pfe_firmware.h"
 #include "pfe_hw.h"
 #include "pfe_hw_lib.h"
 
@@ -144,17 +145,28 @@ static int pfe_platform_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "pfe_hw_init failed\n");
 
+	ret = pfe_firmware_init(pfe);
+	if (ret) {
+		dev_err_probe(dev, ret, "pfe_firmware_init failed\n");
+		goto err_fw;
+	}
+
 	dev_info(dev, "PFE platform probed (apb=%p cbus=%p ddr=%pa/%u hif_irq=%d)\n",
 		 pfe->apb_baseaddr, pfe->cbus_baseaddr, &pfe->ddr_phys_baseaddr,
 		 pfe->ddr_size, pfe->hif_irq);
 
 	return 0;
+
+err_fw:
+	pfe_hw_exit(pfe);
+	return ret;
 }
 
 static void pfe_platform_remove(struct platform_device *pdev)
 {
 	struct pfe *pfe = platform_get_drvdata(pdev);
 
+	pfe_firmware_exit(pfe);
 	pfe_hw_exit(pfe);
 
 	reset_control_assert(pfe->rst_core);

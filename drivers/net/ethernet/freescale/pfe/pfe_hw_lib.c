@@ -18,6 +18,8 @@
 #include <linux/io.h>
 #include <linux/string.h>
 
+#include <asm/byteorder.h>
+
 #include "pfe_mod.h"
 #include "pfe_hw_lib.h"
 
@@ -26,15 +28,425 @@ void *ddr_base_addr;
 unsigned long ddr_phys_base_addr;
 unsigned int ddr_size;
 
+static struct pe_info pe[MAX_PE];
+
 #define PFE_POLL_ITERATIONS	2000000
 
 void pfe_lib_init(void __iomem *cbus_base, void *ddr_base,
 		   unsigned long ddr_phys_base, unsigned int size)
 {
+	int i;
+
 	cbus_base_addr = cbus_base;
 	ddr_base_addr = ddr_base;
 	ddr_phys_base_addr = ddr_phys_base;
 	ddr_size = size;
+
+	for (i = CLASS0_ID; i <= CLASS5_ID; i++) {
+		pe[i].dmem_base_addr = CLASS_DMEM_BASE_ADDR(i - CLASS0_ID);
+		pe[i].pmem_base_addr = CLASS_IMEM_BASE_ADDR(i - CLASS0_ID);
+		pe[i].pmem_size = CLASS_IMEM_SIZE;
+		pe[i].mem_access_wdata = CLASS_MEM_ACCESS_WDATA;
+		pe[i].mem_access_addr = CLASS_MEM_ACCESS_ADDR;
+		pe[i].mem_access_rdata = CLASS_MEM_ACCESS_RDATA;
+	}
+
+	for (i = TMU0_ID; i <= TMU3_ID; i++) {
+		pe[i].dmem_base_addr = TMU_DMEM_BASE_ADDR(i - TMU0_ID);
+		pe[i].pmem_base_addr = TMU_IMEM_BASE_ADDR(i - TMU0_ID);
+		pe[i].pmem_size = TMU_IMEM_SIZE;
+		pe[i].mem_access_wdata = TMU_MEM_ACCESS_WDATA;
+		pe[i].mem_access_addr = TMU_MEM_ACCESS_ADDR;
+		pe[i].mem_access_rdata = TMU_MEM_ACCESS_RDATA;
+	}
+
+	pe[UTIL_ID].dmem_base_addr = UTIL_DMEM_BASE_ADDR;
+	pe[UTIL_ID].mem_access_wdata = UTIL_MEM_ACCESS_WDATA;
+	pe[UTIL_ID].mem_access_addr = UTIL_MEM_ACCESS_ADDR;
+	pe[UTIL_ID].mem_access_rdata = UTIL_MEM_ACCESS_RDATA;
+}
+
+/**************************** PE memory access ***************************/
+
+static void pe_mem_memcpy_to32(int id, u32 mem_access_addr, const void *src, unsigned int len)
+{
+	u32 offset = 0, val, addr;
+	unsigned int len32 = len >> 2;
+	unsigned int i;
+
+	addr = mem_access_addr | PE_MEM_ACCESS_WRITE | PE_MEM_ACCESS_BYTE_ENABLE(0, 4);
+
+	for (i = 0; i < len32; i++, offset += 4, src += 4) {
+		val = *(u32 *)src;
+		writel(cpu_to_be32(val), pe[id].mem_access_wdata);
+		writel(addr + offset, pe[id].mem_access_addr);
+	}
+
+	len = len & 0x3;
+	if (len) {
+		val = 0;
+		addr = (mem_access_addr | PE_MEM_ACCESS_WRITE | PE_MEM_ACCESS_BYTE_ENABLE(0, len)) + offset;
+
+		for (i = 0; i < len; i++, src++)
+			val |= (*(u8 *)src) << (8 * i);
+
+		writel(cpu_to_be32(val), pe[id].mem_access_wdata);
+		writel(addr, pe[id].mem_access_addr);
+	}
+}
+
+void pe_dmem_memcpy_to32(int id, u32 dst, const void *src, unsigned int len)
+{
+	pe_mem_memcpy_to32(id, pe[id].dmem_base_addr | dst | PE_MEM_ACCESS_DMEM, src, len);
+}
+
+void pe_pmem_memcpy_to32(int id, u32 dst, const void *src, unsigned int len)
+{
+	pe_mem_memcpy_to32(id, pe[id].pmem_base_addr | (dst & (pe[id].pmem_size - 1)) |
+			    PE_MEM_ACCESS_IMEM, src, len);
+}
+
+u32 pe_pmem_read(int id, u32 addr, u8 size)
+{
+	u32 offset = addr & 0x3;
+	u32 mask = 0xffffffff >> ((4 - size) << 3);
+	u32 val;
+
+	addr = pe[id].pmem_base_addr | ((addr & ~0x3) & (pe[id].pmem_size - 1)) |
+	       PE_MEM_ACCESS_IMEM | PE_MEM_ACCESS_BYTE_ENABLE(offset, size);
+
+	writel(addr, pe[id].mem_access_addr);
+	val = be32_to_cpu(readl(pe[id].mem_access_rdata));
+
+	return (val >> (offset << 3)) & mask;
+}
+
+void pe_dmem_write(int id, u32 val, u32 addr, u8 size)
+{
+	u32 offset = addr & 0x3;
+
+	addr = pe[id].dmem_base_addr | (addr & ~0x3) | PE_MEM_ACCESS_WRITE | PE_MEM_ACCESS_DMEM |
+	       PE_MEM_ACCESS_BYTE_ENABLE(offset, size);
+
+	/* Indirect access interface is byte swapping data being written */
+	writel(cpu_to_be32(val << (offset << 3)), pe[id].mem_access_wdata);
+	writel(addr, pe[id].mem_access_addr);
+}
+
+u32 pe_dmem_read(int id, u32 addr, u8 size)
+{
+	u32 offset = addr & 0x3;
+	u32 mask = 0xffffffff >> ((4 - size) << 3);
+	u32 val;
+
+	addr = pe[id].dmem_base_addr | (addr & ~0x3) | PE_MEM_ACCESS_DMEM |
+	       PE_MEM_ACCESS_BYTE_ENABLE(offset, size);
+
+	writel(addr, pe[id].mem_access_addr);
+
+	/* Indirect access interface is byte swapping data being read */
+	val = be32_to_cpu(readl(pe[id].mem_access_rdata));
+
+	return (val >> (offset << 3)) & mask;
+}
+
+void class_bus_write(u32 val, u32 addr, u8 size)
+{
+	u32 offset = addr & 0x3;
+
+	writel((addr & CLASS_BUS_ACCESS_BASE_MASK), CLASS_BUS_ACCESS_BASE);
+
+	addr = (addr & ~CLASS_BUS_ACCESS_BASE_MASK) | PE_MEM_ACCESS_WRITE | (size << 24);
+
+	writel(cpu_to_be32(val << (offset << 3)), CLASS_BUS_ACCESS_WDATA);
+	writel(addr, CLASS_BUS_ACCESS_ADDR);
+}
+
+u32 class_bus_read(u32 addr, u8 size)
+{
+	u32 offset = addr & 0x3;
+	u32 mask = 0xffffffff >> ((4 - size) << 3);
+	u32 val;
+
+	writel((addr & CLASS_BUS_ACCESS_BASE_MASK), CLASS_BUS_ACCESS_BASE);
+
+	addr = (addr & ~CLASS_BUS_ACCESS_BASE_MASK) | (size << 24);
+
+	writel(addr, CLASS_BUS_ACCESS_ADDR);
+	val = be32_to_cpu(readl(CLASS_BUS_ACCESS_RDATA));
+
+	return (val >> (offset << 3)) & mask;
+}
+
+void class_pe_lmem_memcpy_to32(u32 dst, const void *src, unsigned int len)
+{
+	u32 len32 = len >> 2;
+	unsigned int i;
+
+	for (i = 0; i < len32; i++, src += 4, dst += 4)
+		class_bus_write(*(u32 *)src, dst, 4);
+
+	if (len & 0x2) {
+		class_bus_write(*(u16 *)src, dst, 2);
+		src += 2;
+		dst += 2;
+	}
+
+	if (len & 0x1) {
+		class_bus_write(*(u8 *)src, dst, 1);
+		src++;
+		dst++;
+	}
+}
+
+void class_pe_lmem_memset(u32 dst, int val, unsigned int len)
+{
+	u32 len32 = len >> 2;
+	unsigned int i;
+
+	val = val | (val << 8) | (val << 16) | (val << 24);
+
+	for (i = 0; i < len32; i++, dst += 4)
+		class_bus_write(val, dst, 4);
+
+	if (len & 0x2) {
+		class_bus_write(val, dst, 2);
+		dst += 2;
+	}
+
+	if (len & 0x1) {
+		class_bus_write(val, dst, 1);
+		dst++;
+	}
+}
+
+/*
+ * UTIL program memory lives in DDR and is loaded as 64bit-swapped values
+ * at 64bit-aligned locations -- unlike the other PEs' IMEM, which goes
+ * through the indirect mem_access registers above.
+ */
+static void util_pmem_write(u32 val, void *addr, u8 size)
+{
+	void *addr64 = (void *)((unsigned long)addr & ~0x7);
+	unsigned long off = 8 - ((unsigned long)addr & 0x7) - size;
+
+	if (size == 4)
+		writel(be32_to_cpu(val), addr64 + off);
+	else
+		writew(be16_to_cpu((u16)val), addr64 + off);
+}
+
+static void util_pmem_memcpy(void *dst, const void *src, unsigned int len)
+{
+	unsigned int len32;
+	unsigned int i;
+
+	if ((unsigned long)src & 0x2) {
+		util_pmem_write(*(u16 *)src, dst, 2);
+		src += 2;
+		dst += 2;
+		len -= 2;
+	}
+
+	len32 = len >> 2;
+
+	for (i = 0; i < len32; i++, dst += 4, src += 4)
+		util_pmem_write(*(u32 *)src, dst, 4);
+
+	if (len & 0x2)
+		util_pmem_write(*(u16 *)src, dst, len & 0x2);
+}
+
+/**************************** ELF section loading ***************************/
+
+static int pe_load_pmem_section(int id, const void *data, const Elf32_Shdr *shdr)
+{
+	u32 offset = be32_to_cpu(shdr->sh_offset);
+	u32 addr = be32_to_cpu(shdr->sh_addr);
+	u32 size = be32_to_cpu(shdr->sh_size);
+	u32 type = be32_to_cpu(shdr->sh_type);
+
+	if (id == UTIL_ID) {
+		pr_err("%s: unsupported pmem section for UTIL\n", __func__);
+		return -EINVAL;
+	}
+
+	if (((unsigned long)(data + offset) & 0x3) != (addr & 0x3)) {
+		pr_err("%s: load address(%x) and elf file address(%lx) don't have the same alignment\n",
+		       __func__, addr, (unsigned long)data + offset);
+		return -EINVAL;
+	}
+
+	if (addr & 0x1) {
+		pr_err("%s: load address(%x) is not 16bit aligned\n", __func__, addr);
+		return -EINVAL;
+	}
+
+	if (size & 0x1) {
+		pr_err("%s: load size(%x) is not 16bit aligned\n", __func__, size);
+		return -EINVAL;
+	}
+
+	switch (type) {
+	case SHT_PROGBITS:
+		pe_pmem_memcpy_to32(id, addr, data + offset, size);
+		break;
+	default:
+		pr_err("%s: unsupported section type(%x)\n", __func__, type);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int pe_load_dmem_section(int id, const void *data, const Elf32_Shdr *shdr)
+{
+	u32 offset = be32_to_cpu(shdr->sh_offset);
+	u32 addr = be32_to_cpu(shdr->sh_addr);
+	u32 size = be32_to_cpu(shdr->sh_size);
+	u32 type = be32_to_cpu(shdr->sh_type);
+	u32 size32 = size >> 2;
+	u32 i;
+
+	if (((unsigned long)(data + offset) & 0x3) != (addr & 0x3)) {
+		pr_err("%s: load address(%x) and elf file address(%lx) don't have the same alignment\n",
+		       __func__, addr, (unsigned long)data + offset);
+		return -EINVAL;
+	}
+
+	if (addr & 0x3) {
+		pr_err("%s: load address(%x) is not 32bit aligned\n", __func__, addr);
+		return -EINVAL;
+	}
+
+	switch (type) {
+	case SHT_PROGBITS:
+		pe_dmem_memcpy_to32(id, addr, data + offset, size);
+		break;
+	case SHT_NOBITS:
+		for (i = 0; i < size32; i++, addr += 4)
+			pe_dmem_write(id, 0, addr, 4);
+		if (size & 0x3)
+			pe_dmem_write(id, 0, addr, size & 0x3);
+		break;
+	default:
+		pr_err("%s: unsupported section type(%x)\n", __func__, type);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int pe_load_ddr_section(int id, const void *data, const Elf32_Shdr *shdr)
+{
+	u32 offset = be32_to_cpu(shdr->sh_offset);
+	u32 addr = be32_to_cpu(shdr->sh_addr);
+	u32 size = be32_to_cpu(shdr->sh_size);
+	u32 type = be32_to_cpu(shdr->sh_type);
+	u32 flags = be32_to_cpu(shdr->sh_flags);
+
+	switch (type) {
+	case SHT_PROGBITS:
+		if (flags & SHF_EXECINSTR) {
+			if (id != UTIL_ID) {
+				pr_err("%s: unsupported ddr section type(%x) for PE(%d)\n",
+				       __func__, type, id);
+				return -EINVAL;
+			}
+
+			if (((unsigned long)(data + offset) & 0x3) != (addr & 0x3)) {
+				pr_err("%s: load address(%x) and elf file address(%lx) don't have the same alignment\n",
+				       __func__, addr, (unsigned long)data + offset);
+				return -EINVAL;
+			}
+
+			if (addr & 0x1) {
+				pr_err("%s: load address(%x) is not 16bit aligned\n",
+				       __func__, addr);
+				return -EINVAL;
+			}
+
+			if (size & 0x1) {
+				pr_err("%s: load length(%x) is not 16bit aligned\n",
+				       __func__, size);
+				return -EINVAL;
+			}
+
+			util_pmem_memcpy((void *)DDR_PHYS_TO_VIRT(addr), data + offset, size);
+		} else {
+			memcpy((void *)DDR_PHYS_TO_VIRT(addr), data + offset, size);
+		}
+		break;
+
+	case SHT_NOBITS:
+		memset((void *)DDR_PHYS_TO_VIRT(addr), 0, size);
+		break;
+
+	default:
+		pr_err("%s: unsupported section type(%x)\n", __func__, type);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int pe_load_pe_lmem_section(int id, const void *data, const Elf32_Shdr *shdr)
+{
+	u32 offset = be32_to_cpu(shdr->sh_offset);
+	u32 addr = be32_to_cpu(shdr->sh_addr);
+	u32 size = be32_to_cpu(shdr->sh_size);
+	u32 type = be32_to_cpu(shdr->sh_type);
+
+	if (id > CLASS5_ID) {
+		pr_err("%s: unsupported pe-lmem section type(%x) for PE(%d)\n",
+		       __func__, type, id);
+		return -EINVAL;
+	}
+
+	if (((unsigned long)(data + offset) & 0x3) != (addr & 0x3)) {
+		pr_err("%s: load address(%x) and elf file address(%lx) don't have the same alignment\n",
+		       __func__, addr, (unsigned long)data + offset);
+		return -EINVAL;
+	}
+
+	if (addr & 0x3) {
+		pr_err("%s: load address(%x) is not 32bit aligned\n", __func__, addr);
+		return -EINVAL;
+	}
+
+	switch (type) {
+	case SHT_PROGBITS:
+		class_pe_lmem_memcpy_to32(addr, data + offset, size);
+		break;
+	case SHT_NOBITS:
+		class_pe_lmem_memset(addr, 0, size);
+		break;
+	default:
+		pr_err("%s: unsupported section type(%x)\n", __func__, type);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+int pe_load_elf_section(int id, const void *data, const Elf32_Shdr *shdr)
+{
+	u32 addr = be32_to_cpu(shdr->sh_addr);
+	u32 size = be32_to_cpu(shdr->sh_size);
+
+	if (IS_DMEM(addr, size))
+		return pe_load_dmem_section(id, data, shdr);
+	else if (IS_PMEM(addr, size))
+		return pe_load_pmem_section(id, data, shdr);
+	else if (IS_PFE_LMEM(addr, size))
+		return 0; /* FIXME, matches vendor: not handled */
+	else if (IS_PHYS_DDR(addr, size))
+		return pe_load_ddr_section(id, data, shdr);
+	else if (IS_PE_LMEM(addr, size))
+		return pe_load_pe_lmem_section(id, data, shdr);
+
+	pr_err("%s: unsupported memory range(%x)\n", __func__, addr);
+	return 0;
 }
 
 /**************************** BMU ***************************/
