@@ -1209,6 +1209,33 @@ Stage P1 (platform_driver skeleton) and P2 (enabled on the board)
     captured before any PFE work started. Unrelated, already-known,
     non-fatal.
 
+Stage P3 (cbus register layer, hw block bring-up, ddr/iram resources)
+    ``pfe_hw_lib.c`` (ported from the vendor tree's shared
+    ``pfe/pfe/c2000/pfe.c`` HAL, not pure firmware-side code as first
+    scoped -- see commit history) brings up BMU1/BMU2, CLASS, TMU,
+    UTIL, and the three EGPI blocks plus HGPI via ``pfe_hw_init()``.
+
+    First real-hardware attempt hit ``error -EBUSY: can't request
+    region for resource [mem 0x83000000-0x83001fff]`` / ``Failed to
+    map iram resource``: the IRAM window was already owned by the
+    pre-existing generic ``mmio-sram`` node (``&iram``, already used
+    for ``clk_bypass_bug@fc00``) -- a second ``devm_ioremap_resource()``
+    on the same physical range from the pfe node conflicted with it.
+    Fixed by dropping the "iram" MMIO claim entirely for now (nothing
+    in this driver dereferences it yet); Stage P4's firmware loader
+    should go through ``&iram``'s own genalloc pool instead of
+    re-claiming the range directly.
+
+    **Confirmed on real hardware** after that fix: all block version
+    registers read back real values (CLASS=0x20, TMU=0x1011231,
+    BMU1/BMU2=0x21, EGPI1-3/HGPI=0x50, HIF/HIF_NOCPY=0x10, UTIL=0x20 --
+    none stuck at 0x0 or 0xffffffff, which would have indicated a dead
+    bus), both of ``tmu_init()``'s previously-unbounded polling waits
+    (``MEM_INIT_DONE``, ``LLM_INIT_DONE``) completed immediately with
+    no timeout, and the full ``PFE platform probed (... ddr=0x03400000
+    /12582912 ...)`` message appeared with no regression to the rest
+    of boot.
+
 Interesting finding for later stages
     **barebox itself already initializes PFE at boot**, before Linux
     ever runs: every real-hardware boot log shows barebox's own
