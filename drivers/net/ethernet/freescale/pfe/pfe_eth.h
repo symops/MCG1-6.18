@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * net_device/MDIO/PHY layer for a single PFE GEM port -- ported from the
- * 3.2.26 vendor tree's pfe_ctrl/pfe_eth.c/pfe_eth.h (kmodules/mspd-c2k/
- * pfe/ in symops/MCG1-3.2.26), scoped down for Stage P7 (GEM0 only, no
- * traffic path yet -- see pfe_eth.c's banner comment for the full scope
- * writeup).
+ * net_device/MDIO/PHY layer (Stage P7) and Tx/Rx traffic path (Stage
+ * P8) for a single PFE GEM port -- ported from the 3.2.26 vendor tree's
+ * pfe_ctrl/pfe_eth.c/pfe_eth.h (kmodules/mspd-c2k/pfe/ in
+ * symops/MCG1-3.2.26), GEM0 only so far (Stage P9 adds GEM1/GEM2 by the
+ * same pattern) -- see pfe_eth.c's banner comment for the full scope
+ * writeup.
  *
  * struct pfe_eth_priv_s below is a trimmed version of the vendor
  * pfe_eth_priv_s: dropped are the vendor's lro/low/high per-net_device
@@ -12,8 +13,9 @@
  * Stage P5 -- see pfe_hif.c's single shared struct pfe_hif.napi -- so a
  * second, per-client NAPI layer doesn't apply here the way it did to
  * the vendor's 3.2.26 architecture), the TX path's per-queue timers/
- * DMA-map bookkeeping/credit accounting (Stage P8), and everything tied
- * to ethtool/sysfs stats reporting that was never ported to begin with.
+ * DMA-map bookkeeping/credit accounting (needed for TSO and multi-queue
+ * QoS, neither of which this port implements), and everything tied to
+ * ethtool/sysfs stats reporting that was never ported to begin with.
  */
 #ifndef _PFE_ETH_H_
 #define _PFE_ETH_H_
@@ -36,9 +38,12 @@ struct pfe_eth_priv_s {
 	struct pfe *pfe;
 	struct hif_client_s client;
 
-	/* TMU Tx queue numbers this GEM's traffic is scheduled on --
-	 * unused until Stage P8 adds a real Tx path, computed now since
-	 * it's a fixed, DT-independent per-GEM constant.
+	/* TMU Tx queue numbers this GEM's traffic is scheduled on -- only
+	 * ever passed to hif_lib_tmu_queue_start()/stop() (both no-ops,
+	 * see pfe_hif_lib.c), since this port's actual Tx submission
+	 * (hif_lib_xmit_pkt(), Stage P8) always uses a single fixed
+	 * client-level queue (PFE_ETH_TXQ in pfe_eth.c) instead of the
+	 * vendor's per-packet QoS classification into one of 16.
 	 */
 	int low_tmuQ;
 	int high_tmuQ;

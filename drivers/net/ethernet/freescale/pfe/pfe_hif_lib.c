@@ -4,10 +4,11 @@
  * from the 3.2.26 vendor tree's pfe_ctrl/pfe_hif_lib.c (kmodules/
  * mspd-c2k/pfe/ in symops/MCG1-3.2.26).
  *
- * Stage P5 scope only -- see pfe_hif_lib.h for what's deliberately not
- * here yet (client registration, TX path, TX credit/QoS), all of which
- * are only reachable once a client is actually registered (Stage
- * P7-P9's pfe_eth.c).
+ * Stage P5 added the Rx buffer pool and event indication; Stage P7
+ * added client registration; Stage P8 adds the TX submission path and
+ * the Rx dequeue/re-arm pair (hif_lib_receive_pkt()/
+ * hif_lib_event_handler_start()) -- see pfe_hif_lib.h for what's still
+ * out of scope (TSO, TX credit/QoS).
  *
  * page_mode/LRO support is dropped, not deferred: it's a performance
  * feature (larger receive buffers backed by whole pages instead of
@@ -247,6 +248,159 @@ int hif_lib_tmu_queue_start(struct hif_client_s *client, int qno)
 
 int hif_lib_tmu_queue_stop(struct hif_client_s *client, int qno)
 {
+	return 0;
+}
+
+/*
+ * Writes the 6-byte struct hif_hdr directly into the packet buffer just
+ * before the data pointer the caller passed in (hif_lib_xmit_pkt()
+ * below decrements it there before calling this) -- the HIF hardware
+ * ring carries just one contiguous DMA buffer per packet, header and
+ * payload together, not a separate header descriptor.
+ */
+static inline void hif_hdr_write(struct hif_hdr *pkt_hdr, unsigned int client_id,
+				  unsigned int qno, u32 client_ctrl)
+{
+	if (!((unsigned long)pkt_hdr & 0x3)) {
+		((u32 *)pkt_hdr)[0] = (client_ctrl << 16) | (qno << 8) | client_id;
+	} else {
+		((u16 *)pkt_hdr)[0] = (qno << 8) | client_id;
+		((u16 *)pkt_hdr)[1] = client_ctrl;
+	}
+}
+
+/*
+ * Queue one full, non-fragmented packet for transmission. Only the
+ * vendor's HIF_FIRST_BUFFER|HIF_LAST_BUFFER|HIF_DATA_VALID single-
+ * descriptor case is ported (see pfe_hif_lib.h) -- data must have at
+ * least sizeof(struct hif_hdr) of headroom before it, since the header
+ * is written in place there; the caller (pfe_eth.c) is responsible for
+ * making sure that holds (pskb_expand_head() if not).
+ */
+int hif_lib_xmit_pkt(struct hif_client_s *client, unsigned int qno, void *data,
+		      unsigned int len, u32 client_ctrl, void *client_data)
+{
+	struct hif_client_tx_queue *queue = &client->tx_q[qno];
+	struct tx_queue_desc *desc = queue->base + queue->write_idx;
+
+	if (queue->tx_pending >= queue->size)
+		return 1;
+
+	data -= sizeof(struct hif_hdr);
+	len += sizeof(struct hif_hdr);
+
+	hif_hdr_write(data, client->id, qno, client_ctrl);
+
+	desc->data = client_data;
+	desc->ctrl = CL_DESC_OWN | CL_DESC_FLAGS(HIF_FIRST_BUFFER | HIF_LAST_BUFFER | HIF_DATA_VALID);
+
+	if (hif_xmit_pkt(&client->pfe->hif, client->id, qno, data, len))
+		return 1;
+
+	queue->write_idx = (queue->write_idx + 1) & (queue->size - 1);
+	queue->tx_pending++;
+	queue->jiffies_last_packet = jiffies;
+
+	return 0;
+}
+
+/*
+ * Dequeues one completed Tx packet's client_data (the skb pointer
+ * hif_lib_xmit_pkt() was given), so the caller can free it. Calls
+ * hif_tx_done_process() (Stage P5, pfe_hif.c) to make the HIF ring
+ * itself progress -- that's also where the Tx buffer's DMA mapping
+ * gets torn down.
+ */
+void *hif_lib_tx_get_next_complete(struct hif_client_s *client, int qno,
+				    unsigned int *flags, int count)
+{
+	struct hif_client_tx_queue *queue = &client->tx_q[qno];
+	struct tx_queue_desc *desc = queue->base + queue->read_idx;
+
+	if (!queue->tx_pending)
+		return NULL;
+
+	if (desc->ctrl & CL_DESC_OWN) {
+		hif_tx_done_process(&client->pfe->hif, count);
+
+		if (desc->ctrl & CL_DESC_OWN)
+			return NULL;
+	}
+
+	queue->read_idx = (queue->read_idx + 1) & (queue->size - 1);
+	queue->tx_pending--;
+	*flags = CL_DESC_GET_FLAGS(desc->ctrl);
+
+	return desc->data;
+}
+
+void *hif_lib_receive_pkt(struct hif_client_s *client, int qno, int *len, int *ofst,
+			   unsigned int *rx_ctrl, unsigned int *desc_ctrl, void **priv_data)
+{
+	struct hif_client_rx_queue *queue = &client->rx_q[qno];
+	struct rx_queue_desc *desc = queue->base + queue->read_idx;
+	void *pkt = NULL;
+
+	if (desc->ctrl & CL_DESC_OWN)
+		return NULL;
+
+	pkt = desc->data - pfe_pkt_headroom;
+
+	*rx_ctrl = desc->client_ctrl;
+	*desc_ctrl = desc->ctrl;
+
+	if (desc->ctrl & CL_DESC_FIRST) {
+		u16 size = *rx_ctrl >> 24;
+
+		if (size) {
+			*len = CL_DESC_BUF_LEN(desc->ctrl) - PFE_PKT_HEADER_SZ - size;
+			*ofst = pfe_pkt_headroom + PFE_PKT_HEADER_SZ + size;
+			*priv_data = desc->data + PFE_PKT_HEADER_SZ;
+		} else {
+			*len = CL_DESC_BUF_LEN(desc->ctrl) - PFE_PKT_HEADER_SZ;
+			*ofst = pfe_pkt_headroom + PFE_PKT_HEADER_SZ;
+			*priv_data = NULL;
+		}
+	} else {
+		*len = CL_DESC_BUF_LEN(desc->ctrl);
+		*ofst = pfe_pkt_headroom;
+	}
+
+	/* Needed so a client that never consumes this slot again (e.g. on
+	 * unregister) doesn't end up freeing the same buffer twice.
+	 */
+	desc->data = NULL;
+	smp_wmb();
+
+	desc->ctrl = CL_DESC_BUF_LEN(pfe_pkt_size) | CL_DESC_OWN;
+	queue->read_idx = (queue->read_idx + 1) & (queue->size - 1);
+
+	return pkt;
+}
+
+int hif_lib_event_handler_start(struct hif_client_s *client, int event, int qno)
+{
+	struct hif_client_rx_queue *queue = &client->rx_q[qno];
+	struct rx_queue_desc *desc = queue->base + queue->read_idx;
+
+	if (event >= HIF_EVENT_MAX || qno >= HIF_CLIENT_QUEUES_MAX)
+		return -1;
+
+	test_and_clear_bit(qno, &client->queue_mask[event]);
+
+	switch (event) {
+	case EVENT_RX_PKT_IND:
+		/* A packet may have arrived between the caller finishing its
+		 * drain and this clearing the mask -- if so, re-indicate
+		 * immediately instead of risking a missed wakeup.
+		 */
+		if (!(desc->ctrl & CL_DESC_OWN))
+			hif_lib_indicate_client(client->id, EVENT_RX_PKT_IND, qno);
+		break;
+	default:
+		break;
+	}
+
 	return 0;
 }
 

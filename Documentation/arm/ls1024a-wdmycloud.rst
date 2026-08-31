@@ -1473,6 +1473,54 @@ Stage P7 (``pfe_eth.c`` -- net_device/MDIO/PHY for GEM0)
     round trip before or alongside Stage P8 to see the transition print
     and confirmed autoneg speed/duplex, but doesn't block starting P8.
 
+Stage P8 (Tx/Rx traffic path for GEM0)
+    ``pfe_eth_send_packet()`` (``.ndo_start_xmit``) and
+    ``pfe_eth_rx_drain()``/``pfe_eth_event_handler()`` replace the Stage
+    P7 Tx stub and give GEM0 an actual data path, on top of new client-
+    library plumbing in ``pfe_hif_lib.c``: ``hif_lib_xmit_pkt()`` (queues
+    one full, non-fragmented packet -- the vendor's TSO/fragmented-skb
+    submission path via ``__hif_lib_xmit_pkt()`` isn't ported),
+    ``hif_lib_tx_get_next_complete()`` (dequeues a completed packet's skb
+    so it can be freed -- also where the underlying HIF Tx descriptor's
+    DMA mapping gets torn down, via ``hif_tx_done_process()``, already in
+    place since Stage P5), ``hif_lib_receive_pkt()`` (dequeues one
+    received packet's buffer), and ``hif_lib_event_handler_start()`` (the
+    Rx re-arm half of ``hif_lib_indicate_client()``'s edge-triggered
+    wakeup -- without it, a client's Rx queue would only ever be
+    indicated once, the very first time a packet arrives, and never
+    again).
+
+    No stop/wake-queue Tx flow control, no TSO, no multi-queue QoS
+    classification (everything submits on a single fixed queue,
+    ``PFE_ETH_TXQ``) -- none of it is needed to reach this stage's own
+    bar (DHCP+ping), and the 1024-deep Tx ring (``EMAC_TXQ_DEPTH``) is
+    comfortably more than that traffic pattern needs; a full ring just
+    drops the packet, the same way any driver without stop/wake-queue
+    wiring should rather than returning ``NETDEV_TX_BUSY`` with nothing
+    to ever un-stick it.
+
+    **Rx consumption has no second NAPI layer**, unlike the vendor's
+    per-GEM lro/low/high NAPI triple. Stage P5 already centralized Rx
+    polling at the HIF level (a single physical Rx DMA ring shared by
+    every client, demultiplexed by client id) -- ``pfe_eth_rx_drain()``
+    runs directly from ``pfe_eth_event_handler()``, itself called
+    synchronously from ``hif_lib_indicate_client()`` while already inside
+    that shared HIF-level NAPI poll's call stack, so there's nothing to
+    separately schedule. Rx buffers are wrapped into skbs with
+    ``build_skb()`` (zero-copy) rather than a copy -- ``PFE_BUF_SIZE``
+    (2048) was already sized for exactly this back in Stage P5, mirroring
+    the vendor driver's own non-mainline ``alloc_skb_header()`` kernel
+    addition with the stock ``build_skb()`` equivalent.
+
+    Multi-descriptor (jumbo/LRO) Rx reassembly isn't ported --
+    ``PFE_PKT_SIZE`` (1544) covers any standard MTU + headers in a single
+    HIF descriptor, so a packet split across more than one should never
+    actually occur; ``pfe_eth_rx_drain()`` drops defensively (with a
+    rate-limited warning) rather than mishandle it if it ever does.
+
+    Build-verified; hardware round-trip (the plan's round #5, DHCP+ping)
+    pending.
+
 Watchdog reset-control conflict with syscon
 ============================================
 

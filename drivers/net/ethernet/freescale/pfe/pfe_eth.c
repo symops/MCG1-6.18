@@ -1,31 +1,39 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * PFE Stage P7: net_device/MDIO/PHY bring-up for GEM0. Ported from the
- * 3.2.26 vendor tree's pfe_ctrl/pfe_eth.c (kmodules/mspd-c2k/pfe/ in
- * symops/MCG1-3.2.26, 2846 lines) -- almost none of that file's size is
- * ported here; see pfe_eth.h's banner for what was structurally dropped.
+ * PFE Stage P7-P8: net_device/MDIO/PHY bring-up (P7) and a working
+ * traffic path (P8) for GEM0. Ported from the 3.2.26 vendor tree's
+ * pfe_ctrl/pfe_eth.c (kmodules/mspd-c2k/pfe/ in symops/MCG1-3.2.26,
+ * 2846 lines) -- almost none of that file's size is ported here; see
+ * pfe_eth.h's banner for what was structurally dropped.
  *
- * Deliberately NOT in this stage:
+ * Stage P7 confirmed on real hardware: PHY address 0 (Broadcom
+ * BCM54612E), MDIO bus and PHY connect both working (see
+ * Documentation/arm/ls1024a-wdmycloud.rst).
  *
- *  - .ndo_start_xmit doesn't submit real packets yet (Stage P8) -- it
- *    exists only because net_device_ops requires a working xmit the
- *    moment the interface is IFF_UP (e.g. an outgoing ARP the instant
- *    link comes up would otherwise call a NULL function pointer), so
- *    it silently drops.
- *  - No per-GEM NAPI: this port's HIF layer (Stage P5) already centralized
- *    Rx polling in a single shared NAPI instance (pfe_hif.c's
- *    struct pfe_hif.napi), unlike the vendor's one-NAPI-triple-per-GEM
- *    design. hif_lib_client_register() (Stage P7, in pfe_hif_lib.c) is
- *    what makes this GEM reachable from that existing Rx path; consuming
- *    what lands in its client Rx queue into real skbs is Stage P8's job.
- *  - PHY address is unconfirmed for this exact board (see
- *    Documentation/arm/ls1024a-wdmycloud.rst and the porting plan's own
- *    "open risk #1"). Rather than guess, the MDIO bus is registered with
- *    a full address scan (phy_mask = 0) and every responding address is
- *    logged; the DTS deliberately has no phy-handle yet, so PHY connect
- *    is skipped and link simply stays down for this first hardware
- *    round-trip. Once a real address is confirmed, a phy-handle can be
- *    added to the DTS with no code change needed here.
+ * Stage P8 adds the actual Tx/Rx path:
+ *
+ *  - pfe_eth_send_packet() (.ndo_start_xmit) submits via
+ *    hif_lib_xmit_pkt() (Stage P8, pfe_hif_lib.c) -- one full,
+ *    non-fragmented packet per call, no TSO, no QoS classification
+ *    (everything goes on a single fixed queue, PFE_ETH_TXQ). No stop/
+ *    wake-queue flow control either: the 1024-deep ring (EMAC_TXQ_DEPTH)
+ *    is comfortably more than this baseline's DHCP+ping target needs,
+ *    so a full ring just drops the packet instead.
+ *  - pfe_eth_rx_drain() consumes what hif_lib_client_register() (Stage
+ *    P7) made this GEM reachable for, called directly from
+ *    pfe_eth_event_handler() -- itself called synchronously from
+ *    hif_lib_indicate_client() (Stage P5), which already runs inside
+ *    the shared HIF-level NAPI poll (pfe_hif.c's struct pfe_hif.napi).
+ *    No second NAPI layer needed: unlike the vendor's one-NAPI-triple-
+ *    per-GEM design, this port centralized Rx polling at the HIF level
+ *    back in Stage P5 (a single physical Rx DMA ring shared by every
+ *    client, demultiplexed by client id), and the drain runs to
+ *    completion inline, in the same softirq context the outer HIF poll
+ *    is already in -- there's nothing to schedule.
+ *  - No multi-descriptor (jumbo/LRO) Rx reassembly: PFE_PKT_SIZE (1544)
+ *    covers any standard MTU + headers in one HIF descriptor, so this
+ *    should never actually come up; pfe_eth_rx_drain() drops
+ *    defensively rather than mishandle it if it ever does.
  */
 
 #include <linux/clk.h>
@@ -328,6 +336,127 @@ static void pfe_eth_stop(struct pfe_eth_priv_s *priv)
 		phy_stop(priv->phydev);
 }
 
+/*
+ * TX queue index this port always submits to. The client registers
+ * EMAC_TXQ_CNT (16) SW queues (matching the vendor's per-packet
+ * priority classification, pfe_eth_get_queuenum() in the vendor
+ * driver), but this port doesn't implement any QoS classification --
+ * everything goes on queue 0, the same "unclassified default" queue
+ * traffic lands on in the vendor driver's own default configuration
+ * (priv->default_priority, never set to anything else there either).
+ */
+#define PFE_ETH_TXQ	0
+
+/*
+ * Per-call cap on how many completed Tx descriptors hif_tx_done_process()
+ * (called inside hif_lib_tx_get_next_complete(), Stage P5) will process
+ * in one go -- distinct from pfe_hif.c's own private TX_FREE_MAX_COUNT
+ * (64), which bounds the same call from the HIF ring's own housekeeping
+ * path instead. 16 matches the vendor's TX_FREE_MAX_COUNT for this
+ * client-level flush.
+ */
+#define PFE_ETH_TX_FREE_MAX	16
+
+/*
+ * Drain everything currently queued for this client/qno, building an
+ * skb around each buffer with build_skb() rather than copying -- the
+ * buffer was heap-allocated for exactly this by client_put_rxpacket()
+ * (pfe_hif.c) with PFE_BUF_SIZE (2048) sized to leave room for
+ * skb_shared_info past the packet data (see pfe_hif_lib.h), the same
+ * way the vendor driver's own alloc_skb_header() (a non-mainline
+ * addition to their 3.2.26 kernel) avoided a copy -- build_skb() is
+ * the stock-kernel equivalent.
+ *
+ * Every normal Ethernet frame fits in one HIF descriptor (PFE_PKT_SIZE,
+ * 1544, comfortably covers any standard MTU + headers), so the
+ * multi-descriptor/jumbo reassembly the vendor's pfe_eth_rx_skb() does
+ * (chaining fragments via skb_shinfo()->frag_list, tracked per-qno in
+ * priv->skb_inflight[]) isn't ported -- if CL_DESC_FIRST and
+ * CL_DESC_LAST aren't both set on the same descriptor, this port has
+ * no way to reassemble it, so it's dropped instead of mishandled.
+ */
+static void pfe_eth_rx_drain(struct pfe_eth_priv_s *priv, unsigned int qno)
+{
+	struct net_device *dev = priv->dev;
+	unsigned int rx_ctrl, desc_ctrl;
+	void *buf_addr, *priv_data;
+	int length, offset;
+	struct sk_buff *skb;
+
+	for (;;) {
+		buf_addr = hif_lib_receive_pkt(&priv->client, qno, &length, &offset,
+						&rx_ctrl, &desc_ctrl, &priv_data);
+		if (!buf_addr)
+			break;
+
+		if (!(desc_ctrl & CL_DESC_FIRST) || !(desc_ctrl & CL_DESC_LAST)) {
+			net_warn_ratelimited("%s: dropping unsupported multi-descriptor packet (ctrl=%#x)\n",
+					      dev->name, desc_ctrl);
+			kfree(buf_addr);
+			dev->stats.rx_dropped++;
+			continue;
+		}
+
+		skb = build_skb(buf_addr, PFE_BUF_SIZE);
+		if (!skb) {
+			kfree(buf_addr);
+			dev->stats.rx_dropped++;
+			continue;
+		}
+
+		skb_reserve(skb, offset);
+		skb_put(skb, length);
+		skb->dev = dev;
+		skb->protocol = eth_type_trans(skb, dev);
+		skb_checksum_none_assert(skb);
+
+		dev->stats.rx_packets++;
+		dev->stats.rx_bytes += length;
+
+		netif_receive_skb(skb);
+	}
+}
+
+static int pfe_eth_event_handler(void *data, int event, int qno)
+{
+	struct pfe_eth_priv_s *priv = data;
+
+	switch (event) {
+	case EVENT_RX_PKT_IND:
+		pfe_eth_rx_drain(priv, qno);
+		/* Edge-triggered -- re-arm so the next arrival indicates
+		 * again (see hif_lib_event_handler_start()'s own comment).
+		 */
+		hif_lib_event_handler_start(&priv->client, EVENT_RX_PKT_IND, qno);
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+/*
+ * Free skbs for Tx descriptors the hardware has finished with. Called
+ * both opportunistically after every send (so the ring doesn't fill up
+ * under sustained traffic) and forced on close() (so nothing referenced
+ * by the about-to-be-freed tx_qbase leaks -- see pfe_eth_close()).
+ */
+static void pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
+{
+	struct sk_buff *skb;
+	unsigned int flags;
+
+	while (count-- > 0) {
+		skb = hif_lib_tx_get_next_complete(&priv->client, qno, &flags, PFE_ETH_TX_FREE_MAX);
+		if (!skb)
+			break;
+
+		if (flags & HIF_DATA_VALID)
+			dev_kfree_skb_any(skb);
+	}
+}
+
 static int pfe_eth_open(struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
@@ -343,6 +472,7 @@ static int pfe_eth_open(struct net_device *dev)
 	client->rx_qsize = EMAC_RXQ_DEPTH;
 	client->priv = priv;
 	client->pfe = priv->pfe;
+	client->event_handler = pfe_eth_event_handler;
 
 	rc = hif_lib_client_register(client);
 	if (rc) {
@@ -409,6 +539,15 @@ static int pfe_eth_close(struct net_device *dev)
 
 	clk_disable_unprepare(priv->gemtx_clk);
 
+	/*
+	 * Force-flush every Tx descriptor still in flight before releasing
+	 * tx_qbase (inside hif_lib_client_unregister()) -- otherwise any
+	 * skb pointer sitting in a not-yet-completed descriptor leaks,
+	 * since the memory holding that pointer is about to be freed out
+	 * from under it. EMAC_TXQ_DEPTH (1024) bounds the loop.
+	 */
+	pfe_eth_flush_txq(priv, PFE_ETH_TXQ, EMAC_TXQ_DEPTH);
+
 	hif_lib_client_unregister(&priv->client);
 
 	return 0;
@@ -416,11 +555,48 @@ static int pfe_eth_close(struct net_device *dev)
 
 static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *dev)
 {
-	/* Stage P8 adds the real HIF Tx submission path -- see this file's
-	 * banner comment for why this can't just be left unset.
+	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+
+	if (skb_headroom(skb) < sizeof(struct hif_hdr) &&
+	    pskb_expand_head(skb, sizeof(struct hif_hdr), 0, GFP_ATOMIC)) {
+		dev_kfree_skb_any(skb);
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+
+	if (skb_linearize(skb)) {
+		dev_kfree_skb_any(skb);
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+
+	hif_tx_lock(&priv->pfe->hif);
+
+	/*
+	 * No hardware checksum offload wired up (NETIF_F_IP_CSUM isn't a
+	 * declared feature, so skb->ip_summed should never actually be
+	 * CHECKSUM_PARTIAL here) and no queue-full backpressure -- ring is
+	 * 1024 deep (EMAC_TXQ_DEPTH), comfortably more than this baseline's
+	 * DHCP+ping target needs; a full ring just drops, like any driver
+	 * without a stop/wake-queue implementation should, rather than
+	 * returning NETDEV_TX_BUSY with nothing to ever un-stick it.
 	 */
-	dev_kfree_skb(skb);
-	dev->stats.tx_dropped++;
+	if (hif_lib_xmit_pkt(&priv->client, PFE_ETH_TXQ, skb->data, skb->len, 0, skb)) {
+		hif_tx_unlock(&priv->pfe->hif);
+		dev_kfree_skb_any(skb);
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+
+	hif_tx_dma_start();
+
+	hif_tx_unlock(&priv->pfe->hif);
+
+	dev->stats.tx_packets++;
+	dev->stats.tx_bytes += skb->len;
+
+	pfe_eth_flush_txq(priv, PFE_ETH_TXQ, PFE_ETH_TX_FREE_MAX);
+
 	return NETDEV_TX_OK;
 }
 
@@ -455,6 +631,12 @@ static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 
 	SET_NETDEV_DEV(dev, pfe->dev);
 	dev->netdev_ops = &pfe_netdev_ops;
+	/* hif_lib_xmit_pkt() writes struct hif_hdr in place just before
+	 * skb->data -- ask the stack to reserve room for it up front so
+	 * pfe_eth_send_packet()'s pskb_expand_head() fallback is only ever
+	 * needed for an skb that came from somewhere unusual.
+	 */
+	dev->needed_headroom = sizeof(struct hif_hdr);
 
 	priv = netdev_priv(dev);
 	priv->pfe = pfe;

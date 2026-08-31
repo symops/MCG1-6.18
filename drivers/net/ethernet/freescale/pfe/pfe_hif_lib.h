@@ -6,11 +6,16 @@
  *
  * Stage P5 added what pfe_hif.c's init/exit/ISR/NAPI path itself needs
  * (the shared-memory rx buffer pool, and the client event indication
- * used by the Rx path). Stage P7 adds the client-registration API
+ * used by the Rx path). Stage P7 added the client-registration API
  * (hif_lib_client_register()/unregister()) that pfe_eth.c calls from
- * its .ndo_open/.ndo_stop. Still out of scope: the TX submission path
- * (hif_lib_xmit_pkt(), TSO) and TX credit/QoS accounting, both only
- * reachable once Stage P8 adds a working .ndo_start_xmit.
+ * its .ndo_open/.ndo_stop. Stage P8 adds the TX submission path
+ * (hif_lib_xmit_pkt(), hif_lib_tx_get_next_complete()) and
+ * hif_lib_event_handler_start() (the Rx re-arm half of the
+ * hif_lib_indicate_client() edge-triggered wakeup below). Still out of
+ * scope: TSO and TX credit/QoS accounting -- neither is needed for
+ * plain, non-jumbo Ethernet traffic at the pace this baseline targets
+ * (DHCP+ping), and dropping them avoids reintroducing the FCI-adjacent
+ * machinery this whole port has deliberately left out since Stage P1.
  */
 #ifndef _PFE_HIF_LIB_H_
 #define _PFE_HIF_LIB_H_
@@ -139,5 +144,49 @@ int hif_lib_client_register(struct hif_client_s *client);
 int hif_lib_client_unregister(struct hif_client_s *client);
 int hif_lib_tmu_queue_start(struct hif_client_s *client, int qno);
 int hif_lib_tmu_queue_stop(struct hif_client_s *client, int qno);
+
+/*
+ * TX submission (Stage P8) -- hif_lib_xmit_pkt() queues one full,
+ * non-fragmented packet (the only case this port implements; the
+ * vendor's fragmented/TSO submission path via __hif_lib_xmit_pkt() and
+ * multiple HIF_FIRST_BUFFER/HIF_LAST_BUFFER-flagged calls per packet
+ * isn't ported). hif_lib_tx_get_next_complete() dequeues a completed
+ * packet's client_data (the skb pointer the caller passed in) so the
+ * caller can free it -- this is also how the underlying HIF Tx ring
+ * descriptor's DMA mapping gets torn down, via hif_tx_done_process()
+ * inside it (already ported in pfe_hif.c since Stage P5).
+ */
+int hif_lib_xmit_pkt(struct hif_client_s *client, unsigned int qno, void *data,
+		      unsigned int len, u32 client_ctrl, void *client_data);
+void *hif_lib_tx_get_next_complete(struct hif_client_s *client, int qno,
+				    unsigned int *flags, int count);
+
+/*
+ * Dequeues one received packet's buffer (Stage P8). *ofst is the byte
+ * offset from the start of that buffer where the actual payload begins
+ * (past the hif_hdr, and past an optional firmware-prepended private
+ * header whose size is packed into the top byte of *rx_ctrl -- this
+ * port never sets that up on the Tx side, so it should always read 0
+ * for anything this driver itself sends, but a packet ingested straight
+ * off the wire goes through the same CLASS PE code path regardless, so
+ * the offset math is kept general rather than assumed away). *priv_data
+ * points at that private header if present, NULL otherwise -- unused by
+ * this port (no consumer for it), kept only because getting *ofst right
+ * depends on computing it.
+ */
+void *hif_lib_receive_pkt(struct hif_client_s *client, int qno, int *len, int *ofst,
+			   unsigned int *rx_ctrl, unsigned int *desc_ctrl, void **priv_data);
+
+/*
+ * Rx re-arm (Stage P8) -- call after draining a client's Rx queue for
+ * the given (event, qno) pair in response to hif_lib_indicate_client()
+ * calling this client's event_handler. hif_lib_indicate_client() is
+ * edge-triggered (queue_mask[] latches once until cleared here), so
+ * skipping this call would mean this queue never gets indicated again.
+ * Also re-checks for a packet that arrived during the drain (a race
+ * between "queue looked empty" and "mask cleared") and re-indicates
+ * immediately if so, rather than risking a missed wakeup.
+ */
+int hif_lib_event_handler_start(struct hif_client_s *client, int event, int qno);
 
 #endif /* _PFE_HIF_LIB_H_ */
