@@ -415,6 +415,33 @@
 			snps,usb3_lpm_capable;
 			status = "disabled";
 		};
+
+		/*
+		 * PFE (Packet Forwarding Engine): this SoC's Ethernet block,
+		 * driving all three EMACs through its own firmware-loaded
+		 * packet-processor cores (CLASS/TMU/UTIL) rather than being
+		 * a set of plain MAC peripherals. No mainline driver exists
+		 * for this IP yet -- see Documentation/arm/ls1024a-wdmycloud.rst.
+		 *
+		 * Only the "apb" and "axi" (cbus) MMIO windows and the "hif"
+		 * IRQ are wired up at this stage; the "ddr" packet-buffer
+		 * carve-out and "iram" window are added once something
+		 * actually consumes them. The old 3.2.26 vendor board file
+		 * also lists an "ipsec" resource for hardware IPsec offload
+		 * -- intentionally not carried forward here.
+		 */
+		pfe: pfe@90500000 {
+			compatible = "fsl,ls1024a-pfe";
+			reg = <0x90500000 0x10000>, <0x9c000000 0x1000000>;
+			reg-names = "apb", "axi";
+			interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "hif";
+			clocks = <&clkcore LS1024A_CLK_PFE>, <&clkcore LS1024A_CLK_PFE_SYS>;
+			clock-names = "pfe", "pfe_sys";
+			resets = <&clkreset LS1024A_AXI_PFE_SYS_RST>, <&clkreset LS1024A_PFE_CORE_RST>;
+			reset-names = "axi", "core";
+			status = "disabled";
+		};
 	};
 };
 
