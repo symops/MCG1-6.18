@@ -27,6 +27,24 @@
 		smp-bringup {
 			reg = <0x00000000 0x800>;
 		};
+
+		/*
+		 * PFE packet-buffer/route-table carve-out. Base/size come
+		 * from the 3.2.26 vendor tree's COMCERTO_PFE_DDR_BASE/SIZE
+		 * (comcerto-2000.h): COMCERTO_AXI_DDR_BASE=0x0 (matches this
+		 * port's own confirmed physical RAM start, see the memory
+		 * bank finding in Documentation/arm/ls1024a-wdmycloud.rst),
+		 * offset by COMCERTO_DDR_SHARED_BASE (0x2C00000 = 44MiB,
+		 * exactly the size of this board's low RAM bank per the old
+		 * kernel's own "Memory: 44MB 192MB" boot log) + 8MiB, so
+		 * this carve-out sits at the very start of the 192MiB high
+		 * bank -- not an arbitrary EVM-only address. Size 12MiB
+		 * matches pfe_hw.c's own DDR sub-layout math (see pfe_mod.h).
+		 */
+		pfe_ddr: pfe@3400000 {
+			reg = <0x03400000 0x00c00000>;
+			no-map;
+		};
 	};
 
 	aliases {
@@ -423,17 +441,15 @@
 		 * a set of plain MAC peripherals. No mainline driver exists
 		 * for this IP yet -- see Documentation/arm/ls1024a-wdmycloud.rst.
 		 *
-		 * Only the "apb" and "axi" (cbus) MMIO windows and the "hif"
-		 * IRQ are wired up at this stage; the "ddr" packet-buffer
-		 * carve-out and "iram" window are added once something
-		 * actually consumes them. The old 3.2.26 vendor board file
-		 * also lists an "ipsec" resource for hardware IPsec offload
-		 * -- intentionally not carried forward here.
+		 * The old 3.2.26 vendor board file also lists an "ipsec"
+		 * resource for hardware IPsec offload -- intentionally not
+		 * carried forward here (not porting that offload path).
 		 */
 		pfe: pfe@90500000 {
 			compatible = "fsl,ls1024a-pfe";
-			reg = <0x90500000 0x10000>, <0x9c000000 0x1000000>;
-			reg-names = "apb", "axi";
+			reg = <0x90500000 0x10000>, <0x9c000000 0x1000000>, <0x83000000 0x2000>;
+			reg-names = "apb", "axi", "iram";
+			memory-region = <&pfe_ddr>;
 			interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "hif";
 			clocks = <&clkcore LS1024A_CLK_PFE>, <&clkcore LS1024A_CLK_PFE_SYS>;
