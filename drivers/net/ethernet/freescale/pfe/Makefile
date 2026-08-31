@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0
+obj-$(CONFIG_FSL_LS1024A_PFE) += fsl_ls1024a_pfe.o
+fsl_ls1024a_pfe-objs := pfe_platform.o

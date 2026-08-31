@@ -24,3 +24,4 @@ obj-$(CONFIG_FSL_DPAA_ETH) += dpaa/
 
 obj-y += dpaa2/
 obj-y += enetc/
+obj-y += pfe/

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config FSL_LS1024A_PFE
+	tristate "Freescale LS1024A PFE support"
+	depends on ARCH_LS1024A || COMPILE_TEST
+	depends on OF && HAS_IOMEM
+	help
+	  This driver supports the PFE (Packet Forwarding Engine) found on
+	  the Freescale/Mindspeed LS1024A (Comcerto 2000) SoC. The PFE
+	  drives all three on-chip Ethernet MACs through its own
+	  firmware-loaded packet-processor cores.
+
+	  This is a staged, in-progress port -- see
+	  Documentation/arm/ls1024a-wdmycloud.rst for status.
