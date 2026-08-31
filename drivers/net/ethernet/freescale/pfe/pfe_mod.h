@@ -8,6 +8,7 @@
 #include <linux/sizes.h>
 
 #include "pfe_cbus.h"
+#include "pfe_ctrl.h"
 #include "pfe_hif.h"
 
 /* Client library's own struct (pfe_hif_lib.h, Stage P7-P9); only ever
@@ -79,10 +80,13 @@ struct pfe {
 
 	/*
 	 * ELF section addresses discovered while loading firmware (Stage
-	 * P4), needed later to talk to each PE's "shared" memory region.
-	 * Vendor driver keeps these in a separate struct pfe_ctrl ctrl;
-	 * member -- move them there once Stage P6 introduces it, rather
-	 * than inventing that struct's shape ahead of actually needing it.
+	 * P4) -- diagnostic bookkeeping only (logged in pfe_firmware.c),
+	 * not used for any address computation. The vendor driver's own
+	 * struct pfe_ctrl keeps the same fields because it needs them to
+	 * compute PE addresses via linker-shadow-section relative offsets;
+	 * Stage P6 deliberately doesn't replicate that mechanism (see the
+	 * banner comment in pfe_ctrl.h), so struct pfe_ctrl below has no
+	 * use for these and they stay here instead of moving there.
 	 */
 	unsigned long class_dmem_sh;
 	unsigned long class_pe_lmem_sh;
@@ -91,6 +95,11 @@ struct pfe {
 	unsigned long util_ddr_sh;
 
 	struct pfe_hif hif;
+
+	/* Control-message channel to the PE firmware (Stage P6) --
+	 * PE start/stop and the DMEM<->DDR "PE request" mailbox protocol.
+	 */
+	struct pfe_ctrl ctrl;
 
 	/* Registered clients, indexed by HIF_CLIENTS_MAX id (PFE_CL_GEM0,
 	 * ...). Populated by hif_lib_client_register() (Stage P7-P9);

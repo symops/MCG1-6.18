@@ -1305,6 +1305,60 @@ Cosmetic, rootfs-side, not a kernel issue
     loadable module. Harmless -- boot continues -- and out of scope
     for this kernel repo to fix (rootfs-side init script).
 
+Stage P6 (``pfe_ctrl.c`` -- control-message channel to the PE firmware)
+    ``pfe_ctrl.c``/``pfe_ctrl.h`` add the mailbox protocol used to talk
+    to running CLASS/TMU/UTIL PE firmware: ``pe_sync_stop()``/
+    ``pe_start()`` (pause/resume packet processing on a set of PEs) and
+    ``pe_request()``/``tmu_pe_request()`` (ask a PE to copy data
+    to/from its own DMEM from/to DDR, used by later stages to push
+    per-GEM config down to the firmware). Deliberately dropped: the
+    vendor pfe_ctrl.c's "FCI" control plane
+    (``__pfe_ctrl_cmd_handler()`` in ``pfe/pfe/c2000/__pfe_ctrl.c``,
+    dispatching into a dozen ``module_*.c`` files implementing IP
+    routing/bridging/VLAN/PPPoE/IPsec/tunnel/WiFi-offload/RTP-relay/
+    multicast/QoS) -- none of it is needed to pass plain Ethernet
+    traffic through GEM0-2 (Stage P7-P9), matching the same scope cuts
+    already made for ``pfe_vwd.c``/``pfe_pci.c``/``pfe_diags.c``/
+    ``pfe_sysfs.c``/``pfe_mspsync.c``/``pfe_unit_test.c`` earlier.
+    Also dropped along with it: the periodic ``ctrl->timer_thread``,
+    the ``dma_pool``/``dma_pool_512``/``null_ct`` conntrack-entry
+    allocators, and the route-table/IPsec-LMEM address fields -- all of
+    it existed only to support the FCI apparatus.
+
+    A second, independent scope cut: the vendor driver finds each PE's
+    mailbox address by building host-side "shadow" copies of the
+    mailbox structs into specially-named linker sections inside its own
+    ``pfe_ctrl.ko`` (the ``CLASS_DMEM_SH2()``-family macros in
+    ``pfe_ctrl_hal.h``), then computing the PE-side address from the
+    relative offset between that shadow section and this driver's own
+    copy of it. That trick needs the host driver to be a loadable
+    module with its own linker script fragment -- doesn't fit a
+    built-in (``=y``) driver. Since the firmware ELFs are unstripped,
+    this port instead looks the exact ``sync_mbox``/``msg_mbox``
+    symbols up directly in each firmware's ``.symtab``
+    (``pfe_firmware.c:get_elf_symbol_addr()``) and uses their
+    ``st_value`` as-is -- confirmed via ``arm-linux-gnueabihf-readelf
+    -sW`` that those symbols exist, with sizes matching
+    ``struct pe_sync_mailbox``/``struct pe_msg_mailbox``, in all three
+    firmware blobs in this tree (``class_c2000.elf``: ``msg_mbox`` @
+    ``0x1600``, ``sync_mbox`` @ ``0x1860``; ``tmu_c2000.elf``:
+    ``msg_mbox`` @ ``0x4c8``, ``sync_mbox`` @ ``0x5a8``;
+    ``util_c2000.elf``: ``msg_mbox`` @ ``0x1288``, ``sync_mbox`` @
+    ``0x1d18``). ``pfe_firmware_init()`` populates
+    ``pfe->ctrl.sync_mailbox_baseaddr[]``/``msg_mailbox_baseaddr[]``
+    for the matching PE id range right after each firmware image loads;
+    ``pfe_ctrl_init()`` itself is now just a ``mutex_init()``, run after
+    ``pfe_firmware_init()`` (matching vendor ordering) since those
+    addresses aren't known until the ELF symbol tables have been
+    parsed.
+
+    **Build-only verification** -- per the porting plan, this stage has
+    no independently observable boot-time behaviour of its own (nothing
+    calls ``pe_request()``/``pe_sync_stop()``/``pe_start()`` yet; that
+    starts in Stage P7-P9 once a ``net_device`` exists to drive them),
+    so it's checked by a clean build rather than its own hardware round
+    trip -- treated as one combined checkpoint with Stage P7.
+
 Watchdog reset-control conflict with syscon
 ============================================
 

@@ -14,6 +14,7 @@
 #define _PFE_HW_LIB_H_
 
 #include <linux/elf.h>
+#include <linux/io.h>
 
 #include <asm/system_info.h>
 
@@ -156,7 +157,9 @@ enum {
 
 #define CLASS_MASK	((1 << CLASS0_ID) | (1 << CLASS1_ID) | (1 << CLASS2_ID) | \
 			 (1 << CLASS3_ID) | (1 << CLASS4_ID) | (1 << CLASS5_ID))
+#define CLASS_MAX_ID	CLASS5_ID
 #define TMU_MASK	((1 << TMU0_ID) | (1 << TMU1_ID) | (1 << TMU2_ID) | (1 << TMU3_ID))
+#define TMU_MAX_ID	TMU3_ID
 #define UTIL_MASK	(1 << UTIL_ID)
 
 /* PE information: virtual addresses of a PE's indirect memory-access

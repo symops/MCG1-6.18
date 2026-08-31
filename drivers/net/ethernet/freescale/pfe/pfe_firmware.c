@@ -33,6 +33,7 @@
 #include <linux/firmware.h>
 
 #include "pfe_mod.h"
+#include "pfe_ctrl.h"
 #include "pfe_firmware.h"
 #include "pfe_hw_lib.h"
 
@@ -72,6 +73,59 @@ static unsigned long get_elf_section(const struct firmware *fw, const char *sect
 	if (shdr)
 		return be32_to_cpu(shdr->sh_addr);
 	return -1;
+}
+
+/*
+ * Look up a symbol's address (st_value) in the firmware's .symtab.
+ *
+ * The vendor host driver never did this: it instead built its own
+ * "shadow" copies of shared structures (sync_mailbox, msg_mailbox, ...)
+ * into specially-named linker sections inside its own pfe_ctrl.ko
+ * (CLASS_DMEM_SH()-family macros in pfe_ctrl_hal.h) and computed each
+ * one's real PE-side address from the *relative offset* between that
+ * shadow section and this driver's own equivalent shadow copy -- a
+ * trick that needs the host driver built as a loadable module with its
+ * own linker script, and needs the shared struct's definition to have
+ * identical layout on both sides by construction.
+ *
+ * This port doesn't need that: the firmware ELFs are unstripped, so the
+ * exact symbol (e.g. "sync_mbox", 8 bytes, matching struct
+ * pe_sync_mailbype) can just be looked up directly and its st_value
+ * used as-is (confirmed on the actual class_c2000.elf/tmu_c2000.elf/
+ * util_c2000.elf blobs in this tree -- st_value is already an absolute
+ * PE-side DMEM address, not section-relative). Simpler, and doesn't
+ * require this driver to be built as a loadable module.
+ */
+static long get_elf_symbol_addr(const struct firmware *fw, const char *name)
+{
+	const Elf32_Shdr *symtab_shdr, *strtab_shdr;
+	const Elf32_Sym *sym;
+	Elf32_Word strtab_ndx;
+	const char *strtab;
+	unsigned int i, nsyms;
+
+	symtab_shdr = get_elf_section_header(fw, ".symtab");
+	if (!symtab_shdr)
+		return -ENOENT;
+
+	strtab_ndx = be32_to_cpu(symtab_shdr->sh_link);
+	strtab_shdr = (const Elf32_Shdr *)(fw->data + be32_to_cpu(
+			((const Elf32_Ehdr *)fw->data)->e_shoff) +
+			strtab_ndx * be16_to_cpu(((const Elf32_Ehdr *)fw->data)->e_shentsize));
+	strtab = fw->data + be32_to_cpu(strtab_shdr->sh_offset);
+
+	sym = (const Elf32_Sym *)(fw->data + be32_to_cpu(symtab_shdr->sh_offset));
+	nsyms = be32_to_cpu(symtab_shdr->sh_size) / sizeof(*sym);
+
+	for (i = 0; i < nsyms; i++, sym++) {
+		const char *sym_name = strtab + be32_to_cpu(sym->st_name);
+
+		if (!strcmp(sym_name, name))
+			return be32_to_cpu(sym->st_value);
+	}
+
+	pr_err("%s: symbol %s not found\n", __func__, name);
+	return -ENOENT;
 }
 
 static void pfe_check_version_info(const struct firmware *fw)
@@ -145,6 +199,37 @@ static int pfe_load_elf(int pe_mask, const struct firmware *fw)
 	return 0;
 }
 
+/*
+ * Look up a firmware image's "sync_mbox"/"msg_mbox" symbols (see
+ * get_elf_symbol_addr() above) and record their PE-side address for
+ * every PE id in [first_id, last_id] -- all PEs loaded from the same
+ * firmware image share the same firmware layout, hence the same
+ * mailbox addresses (matching the vendor driver's own pfe_ctrl_init(),
+ * which assigns the same looked-up address to every id in a PE-type's
+ * range).
+ */
+static int pfe_ctrl_set_mailbox_addrs(struct pfe *pfe, const struct firmware *fw,
+				       int first_id, int last_id)
+{
+	long sync_addr, msg_addr;
+	int id;
+
+	sync_addr = get_elf_symbol_addr(fw, "sync_mbox");
+	if (sync_addr < 0)
+		return sync_addr;
+
+	msg_addr = get_elf_symbol_addr(fw, "msg_mbox");
+	if (msg_addr < 0)
+		return msg_addr;
+
+	for (id = first_id; id <= last_id; id++) {
+		pfe->ctrl.sync_mailbox_baseaddr[id] = sync_addr;
+		pfe->ctrl.msg_mailbox_baseaddr[id] = msg_addr;
+	}
+
+	return 0;
+}
+
 int pfe_firmware_init(struct pfe *pfe)
 {
 	const struct firmware *class_fw, *tmu_fw, *util_fw;
@@ -192,6 +277,12 @@ int pfe_firmware_init(struct pfe *pfe)
 	dev_info(pfe->dev, "class firmware loaded %#lx %#lx\n",
 		 pfe->class_dmem_sh, pfe->class_pe_lmem_sh);
 
+	rc = pfe_ctrl_set_mailbox_addrs(pfe, class_fw, CLASS0_ID, CLASS_MAX_ID);
+	if (rc < 0) {
+		dev_err(pfe->dev, "failed to locate class mailbox symbols\n");
+		goto err_load;
+	}
+
 	rc = pfe_load_elf(TMU_MASK, tmu_fw);
 	if (rc < 0) {
 		dev_err(pfe->dev, "tmu firmware load failed\n");
@@ -199,6 +290,12 @@ int pfe_firmware_init(struct pfe *pfe)
 	}
 	pfe->tmu_dmem_sh = get_elf_section(tmu_fw, ".dmem_sh");
 	dev_info(pfe->dev, "tmu firmware loaded %#lx\n", pfe->tmu_dmem_sh);
+
+	rc = pfe_ctrl_set_mailbox_addrs(pfe, tmu_fw, TMU0_ID, TMU_MAX_ID);
+	if (rc < 0) {
+		dev_err(pfe->dev, "failed to locate tmu mailbox symbols\n");
+		goto err_load;
+	}
 
 	rc = pfe_load_elf(UTIL_MASK, util_fw);
 	if (rc < 0) {
@@ -208,6 +305,12 @@ int pfe_firmware_init(struct pfe *pfe)
 	pfe->util_dmem_sh = get_elf_section(util_fw, ".dmem_sh");
 	pfe->util_ddr_sh = get_elf_section(util_fw, ".ddr_sh");
 	dev_info(pfe->dev, "util firmware loaded %#lx\n", pfe->util_dmem_sh);
+
+	rc = pfe_ctrl_set_mailbox_addrs(pfe, util_fw, UTIL_ID, UTIL_ID);
+	if (rc < 0) {
+		dev_err(pfe->dev, "failed to locate util mailbox symbols\n");
+		goto err_load;
+	}
 
 	util_enable();
 	tmu_enable(0xf);
