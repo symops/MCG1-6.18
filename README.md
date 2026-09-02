@@ -101,8 +101,9 @@ against real hardware, in order:
    CPU cores online, 235 MiB total memory.
 
 See `Documentation/arm/ls1024a-wdmycloud.rst` for the full writeup of
-each, plus what's still not working post-boot (networking, LEDs --
-both already expected/tracked below).
+each. Networking (PFE) and the RJ45 port LEDs, once the largest
+remaining gaps, are now both working -- see "What's in this repo"
+and "What's *not* ported yet" below.
 
 ## What's in this repo
 
@@ -151,6 +152,21 @@ both already expected/tracked below).
   "SPI-NOR boot flash access from Linux", for the full story (missing
   pinctrl, a broken EEPROM-read hardware mode, chip-select timing
   across the command/data phase boundary, and scratch-buffer sizing).
+- **`drivers/net/ethernet/freescale/pfe/`** -- new driver for the
+  Comcerto Packet Forwarding Engine (EMAC0, EGPI1, HGPI, BMU1-2,
+  CLASS, TMU, UTIL, HIF), this SoC's entire network path and this
+  project's largest single piece of work. No mainline or Bonstra-fork
+  driver existed to forward-port; this is a from-scratch port of the
+  old 3.2.26 kernel's custom `pfe` module (`symops/MCG1-3.2.26`,
+  `kmodules/mspd-c2k/pfe`), reusing its three firmware blobs
+  (`class_c2000.elf`, `tmu_c2000.elf`, `util_c2000.elf`) as opaque,
+  version-independent microcode. Confirmed on real hardware: DHCP,
+  ping, and sustained multi-hundred-MB transfers over the single
+  physical RJ45 port (GEM0), including both port LEDs behaving
+  correctly (see `Documentation/arm/ls1024a-wdmycloud.rst` for the
+  register-level story behind the LED fix). This board has only one
+  physical Ethernet port, so GEM1/GEM2 (present in the SoC but unwired
+  on this board) are not applicable -- see below.
 - **`arch/arm/configs/ls1024a_defconfig`** -- the config this was all
   built and verified against.
 - **`Documentation/arm/ls1024a-wdmycloud.rst`** -- longer-form porting
@@ -159,16 +175,18 @@ both already expected/tracked below).
 
 ## What's *not* ported yet
 
-- **Networking (PFE).** The Comcerto Packet Forwarding Engine
-  (EMAC1-3, EGPI1-3, HGPI, BMU1-2, CLASS, TMU, UTIL, HIF) is this
-  SoC's entire network path, and has no driver anywhere in mainline
-  or in the Bonstra fork. This is expected to be the largest
-  remaining piece of work by a wide margin. The old kernel's custom
-  `pfe` module (see `symops/MCG1-3.2.26`,
-  `kmodules/mspd-c2k/pfe`) is the reference for a future port; its
-  three firmware blobs (`class_c2000.elf`, `tmu_c2000.elf`,
-  `util_c2000.elf`) are opaque microcode and should be reusable as-is
-  regardless of kernel/driver version.
+- **GEM1/GEM2** (the two other EMACs the PFE silicon supports, beyond
+  the GEM0 port that's fully working -- see "What's in this repo"):
+  this board exposes exactly one physical RJ45 Ethernet port, so the
+  other two MACs have nothing wired to them. The old kernel's
+  production board file (`board-c2kasic.c`) configures all three GEMs
+  with PHY addresses 4/5/6, but that's a shared-silicon default, not
+  confirmed per-board wiring -- this exact board's GEM0 PHY turned
+  out to live at address 0, not 4, so those defaults can't be trusted
+  for GEM1/GEM2 either without hardware that's actually populated to
+  test against. Treated as not applicable rather than pending work,
+  same as RTC and PCIe below; no DT nodes added for MACs nothing is
+  connected to.
 - **RTC.** Proprietary "c2k-rtc" block, no driver in mainline or in
   the fork. NTP-only timekeeping -- and this board has no RTC backup
   battery, so even a working driver wouldn't retain time across power

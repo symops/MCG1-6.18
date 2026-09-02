@@ -1654,13 +1654,51 @@ Stage P8 (Tx/Rx traffic path for GEM0)
     with zero Rx errors/drops -- versus permanent Rx stall and an
     eventual kernel panic before the sixth fix above.
 
-    Not yet investigated: on this same hardware, only one of the two
-    port LEDs shows activity under this port (both did under the 3.2.26
-    vendor kernel). Likely PHY-hardware-driven (link/activity LED mode
-    is typically a PHY strap/register setting the vendor driver may set
-    explicitly and this port's generic phylib usage doesn't) rather than
-    a host-driver bug -- cosmetic, not blocking, deferred to Stage P9
-    alongside GEM1/GEM2.
+Stage P9 (GEM1/GEM2 -- confirmed not applicable to this board)
+================================================================
+
+The plan called for porting GEM1/GEM2 by the same pattern as GEM0 once
+it worked. Before starting, checked with the physical hardware first
+(the same discipline that caught the SPI-NOR chip misidentification and
+the PHY address 4 vs. 0 mismatch earlier in this port): **this board has
+exactly one physical RJ45 Ethernet jack**, user-confirmed. The vendor
+tree's production ASIC board file (``board-c2kasic.c``, not just the EVM
+one) does configure all three GEMs (``phy_id`` 4/5/6 for GEM0/1/2
+respectively) -- PFE's three-EMAC hardware is shared silicon across
+WD's whole product line, and that board file is a shared base other
+SKUs (routers, multi-port NAS models) build on, not a description of
+this specific board's wiring. GEM0's own real PHY address (0, not the
+board file's assumed 4) already proved this board deviates from that
+shared default once; GEM1/GEM2 having no PHY populated at all is the
+same kind of deviation, not a contradiction of it.
+
+**No DT nodes added for GEM1/GEM2** -- there's no PHY to describe a
+``phy-handle`` for, so a node would just be dead configuration with
+nothing to confirm against real hardware, the same reasoning already
+applied to RTC (no backup battery on this board) and PCIe (physically
+unused on this SKU). Treated as not applicable, not pending work.
+
+Two-LED Stage P8 finding, closed out here rather than left as P9 work:
+only one of this port's two RJ45 LEDs ("Link") lit under this port, vs.
+both under the 3.2.26 vendor kernel, confirmed purely PHY-register-
+driven (real cable unplug/replug on this port didn't light it either,
+ruling out any link-event-timing explanation). Root cause found by a
+full blind sweep of every BCM54xx shadow (0x00-0x1f) and expansion
+register this driver's code selects, diffed byte-for-byte against the
+same sweep run on the vendor kernel: shadow register 0x0b (RGMII Mode
+Selector) read its untouched hardware default here vs. 0x08c on the
+vendor kernel -- exactly the value the vendor's WD-specific
+``bcm54610_config_init()`` hack writes there as an undocumented side
+effect of what its own comment calls "disable half-duplex" (the actual
+half-duplex-disable part is two separate MII register writes; the
+shadow-0x0b write is a third, distinct action the same function
+performs). This port never carried that write over -- inspected and
+dismissed early in the investigation as "not LED-related" from the
+register's generic name alone, without checking the value the vendor
+was actually writing or what dropping it might affect. Restoring it
+(``pfe_phy_restore_led_mode()``, ``pfe_eth.c``) fixed it; confirmed on
+real hardware, both LEDs now show real link/activity status matching
+the vendor kernel.
 
 Watchdog reset-control conflict with syscon
 ============================================
