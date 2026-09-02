@@ -28,6 +28,7 @@ void __iomem *cbus_base_addr;
 void *ddr_base_addr;
 unsigned long ddr_phys_base_addr;
 unsigned int ddr_size;
+unsigned int pfe_chip_rev;
 
 static struct pe_info pe[MAX_PE];
 

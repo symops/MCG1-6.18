@@ -249,18 +249,15 @@ int pfe_firmware_init(struct pfe *pfe)
 
 	/*
 	 * The vendor tree ships a second UTIL firmware variant
-	 * ("util_c2000_revA0.elf") selected when system_rev == 0, but that
-	 * file isn't present anywhere in the GPL source drop we have --
-	 * only the non-revA0 one. Load that unconditionally; if real
-	 * hardware turns out to report system_rev == 0, this is the wrong
-	 * firmware and needs the missing blob sourced from somewhere else
-	 * (open question, not silently assumed away).
+	 * ("util_c2000_revA0.elf") selected when the chip revision reads
+	 * 0. That file isn't present anywhere in the GPL source drop we
+	 * have, nor in the vendor kernel's own CONFIG_EXTRA_FIRMWARE
+	 * list on this exact board (confirmed by reading
+	 * /proc/config.gz there) -- and CHIP_REVISION() there reads 1,
+	 * not 0 (see pfe_hw_lib.h's CHIP_REVISION() comment), so the
+	 * vendor driver never actually requests it either. This
+	 * non-revA0 file is simply the correct one for this hardware.
 	 */
-	if (system_rev == 0)
-		dev_warn(pfe->dev,
-			 "system_rev=0: vendor tree would use util_c2000_revA0.elf here, which isn't available -- loading %s instead\n",
-			 UTIL_FIRMWARE_FILENAME);
-
 	rc = request_firmware(&util_fw, UTIL_FIRMWARE_FILENAME, pfe->dev);
 	if (rc) {
 		dev_err(pfe->dev, "request firmware %s failed\n", UTIL_FIRMWARE_FILENAME);

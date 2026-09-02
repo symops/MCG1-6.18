@@ -16,8 +16,6 @@
 #include <linux/elf.h>
 #include <linux/io.h>
 
-#include <asm/system_info.h>
-
 #include "pfe_cbus.h"
 
 /*
@@ -33,9 +31,34 @@ struct hif_hdr {
 	u16 client_ctrl1;
 };
 
+/*
+ * The vendor driver reads this from a real SoC-level chip-ID register
+ * (COMCERTO_GPIO_DEVICE_ID_REG, mach-comcerto-2000.c's device_Init():
+ * "system_rev = (readl(COMCERTO_GPIO_DEVICE_ID_REG) >> 24) & 0xf;") into
+ * the generic ARM kernel's system_rev global -- ATAGS-era board-file
+ * infrastructure this DT-only port never had a path to populate, so
+ * system_rev silently stayed 0 here. That 0 is not a harmless "unknown"
+ * default: control_qm.c's QM_update_qdepth() has a chip-rev-0-only
+ * workaround ("LOG: 68855 -- workaround for the reordered packet and
+ * BMU2 buffer leakage issue", forces every TMU queue's depth down to 31)
+ * that tmu_init() below also carries -- with CHIP_REVISION() wrongly
+ * always reading 0, this port was unconditionally applying that
+ * rev-0-only workaround to hardware confirmed (by reading this exact
+ * register from the vendor driver on this exact board -- see
+ * Documentation/arm/ls1024a-wdmycloud.rst) to be rev 1, forcing every
+ * queue down to a 31-entry depth instead of the correct 511/255 --
+ * a real, previously undiagnosed root cause fully consistent with the
+ * whole RX investigation's central symptom (BMU2 buffers accumulating,
+ * never freed). pfe_chip_rev is set once, early in
+ * pfe_platform_probe(), by reading that same physical register directly
+ * (see the ioremap() there) -- independent of the generic system_rev
+ * global, which nothing in this DT-boot kernel ever populates.
+ */
+extern unsigned int pfe_chip_rev;
+
 static inline unsigned int CHIP_REVISION(void)
 {
-	return system_rev;
+	return pfe_chip_rev;
 }
 
 /*
@@ -45,10 +68,13 @@ static inline unsigned int CHIP_REVISION(void)
  * actual ioremap'd host virtual address.
  *
  * cbus_base_addr is a true MMIO register window (readl/writel only).
- * ddr_base_addr is plain, cacheable system DRAM carved out for packet
- * buffers/route tables -- mapped with memremap(), not ioremap(), and
- * accessed with ordinary pointer/memset/memcpy like any other kernel
- * memory (matching the vendor driver's own plain memset() on it).
+ * ddr_base_addr is the DDR carve-out for packet buffers/firmware/route
+ * table -- mapped uncached with ioremap() (matching the vendor driver's
+ * own ioremap() of this same resource exactly; a plain memremap(...,
+ * MEMREMAP_WB) here left CPU writes into it cache-stale from PFE's own
+ * bus-master's point of view, confirmed as a real bug via real-hardware
+ * testing -- see Documentation/arm/ls1024a-wdmycloud.rst), accessed with
+ * ordinary pointer/memset/memcpy like any other memory.
  */
 extern void __iomem *cbus_base_addr;
 extern void *ddr_base_addr;

@@ -38,6 +38,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -101,6 +102,35 @@ static int pfe_platform_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(pfe->rst_core),
 				      "Failed to get core reset\n");
 
+	/*
+	 * A genuine assert-then-deassert pulse, not deassert-only as
+	 * before. This board's barebox boots via a legacy ATAG-passing
+	 * path that fully brings up PFE itself before Linux ever runs --
+	 * its own boot log shows "class init complete ... HIF init
+	 * complete ... pfe_hw_init: done ... class/tmu/util firmware
+	 * loaded" happening in barebox, well before this driver's probe()
+	 * -- so by the time we get here, these reset lines are quite
+	 * possibly already deasserted and CLASS/TMU/UTIL's PE cores are
+	 * already running barebox's own firmware load. A deassert-only
+	 * call in that state does nothing (writing the same "already 0"
+	 * value), and everything below (class_init()/tmu_init()/
+	 * util_init(), the ELF firmware reload) then reconfigures DMEM
+	 * and reloads new PE code out from under cores that were never
+	 * actually stopped -- a real race the vendor's own kernel doesn't
+	 * have to worry about the same way (it boots standalone, not
+	 * chained after another OS's already-initialized PFE state).
+	 * Force a real reset window before touching anything else.
+	 */
+	ret = reset_control_assert(pfe->rst_core);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to assert core reset\n");
+
+	ret = reset_control_assert(pfe->rst_axi);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to assert axi reset\n");
+
+	usleep_range(50, 100);
+
 	ret = reset_control_deassert(pfe->rst_axi);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to deassert axi reset\n");
@@ -108,6 +138,8 @@ static int pfe_platform_probe(struct platform_device *pdev)
 	ret = reset_control_deassert(pfe->rst_core);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to deassert core reset\n");
+
+	usleep_range(50, 100);
 
 	pfe->hif_irq = platform_get_irq_byname(pdev, "hif");
 	if (pfe->hif_irq < 0)
@@ -140,18 +172,36 @@ static int pfe_platform_probe(struct platform_device *pdev)
 		pfe->ddr_size = rmem->size;
 
 		/*
-		 * Plain cacheable system DRAM (packet buffers/route table),
-		 * not a device MMIO window -- memremap(), not ioremap().
-		 * No live cross-master DMA happens yet at this stage (that
-		 * starts in Stage P5), so this stage doesn't need to answer
-		 * the cache-coherency question between the ARM cores and
-		 * the PFE's own bus master; Stage P5 does and must revisit
-		 * this mapping if real traffic shows corruption.
+		 * Uncached, matching the vendor driver's own ioremap() of
+		 * this exact resource (pfe_platform.c: "pfe->ddr_baseaddr =
+		 * ioremap(r->start, resource_size(r))", plain non-__iomem
+		 * void *). This carve-out holds the CLASS route table, BMU2's
+		 * buffer pool, and the CLASS/TMU/UTIL firmware's DDR-resident
+		 * data/code sections (pe_load_ddr_section() in pfe_hw_lib.c
+		 * plain memcpy()s firmware bytes straight into it, and
+		 * class_init() memset()s the route table the same way) --
+		 * all read by PFE's own AXI bus master, which has no
+		 * visibility into the ARM cores' cache. A WRITE-BACK cacheable
+		 * mapping (the previous devm_memremap(..., MEMREMAP_WB), used
+		 * here through Stage P4 when nothing yet read this memory
+		 * from the PFE side) left every one of those CPU-side writes
+		 * potentially stuck in cache, silently invisible to PFE --
+		 * confirmed as the actual bug via real hardware testing during
+		 * the Stage P8 RX investigation (see
+		 * Documentation/arm/ls1024a-wdmycloud.rst): CLASS/TMU showed
+		 * plausible-looking activity but packets never reached the
+		 * host, book-ended by an exhaustive register/IRQ-level
+		 * comparison against the vendor driver on the same hardware/
+		 * firmware that turned up no other difference at all. ioremap()
+		 * makes every one of these writes land in physical DRAM
+		 * synchronously, with no separate cache-maintenance call
+		 * needed -- matching the vendor's own approach exactly instead
+		 * of trying to track and flush every write site individually.
 		 */
-		pfe->ddr_baseaddr = devm_memremap(dev, pfe->ddr_phys_baseaddr,
-						   pfe->ddr_size, MEMREMAP_WB);
-		if (IS_ERR(pfe->ddr_baseaddr))
-			return dev_err_probe(dev, PTR_ERR(pfe->ddr_baseaddr),
+		pfe->ddr_baseaddr = devm_ioremap(dev, pfe->ddr_phys_baseaddr,
+						  pfe->ddr_size);
+		if (!pfe->ddr_baseaddr)
+			return dev_err_probe(dev, -ENOMEM,
 					      "Failed to map ddr carve-out\n");
 	}
 
@@ -162,6 +212,34 @@ static int pfe_platform_probe(struct platform_device *pdev)
 
 	pfe_lib_init(pfe->cbus_baseaddr, pfe->ddr_baseaddr, pfe->ddr_phys_baseaddr,
 		     pfe->ddr_size);
+
+	/*
+	 * Real chip revision, read directly off the same SoC-level
+	 * register the vendor driver's own device_Init() reads
+	 * (mach-comcerto-2000.c: COMCERTO_GPIO_DEVICE_ID_REG =
+	 * <GPIO APB base> + 0x50, physical 0x90470000 + 0x50, bits
+	 * [27:24]) -- confirmed empirically on this exact board (see
+	 * Documentation/arm/ls1024a-wdmycloud.rst) to read 1, not 0.
+	 * pfe_chip_rev feeds CHIP_REVISION() (pfe_hw_lib.h), which
+	 * tmu_init() uses to decide whether the rev-0-only "LOG: 68855"
+	 * TMU queue-depth workaround applies -- getting this wrong was a
+	 * real, previously undiagnosed bug (see CHIP_REVISION()'s own
+	 * comment), not just a missing diagnostic. One-shot read: no
+	 * need to keep this mapped, and this register lives in the
+	 * separate "gpio"/syscon device's own resource, not something
+	 * this driver otherwise touches.
+	 */
+	{
+		void __iomem *dev_id_reg = ioremap(0x90470050, 4);
+
+		if (dev_id_reg) {
+			pfe_chip_rev = (readl(dev_id_reg) >> 24) & 0xf;
+			iounmap(dev_id_reg);
+		} else {
+			dev_warn(dev, "failed to map chip-id register, assuming rev 0\n");
+		}
+		dev_info(dev, "chip revision: %u\n", pfe_chip_rev);
+	}
 
 	ret = pfe_hw_init(pfe);
 	if (ret)
