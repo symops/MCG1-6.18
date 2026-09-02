@@ -1580,13 +1580,87 @@ Stage P8 (Tx/Rx traffic path for GEM0)
     errors, zero drops. No RCU stall, no crash, clean boot to login as
     before.
 
-    Not yet separately confirmed: an actual DHCP lease and a successful
-    ``ping`` (the plan's literal round #5 bar) -- this same boot's
-    ``ping 8.8.8.8`` still failed with "Network is unreachable" simply
-    because no DHCP client had been run yet in that session (no IPv4
-    address configured at all), not a driver problem. A follow-up round
-    running ``dhclient``/``ifup`` against a real DHCP server would close
-    this out.
+    **Rx investigation: five real bugs found and fixed before a single
+    packet reached the host.** Link-up (above) only proved TX and the
+    PHY/MDIO path; Rx stayed at 0 packets for many further real-hardware
+    rounds after that, with ``hif_isr()`` never firing at all (confirmed
+    via an unconditional entry ``pr_info()`` and ``/proc/interrupts``)
+    even under sustained real broadcast/DHCP/ARP traffic on the wire.
+    Extensive register/IRQ-level comparison against a reference 3.2.26
+    vendor kernel/``pfe.ko`` built and run on the exact same hardware
+    (needed real logging added to that tree too, since its own source
+    gave no better a starting point) eventually turned up five
+    independent, real bugs -- none alone sufficient, each confirmed by
+    its own real-hardware round:
+
+    - **DDR carve-out mapped write-back cacheable** (``devm_memremap(...,
+      MEMREMAP_WB)``) instead of uncached, unlike the vendor driver's own
+      ``ioremap()`` of the same resource -- PFE's AXI bus master has no
+      visibility into the ARM cores' cache, so CPU writes into the route
+      table/BMU2 pool/firmware DDR sections could sit in cache
+      indefinitely, invisible to PFE. Fixed with ``devm_ioremap()``.
+    - **No real reset pulse before reconfiguring PFE.** This board's
+      barebox fully brings up PFE (loads and enables CLASS/TMU/UTIL
+      firmware) before Linux boots at all; ``pfe_platform_probe()`` only
+      ever called ``reset_control_deassert()``, never ``assert()`` first
+      -- against already-deasserted lines that's a no-op, so firmware
+      reconfiguration/reload happened out from under PE cores that were
+      never actually stopped. Fixed with a genuine assert-then-deassert
+      pulse.
+    - **``CHIP_REVISION()`` always read 0** (the generic ARM kernel's
+      never-populated ``system_rev``), silently triggering a
+      rev-0-only vendor workaround (``control_qm.c``'s "LOG: 68855",
+      forcing every TMU queue depth down to 31) on hardware confirmed
+      (by reading the real SoC chip-ID register, as the vendor driver
+      does) to actually be rev 1. Fixed by reading that register
+      directly into a new ``pfe_chip_rev`` global.
+    - **CLASS PE firmware never learns a GEM's MAC address or interface
+      index.** The vendor host driver writes both into the firmware's
+      ``phy_port[]`` DMEM array as a side effect of an FCI command this
+      port never implements. Without it, TX worked but RX stayed at 0
+      packets forever regardless of any of the other fixes -- this was
+      the one that actually got a packet delivered to the host for the
+      first time. Fixed by writing it directly in
+      ``pfe_eth_class_register_port()``, called from ``.ndo_open``.
+    - **Random MAC address.** This board's barebox has no per-unit DT, so
+      the real MAC reaches Linux via a ``mac_addr=`` kernel command line
+      parameter (the same mechanism the 3.2.26 vendor kernel's ATAG boot
+      path used) -- never parsed here, so every GEM fell back to
+      ``eth_hw_addr_random()``, which the ``phy_port[]`` registration
+      above would then never match real inbound traffic against. Fixed
+      with a ``__setup("mac_addr=", ...)`` handler mirroring the
+      vendor's own ``mac_addr_setup()``.
+
+    Once those five landed, real traffic started arriving -- but Rx
+    stalled again after ~60 real packets (DHCP + a few pings), followed
+    minutes later by an unrelated-looking kernel panic from
+    ``ksoftirqd`` spinning at 100% CPU. **A sixth bug**: Rx buffer
+    refill called ``dma_alloc_coherent(..., GFP_ATOMIC)`` on every single
+    received packet, which -- unable to sleep -- is forced through the
+    kernel's small, fixed-size boot-time atomic DMA pool rather than the
+    much larger general-purpose backing available to ordinary
+    ``GFP_KERNEL`` allocations; a modest traffic burst exhausts it, the
+    descriptor it would have refilled never gets re-armed, and NAPI
+    (which treats "client queue full" as "budget exhausted, poll again
+    immediately") busy-spins forever on a descriptor that will never
+    move again. Fixed by pre-allocating a pool of spare buffers once via
+    ``GFP_KERNEL`` and recycling them via plain array push/pop
+    (``pfe_hif_spare_buf_get()``/``_put()``, ``pfe_hif_lib.c``) -- no
+    allocator call, atomic or otherwise, on the Rx hot path at all.
+
+    **Confirmed on real hardware, DHCP lease and sustained ping (the
+    plan's literal round #5 bar) both closed out**: ``ping 8.8.8.8`` at
+    0% packet loss, and a further round moving 280+ MiB of real traffic
+    with zero Rx errors/drops -- versus permanent Rx stall and an
+    eventual kernel panic before the sixth fix above.
+
+    Not yet investigated: on this same hardware, only one of the two
+    port LEDs shows activity under this port (both did under the 3.2.26
+    vendor kernel). Likely PHY-hardware-driven (link/activity LED mode
+    is typically a PHY strap/register setting the vendor driver may set
+    explicitly and this port's generic phylib usage doesn't) rather than
+    a host-driver bug -- cosmetic, not blocking, deferred to Stage P9
+    alongside GEM1/GEM2.
 
 Watchdog reset-control conflict with syscon
 ============================================
