@@ -53,6 +53,13 @@ boots, now running under v6.18.49. (Plain `make uImage` still works
 for a quick build check, but doesn't produce a bootable image for
 this board on its own -- see below for why.)
 
+The baseline has since been bumped from the original v6.18.46 import
+to v6.18.49 (three upstream incremental patches, none touching any
+board-specific file -- see git log for the `chore:` commit) --
+**confirmed on real hardware**: same clean boot to login, `eth0` link
+up, no regressions, size unchanged (~5.3 MiB, well under barebox's
+10 MiB image budget).
+
 Getting here surfaced a chain of board-specific fixes, each confirmed
 against real hardware, in order:
 
