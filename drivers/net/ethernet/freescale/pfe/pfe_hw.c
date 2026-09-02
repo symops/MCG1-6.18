@@ -15,10 +15,30 @@
 
 int pfe_hw_init(struct pfe *pfe)
 {
+	/*
+	 * toe_mode: matches this board's real production configuration.
+	 * The stock WD image loads this driver via /etc/modules with
+	 * "pfe lro_mode=1 tx_qos=1 alloc_on_init=1 disable_wifi_offload=1"
+	 * (confirmed by reading that file on the device) -- lro_mode=1 is
+	 * what sets class_cfg.toe_mode=1 in the vendor driver
+	 * (pfe_hw_init(): "if (lro_mode) class_cfg.toe_mode = 1;"), which
+	 * OR's CLASS_TOE into the CLASS_ROUTE_MULTI register
+	 * (class_set_config(), byte-for-byte ported into this port's own
+	 * pfe_hw_lib.c already) -- a real CBUS register bit this port has
+	 * never actually set, never checked against the vendor baseline
+	 * (every prior round of register-level comparison read plenty of
+	 * *other* CLASS registers, but never CLASS_ROUTE_MULTI itself).
+	 * tx_qos (TX-only credit tracking) and alloc_on_init (purely
+	 * host-side client-queue allocation timing, never touches a PFE
+	 * register) don't have a built-in-driver equivalent worth adding;
+	 * disable_wifi_offload only gates pfe_vwd.c code paths, and that
+	 * whole driver was never ported (see pfe_eth.h's banner).
+	 */
 	CLASS_CFG class_cfg = {
 		.pe_sys_clk_ratio = PE_SYS_CLK_RATIO,
 		.route_table_baseaddr = pfe->ddr_phys_baseaddr + ROUTE_TABLE_BASEADDR,
 		.route_table_hash_bits = ROUTE_TABLE_HASH_BITS,
+		.toe_mode = 1,
 	};
 
 	TMU_CFG tmu_cfg = {

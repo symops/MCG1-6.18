@@ -95,6 +95,19 @@ struct pfe {
 	unsigned long util_dmem_sh;
 	unsigned long util_ddr_sh;
 
+	/*
+	 * CLASS PE DMEM address of the firmware's "phy_port[]" array
+	 * (Stage P8 fix, pfe_eth.c) -- unlike the fields above, this one
+	 * is load-bearing, not diagnostic: pfe_eth_open() writes each
+	 * GEM's MAC address and interface index into it every time an
+	 * interface comes up, confirmed on real hardware to be required
+	 * for the CLASS PE firmware to forward any received frame to the
+	 * host at all. Found the same way as pfe_ctrl's mailbox addresses
+	 * (Stage P6) -- looked up by symbol name in the firmware ELF while
+	 * it's still available, since pfe_firmware_init() releases it.
+	 */
+	unsigned long class_phy_port_dmem;
+
 	struct pfe_hif hif;
 
 	/* Control-message channel to the PE firmware (Stage P6) --

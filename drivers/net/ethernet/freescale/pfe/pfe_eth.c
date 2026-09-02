@@ -46,6 +46,7 @@
 #include <linux/clk.h>
 #include <linux/ethtool.h>
 #include <linux/etherdevice.h>
+#include <linux/init.h>
 #include <linux/io.h>
 #include <linux/mii.h>
 #include <linux/netdevice.h>
@@ -53,6 +54,7 @@
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
 #include <linux/phy.h>
+#include <linux/string.h>
 #include <linux/unaligned.h>
 
 #include "pfe_eth.h"
@@ -475,6 +477,47 @@ static void pfe_eth_flush_txq(struct pfe_eth_priv_s *priv, int qno, int count)
 	}
 }
 
+/*
+ * Layout of the CLASS PE firmware's phy_port[] array (vendor tree's
+ * pfe/pfe/c2000/common/types.h -- "struct itf { void *phys; u8 type;
+ * u8 index; }" padded to 8 bytes, then "struct physical_port { struct
+ * itf itf; u8 mac_addr[6]; u8 id; }" padded to 16 -- confirmed via
+ * readelf -sW against our own firmware/ls1024a-pfe/class_c2000.elf:
+ * phy_port @ 0x1610, size 80 = 5 * 16 (MAX_PHY_PORTS = GEM_PORTS(3) +
+ * MAX_WIFI_VAPS(2) in that build)).
+ */
+#define PHY_PORT_STRUCT_SIZE	16
+#define PHY_PORT_ITF_INDEX_OFF	5
+#define PHY_PORT_MAC_ADDR_OFF	8
+
+/*
+ * Without this, the CLASS PE firmware never learns this port's MAC
+ * address or interface index -- confirmed on real hardware to be
+ * required for the firmware to forward any received frame to the host
+ * at all: TX worked fine without it, but RX stayed at 0 packets
+ * forever, even after minutes of real broadcast/DHCP traffic on the
+ * wire. This mirrors two of the DMEM writes the vendor host driver's
+ * pfe_ctrl_set_eth_state()/CMD_TX_ENABLE made as a side effect of an
+ * FCI command this port doesn't implement (see pfe_ctrl.h's banner for
+ * why the FCI apparatus itself isn't ported) -- done directly here
+ * instead of routing through that dropped command-handler machinery.
+ * Vendor's own onif/bridge registration (add_onif()/
+ * bridge_interface_register(), also part of that same FCI init path)
+ * is genuinely bridging-specific (forwarding *between* GEM0/1/2) and
+ * isn't needed for this port's "receive my own traffic, deliver it to
+ * my own HIF client" case.
+ */
+static void pfe_eth_class_register_port(struct pfe_eth_priv_s *priv)
+{
+	unsigned long base = priv->pfe->class_phy_port_dmem + priv->id * PHY_PORT_STRUCT_SIZE;
+	int id;
+
+	for (id = CLASS0_ID; id <= CLASS_MAX_ID; id++) {
+		pe_dmem_write(id, priv->id, base + PHY_PORT_ITF_INDEX_OFF, 1);
+		pe_dmem_memcpy_to32(id, base + PHY_PORT_MAC_ADDR_OFF, priv->dev->dev_addr, ETH_ALEN);
+	}
+}
+
 static int pfe_eth_open(struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
@@ -515,6 +558,8 @@ static int pfe_eth_open(struct net_device *dev)
 	addr.bottom = get_unaligned_le32(dev->dev_addr);
 	addr.top = get_unaligned_le16(dev->dev_addr + 4);
 	gemac_set_laddrN(priv->EMAC_baseaddr, &addr, 1);
+
+	pfe_eth_class_register_port(priv);
 
 	if (of_property_present(priv->of_node, "phy-handle")) {
 		rc = pfe_phy_init(dev);
@@ -647,6 +692,46 @@ static void pfe_eth_extphy_clk_release(void *data)
 	clk_put(clk);
 }
 
+/*
+ * This board's barebox has no per-unit DT (its DTB is compiled into this
+ * kernel image, not read from flash/OTP), so the real, per-unit hardware
+ * MAC address(es) reach Linux the same way they did under the 3.2.26
+ * vendor kernel's legacy ATAG boot path: a "mac_addr=" kernel command
+ * line parameter (comma-separated, up to one per GEM), set by barebox's
+ * boot script. The vendor kernel consumed this via its own __setup()
+ * handler in arch/arm/mach-comcerto/comcerto-2000.c
+ * (mac_addr_setup()/mac_addr_init()); this is the DT-based port's
+ * equivalent, feeding pfe_eth_probe_gem() below instead of platform
+ * data. Confirmed present on this board's real boot log: "commandline:
+ * ... mac_addr=00:90:A9:D0:AA:4F ...", and confirmed NOT consumed
+ * anywhere before this -- the kernel logs it under "Unknown kernel
+ * command line parameters" and passes it through to userspace, meaning
+ * every GEM fell back to eth_hw_addr_random() below. That's not just
+ * cosmetic: a random MAC on this netdev never matches the CLASS PE
+ * firmware's actual traffic (see pfe_eth_class_register_port()'s
+ * comment -- the firmware needs to know this port's real MAC to
+ * forward anything to the host at all), so this alone can fully
+ * account for real inbound traffic never reaching the host on a board
+ * that boots this way, independent of anything else.
+ */
+static u8 pfe_boot_mac_addr[3][ETH_ALEN];
+static bool pfe_boot_mac_addr_valid[3];
+
+static int __init pfe_mac_addr_setup(char *str)
+{
+	char *tok;
+	int id;
+
+	for (id = 0; id < 3 && str && *str; id++) {
+		tok = strsep(&str, ",");
+		if (*tok && mac_pton(tok, pfe_boot_mac_addr[id]))
+			pfe_boot_mac_addr_valid[id] = true;
+	}
+
+	return 1;
+}
+__setup("mac_addr=", pfe_mac_addr_setup);
+
 static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 {
 	struct pfe_eth_priv_s *priv;
@@ -745,8 +830,12 @@ static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 	if (of_get_phy_mode(np, &priv->phy_mode))
 		priv->phy_mode = PHY_INTERFACE_MODE_MII;
 
-	if (of_get_ethdev_address(np, dev))
-		eth_hw_addr_random(dev);
+	if (of_get_ethdev_address(np, dev)) {
+		if (pfe_boot_mac_addr_valid[id])
+			eth_hw_addr_set(dev, pfe_boot_mac_addr[id]);
+		else
+			eth_hw_addr_random(dev);
+	}
 
 	rc = register_netdev(dev);
 	if (rc) {

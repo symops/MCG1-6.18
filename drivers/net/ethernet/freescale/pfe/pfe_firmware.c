@@ -280,6 +280,20 @@ int pfe_firmware_init(struct pfe *pfe)
 		goto err_load;
 	}
 
+	/*
+	 * DMEM address of the firmware's phy_port[] array -- see the field
+	 * comment on struct pfe.class_phy_port_dmem for why this is needed
+	 * (Stage P8 fix, pfe_eth.c writes each GEM's MAC address/interface
+	 * index here on open, required for the firmware to forward any
+	 * received frame to the host at all).
+	 */
+	rc = get_elf_symbol_addr(class_fw, "phy_port");
+	if (rc < 0) {
+		dev_err(pfe->dev, "failed to locate phy_port symbol\n");
+		goto err_load;
+	}
+	pfe->class_phy_port_dmem = rc;
+
 	rc = pfe_load_elf(TMU_MASK, tmu_fw);
 	if (rc < 0) {
 		dev_err(pfe->dev, "tmu firmware load failed\n");

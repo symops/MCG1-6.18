@@ -20,7 +20,6 @@
 #ifndef _PFE_ETH_H_
 #define _PFE_ETH_H_
 
-#include <linux/clk.h>
 #include <linux/mii.h>
 #include <linux/netdevice.h>
 #include <linux/phy.h>
@@ -64,7 +63,6 @@ struct pfe_eth_priv_s {
 	int oldlink;
 
 	struct mii_bus *mii_bus;	/* shared across all GEMs on this PFE */
-	struct clk *gemtx_clk;		/* shared across all GEMs on this PFE */
 };
 
 int pfe_eth_init(struct pfe *pfe);
