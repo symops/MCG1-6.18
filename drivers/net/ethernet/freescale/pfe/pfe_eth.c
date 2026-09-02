@@ -294,6 +294,122 @@ static void pfe_eth_adjust_link(struct net_device *dev)
 	spin_unlock_irqrestore(&priv->lock, flags);
 }
 
+/*
+ * Restores this PHY's LED-adjacent shadow registers to their vendor-
+ * matching values -- found by diffing raw register reads against the
+ * 3.2.26 vendor kernel on the same board. Two prior fixes already
+ * cover other real differences the same way: PHY_BRCM_RX_REFCLK_UNUSED
+ * (see pfe_phy_init() below) stops bcm54612e_config_init() from
+ * diverting LED4 to a CLK125 clock output, and this function's own ECR
+ * write undoes that same config_init()'s global interrupt/event mask
+ * (0x1000 here vs 0x0 on the vendor kernel, which never touches it).
+ *
+ * LEDS1 (shadow 0x0d, LED1/LED3 -- the "Link" LED): the generic
+ * Broadcom config_init() shared by every non-SFP chip this driver
+ * matches (drivers/net/phy/broadcom.c, right after the switch on
+ * phy_id) unconditionally reprograms this pin pair from its hardware-
+ * strap default (BCM_LED_SRC_LINKSPD1/LINKSPD2, 0x10 -- matching the
+ * vendor kernel exactly, which never touches this register at all)
+ * into BCM_LED_SRC_MULTICOLOR1 (0xaa) plus a Multicolor expansion-
+ * register LINK_ACT encoding -- its own comment there says this is
+ * meant for a single physical bi-color LED sharing both pins. This
+ * board instead has two separate single-color LEDs wired to LED1 and
+ * LED3 (confirmed: the vendor kernel's LED is lit *steady*, matching a
+ * plain link-speed indicator, not a blink-on-activity one), so forcing
+ * the bi-color pairing breaks that. Restored to the vendor-matching
+ * encoding here -- though on its own this wasn't sufficient to light
+ * it; see the RGMII_MODE write below for what actually was.
+ *
+ * Caller must run this after pfe_eth_start()/phy_start(), not right
+ * after connecting -- see the comment at its one call site in
+ * pfe_eth_open() for why (phy_start() unconditionally resumes the PHY,
+ * which re-runs config_init and undoes this otherwise).
+ */
+/*
+ * RGMII Mode Selector (shadow 0x0b) -- not one of mainline's named LED
+ * registers, but this is the exact register the vendor's WD-specific
+ * bcm54610_config_init() hack (shared by BCM54610/BCM54612 in that
+ * tree) writes as a side effect of what its own comment describes as
+ * "disable half-duplex" (the real half-duplex-disable part is two
+ * separate writes to MII regs 4/9; this shadow-0x0b write is a third,
+ * distinct action the same function performs that this port never
+ * carried over -- dismissed early on as "not LED-related" based on the
+ * register's generic name alone, without checking the actual value).
+ * A full blind register sweep (every shadow reg 0x00-0x1f, every
+ * expansion reg on the three pages any BCM54xx code in this driver
+ * selects) diffed against the same sweep on the vendor kernel turned up
+ * this as the one meaningful difference among them: this port reads
+ * 0x009 here (hardware default, untouched) vs the vendor kernel's
+ * 0x08c -- which exactly matches the DATA field the WD hack's own raw
+ * MDIO writes encode (phy_write(0x1C, 0xAC8C) -- VAL=0x0b, DATA=0x08c).
+ * BCM54XX_SHD_RGMII_MODE is a real, documented-elsewhere-in-mainline
+ * register (bcm_phy_write_shadow(..., BCM54XX_SHD_RGMII_MODE, 0) is
+ * used for BCM50610/BCM50610M under PHY_BRCM_CLEAR_RGMII_MODE), so this
+ * genuinely configures something -- unlike TOP_MISC_LED_CTL, which a
+ * previous round found reads back unchanged no matter what's written
+ * (likely mostly reserved bits for this chip), this one is confirmed
+ * writable and vendor-nonzero. Not otherwise explained yet, but it's
+ * the most concrete remaining lead after every named LED-selector
+ * register was matched or forced with zero effect.
+ */
+#define PFE_PHY_SHD_RGMII_MODE_VENDOR_VAL	0x08c
+
+static void pfe_phy_restore_led_mode(struct phy_device *phydev)
+{
+	/*
+	 * LEDS1 (LED1/LED3, the "Link" LED): restored to the vendor-
+	 * matching hardware-default encoding (LINKSPD1/LINKSPD2 -- real
+	 * link-speed indication, not a blunt "always on"). Confirmed on
+	 * real hardware (putty.log.213) that the LED actually responds now
+	 * that RGMII_MODE (below) is also fixed -- earlier rounds tried
+	 * this same LEDS1 value (and a forced-all-on variant) without
+	 * RGMII_MODE fixed and got nothing, so RGMII_MODE was the real
+	 * missing piece, not LEDS1's content.
+	 */
+	u16 leds1 = BCM54XX_SHD_LEDS1_LED1(BCM_LED_SRC_LINKSPD1) |
+		    BCM54XX_SHD_LEDS1_LED3(BCM_LED_SRC_LINKSPD2);
+
+	phy_write(phydev, MII_BCM54XX_SHD,
+		  MII_BCM54XX_SHD_WRITE | MII_BCM54XX_SHD_VAL(BCM54XX_SHD_LEDS1) |
+		  MII_BCM54XX_SHD_DATA(leds1));
+
+	/*
+	 * ECR.IM (global interrupt/event mask): confirmed real difference
+	 * vs. the vendor kernel (0x1000 here vs 0x0 there, neither kernel
+	 * ever using a real hardware IRQ line for this PHY either way --
+	 * see git log for the full writeup). Clear it to match; harmless.
+	 */
+	phy_write(phydev, MII_BCM54XX_ECR, phy_read(phydev, MII_BCM54XX_ECR) & ~MII_BCM54XX_ECR_IM);
+
+	/* LEDS2 (LED0/LED2, "ACT"): deliberately left untouched -- this one
+	 * already works correctly on hardware defaults with no software
+	 * help on either kernel, so there's nothing to restore here.
+	 */
+
+	/*
+	 * RGMII Mode Selector (shadow 0x0b) -- the actual fix. Not one of
+	 * mainline's named LED registers; the vendor's WD-specific
+	 * bcm54610_config_init() hack (shared by BCM54610/BCM54612 in that
+	 * tree) writes this as a side effect of what its own comment calls
+	 * "disable half-duplex" (the real half-duplex-disable part is two
+	 * separate writes to MII regs 4/9; this shadow-0x0b write is a
+	 * third, distinct action that same function performs, dismissed
+	 * early in this investigation as "not LED-related" based on the
+	 * register's generic name alone). A full blind register sweep
+	 * (every shadow reg 0x00-0x1f, every expansion reg on the three
+	 * pages any BCM54xx code in this driver selects) diffed against the
+	 * same sweep on the vendor kernel turned up this as the one
+	 * meaningful difference among them: hardware default (untouched)
+	 * here vs. 0x08c on the vendor kernel -- exactly the DATA field the
+	 * WD hack's own raw MDIO writes encode. Confirmed on real hardware
+	 * (putty.log.213): with this written, the "Link" LED responds for
+	 * the first time in this entire investigation.
+	 */
+	phy_write(phydev, MII_BCM54XX_SHD,
+		  MII_BCM54XX_SHD_WRITE | MII_BCM54XX_SHD_VAL(BCM54XX_SHD_RGMII_MODE) |
+		  MII_BCM54XX_SHD_DATA(PFE_PHY_SHD_RGMII_MODE_VENDOR_VAL));
+}
+
 static int pfe_phy_init(struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
@@ -601,6 +717,27 @@ static int pfe_eth_open(struct net_device *dev)
 	}
 
 	pfe_eth_start(priv);
+
+	/*
+	 * Must run after pfe_eth_start(), not right after connecting in
+	 * pfe_phy_init() -- confirmed on real hardware (putty.log.203/204/
+	 * 205) that the write lands fine at connect() time but is gone
+	 * again by the time link-up is reported a few ms later. Root cause:
+	 * pfe_eth_start()'s phy_start() unconditionally calls
+	 * __phy_resume() (drivers/net/phy/phy.c) regardless of whether the
+	 * PHY was ever actually suspended, which for this driver calls
+	 * bcm54xx_resume() -> ends by re-running bcm54xx_config_init() --
+	 * the exact function whose LED1/LED3 multicolor override and ECR
+	 * interrupt masking this fix exists to undo. of_phy_connect()
+	 * itself already goes through the same config_init/resume dance
+	 * once internally (phy_attach_direct() calls phy_init_hw() then
+	 * unconditionally phy_resume()), so the value written in
+	 * pfe_phy_init() never had a chance regardless -- this is the
+	 * first point after phy_start() where it can actually stick.
+	 */
+	if (priv->phydev)
+		pfe_phy_restore_led_mode(priv->phydev);
+
 	netif_start_queue(dev);
 
 	return 0;
