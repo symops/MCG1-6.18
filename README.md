@@ -1,6 +1,6 @@
 # MCG1-6.18
 
-Porting Linux **v6.18.46** to the WD My Cloud (Gen 1) NAS.
+Porting Linux **v6.18.49** to the WD My Cloud (Gen 1) NAS.
 
 The stock kernel on this device is a vendor 3.2.26 build from 2012
 (see [symops/MCG1-3.2.26](https://github.com/symops/MCG1-3.2.26)).
@@ -19,7 +19,7 @@ Devuan-based) rootfs.
   [Bonstra/linux-ls1024a](https://github.com/Bonstra/linux-ls1024a)
   (branch `ls1024a`, based on v6.2.0, last updated 2023-03-11),
   written against the QNAP TS-x31 (a different product on the same
-  SoC). This repository forward-ports that work to v6.18.46 and
+  SoC). This repository forward-ports that work to v6.18.49 and
   adapts it to the WD My Cloud gen1 board specifically.
 
 ## Status: Stage 2 -- boots to a shell on real hardware
@@ -30,7 +30,7 @@ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= zImage dtbs modul
 cat arch/arm/boot/zImage arch/arm/boot/dts/nxp/ls/ls1024a-wdmycloud.dtb \
     > arch/arm/boot/zImage-w-dtb
 mkimage -A arm -O linux -T kernel -C none -a 0x00008000 -e 0x00008000 \
-    -n "Linux-6.18.46-ls1024a-wdmycloud" \
+    -n "Linux-6.18.49-ls1024a-wdmycloud" \
     -d arch/arm/boot/zImage-w-dtb arch/arm/boot/uImage
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= \
     INSTALL_MOD_PATH=/some/staging/dir modules_install
@@ -40,8 +40,8 @@ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= \
 drops the `-g<commit>` suffix from `uname -r`, but `scripts/setlocalversion`
 still appends a bare `+` for an uncommitted/dirty tree unless the
 `LOCALVERSION` make variable is explicitly passed (even empty, as
-above) -- that's what makes the release string a clean `6.18.46`
-matching the module directory (`/lib/modules/6.18.46/`) installed
+above) -- that's what makes the release string a clean `6.18.49`
+matching the module directory (`/lib/modules/6.18.49/`) installed
 above.
 
 produces a `uImage` (~5.3 MiB) that, flashed to this board's kernel
@@ -49,7 +49,7 @@ partition, boots all the way to userspace: `md0` (the RAID1 rootfs)
 assembles and mounts, sysvinit runs, udev populates `/dev`, both
 filesystems get fscked, swap activates, cron/Dropbear SSH/MD
 monitoring start -- the *same* Devuan rootfs the old 3.2.26 kernel
-boots, now running under v6.18.46. (Plain `make uImage` still works
+boots, now running under v6.18.49. (Plain `make uImage` still works
 for a quick build check, but doesn't produce a bootable image for
 this board on its own -- see below for why.)
 
@@ -107,11 +107,11 @@ and "What's *not* ported yet" below.
 
 ## What's in this repo
 
-- One squashed baseline commit importing `linux-stable` v6.18.46
+- One squashed baseline commit importing `linux-stable` v6.18.49
   (full upstream history intentionally not carried here to keep the
   repo a reasonable size -- it's on
   [git.kernel.org](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git),
-  tag `v6.18.46`, for anyone who needs to trace a specific change).
+  tag `v6.18.49`, for anyone who needs to trace a specific change).
 - On top of that, one or two commits per subsystem, each importing
   the relevant file(s) from `Bonstra/linux-ls1024a@d751daba` and, if
   needed, a separate commit adapting them to the v6.18 kernel API:
@@ -207,9 +207,6 @@ and "What's *not* ported yet" below.
   "PCIe0: Link Up Failed"), so it's left disabled in the board DTS --
   this SKU doesn't appear to expose a usable PCIe slot/device at all,
   so treat this as not applicable rather than pending work.
-- **`rsyslog: Permission denied` / `ntpsec: Permission denied`** at
-  userspace startup -- seen on the real-hardware Stage 2 boot, not yet
-  root-caused. Doesn't block reaching a shell.
 
 See `Documentation/arm/ls1024a-wdmycloud.rst` for the full detail on
 each of these, including the exact register-level behavior of the
