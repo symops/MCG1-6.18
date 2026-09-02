@@ -366,14 +366,16 @@ static void pfe_eth_stop(struct pfe_eth_priv_s *priv)
 #define PFE_ETH_TX_FREE_MAX	16
 
 /*
- * Drain everything currently queued for this client/qno, building an
- * skb around each buffer with build_skb() rather than copying -- the
- * buffer was heap-allocated for exactly this by client_put_rxpacket()
- * (pfe_hif.c) with PFE_BUF_SIZE (2048) sized to leave room for
- * skb_shared_info past the packet data (see pfe_hif_lib.h), the same
- * way the vendor driver's own alloc_skb_header() (a non-mainline
- * addition to their 3.2.26 kernel) avoided a copy -- build_skb() is
- * the stock-kernel equivalent.
+ * Drain everything currently queued for this client/qno, copying each
+ * buffer's payload into a freshly allocated skb rather than wrapping
+ * the buffer itself with build_skb(). The buffer is dma_alloc_
+ * coherent() memory (pfe_hif_lib.h's pfe_hif_spare_buf_get(), see the
+ * comment there for why) and must go back to pfe_hif_spare_buf_put(),
+ * never generic kfree() -- which rules out build_skb()/zero-copy, since
+ * the network stack tears an skb's data down with kfree() once
+ * head_frag is unset. This matches the vendor driver's own
+ * pfe_eth_rx_skb(), which copies out of its (also specially-allocated,
+ * GFP_DMA_NCNB) buffer pool for the same reason.
  *
  * Every normal Ethernet frame fits in one HIF descriptor (PFE_PKT_SIZE,
  * 1544, comfortably covers any standard MTU + headers), so the
@@ -397,23 +399,31 @@ static void pfe_eth_rx_drain(struct pfe_eth_priv_s *priv, unsigned int qno)
 		if (!buf_addr)
 			break;
 
+		/*
+		 * hif_lib_receive_pkt() hands back the true base of the
+		 * dma_alloc_coherent() block (what build_skb() used to
+		 * need); pfe_hif_spare_buf_put() takes the same "usable"
+		 * (base + headroom) pointer pfe_hif_spare_buf_get() returns,
+		 * so every free below adds the headroom back.
+		 */
 		if (!(desc_ctrl & CL_DESC_FIRST) || !(desc_ctrl & CL_DESC_LAST)) {
 			net_warn_ratelimited("%s: dropping unsupported multi-descriptor packet (ctrl=%#x)\n",
 					      dev->name, desc_ctrl);
-			kfree(buf_addr);
+			pfe_hif_spare_buf_put(buf_addr + PFE_PKT_HEADROOM);
 			dev->stats.rx_dropped++;
 			continue;
 		}
 
-		skb = build_skb(buf_addr, PFE_BUF_SIZE);
+		skb = netdev_alloc_skb_ip_align(dev, length);
 		if (!skb) {
-			kfree(buf_addr);
+			pfe_hif_spare_buf_put(buf_addr + PFE_PKT_HEADROOM);
 			dev->stats.rx_dropped++;
 			continue;
 		}
 
-		skb_reserve(skb, offset);
-		skb_put(skb, length);
+		skb_put_data(skb, buf_addr + offset, length);
+		pfe_hif_spare_buf_put(buf_addr + PFE_PKT_HEADROOM);
+
 		skb->dev = dev;
 		skb->protocol = eth_type_trans(skb, dev);
 		skb_checksum_none_assert(skb);

@@ -21,14 +21,29 @@
  *    silently wrong if the struct layouts it assumes ever changed.
  *  - outer_inv_range() on the descriptor ring + the napi_first_batch
  *    flag that gated it: this was an explicit PL310 outer-cache
- *    invalidate on the *descriptor* memory specifically (not the
- *    packet buffers, which already go through the ordinary
- *    dma_unmap_single()/dma_map_single() DMA API further down in this
- *    same function). dma_alloc_coherent() memory is coherent by
- *    definition -- if this SoC's descriptor ring genuinely needs
- *    manual cache maintenance on top of that, dma_alloc_coherent()
- *    would be the wrong allocator to begin with. Dropped; flagged here
- *    in case real-hardware Rx corruption ever points back at it.
+ *    invalidate on the *descriptor* memory specifically. dma_alloc_
+ *    coherent() memory is coherent by definition -- if this SoC's
+ *    descriptor ring genuinely needed manual cache maintenance on top
+ *    of that, dma_alloc_coherent() would be the wrong allocator to
+ *    begin with. Dropped; flagged here in case real-hardware Rx
+ *    corruption ever points back at it.
+ *
+ * Rx packet buffers (as opposed to the descriptor ring, always
+ * dma_alloc_coherent()) were originally kmalloc()+dma_map_single()/
+ * dma_unmap_single(), matching a mainline streaming-DMA driver. Real-
+ * hardware testing (Rx stuck at 0 packets on this port, while a
+ * reference 3.2.26 vendor kernel/pfe.ko built and run on the exact
+ * same hardware received traffic normally) traced this to the vendor
+ * driver relying on kmalloc(GFP_DMA_NCNB) for Rx buffers specifically
+ * -- a custom flag drawing from a boot-time-remapped, genuinely
+ * non-cacheable (Device-type) physical zone, confirmed active in the
+ * working reference config. Rx buffers now come from dma_alloc_
+ * coherent() instead (pfe_hif_buf_alloc()/_free()/_dma() in
+ * pfe_hif_lib.h), which gets the same non-cacheable guarantee through
+ * the portable DMA API -- the same mechanism this driver already uses
+ * for the descriptor ring, where Tx has proven it works. See the
+ * comment above those helpers for why this also meant moving Rx off
+ * zero-copy build_skb() in pfe_eth.c.
  *
  * Deferred to Stage P7-P9 (pfe_eth.c, the only caller of any of these):
  * the client TX path (__hif_xmit_pkt() and hif_xmit_pkt() are ported
@@ -106,8 +121,7 @@ static void pfe_hif_release_buffers(struct pfe_hif *hif)
 	for (i = 0; i < hif->RxRingSize; i++) {
 		if (desc->data) {
 			if (i < hif->shm->rx_buf_pool_cnt && !hif->shm->rx_buf_pool[i]) {
-				dma_unmap_single(hif->dev, desc->data, pfe_pkt_size,
-						  DMA_FROM_DEVICE);
+				/* Coherent memory -- no dma_unmap_single() needed. */
 				hif->shm->rx_buf_pool[i] = hif->rx_buf_addr[i];
 			} else {
 				dev_err(hif->dev, "%s: buffer pool already full\n", __func__);
@@ -141,15 +155,10 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 	first_desc_p = (struct hif_desc *)hif->descr_baseaddr_p;
 
 	for (i = 0; i < hif->RxRingSize; i++) {
-		data = dma_map_single(hif->dev, (void *)hif->shm->rx_buf_pool[i],
-				       pfe_pkt_size, DMA_FROM_DEVICE);
+		data = pfe_hif_buf_dma((void *)hif->shm->rx_buf_pool[i]);
 		hif->rx_buf_addr[i] = (void *)hif->shm->rx_buf_pool[i];
 		hif->shm->rx_buf_pool[i] = NULL;
 
-		if (unlikely(dma_mapping_error(hif->dev, data))) {
-			dev_err(hif->dev, "%s: low on mem\n", __func__);
-			goto err;
-		}
 		desc->data = data;
 
 		desc->status = 0;
@@ -185,10 +194,6 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 	writel((u32)first_desc_p, HIF_TX_BDP_ADDR);
 
 	return 0;
-
-err:
-	pfe_hif_release_buffers(hif);
-	return -ENOMEM;
 }
 
 static int pfe_hif_client_register(struct pfe_hif *hif, u32 client_id,
@@ -268,7 +273,13 @@ static void *client_put_rxpacket(struct pfe_hif *hif, void *pkt, u32 len, u32 fl
 	if (!(desc->ctrl & CL_DESC_OWN))
 		return NULL;
 
-	free_pkt = kmalloc(PFE_BUF_SIZE, GFP_ATOMIC);
+	/*
+	 * Not pfe_hif_buf_alloc(GFP_ATOMIC): see the comment above
+	 * pfe_hif_spare_buf_get() in pfe_hif_lib.h for why a fresh
+	 * dma_alloc_coherent() call on every packet is the wrong thing to
+	 * do here.
+	 */
+	free_pkt = pfe_hif_spare_buf_get();
 	if (!free_pkt)
 		return NULL;
 
@@ -278,7 +289,7 @@ static void *client_put_rxpacket(struct pfe_hif *hif, void *pkt, u32 len, u32 fl
 	desc->ctrl = CL_DESC_BUF_LEN(len) | flags;
 	queue->write_idx = (queue->write_idx + 1) & (queue->size - 1);
 
-	return free_pkt + pfe_pkt_headroom;
+	return free_pkt;
 }
 
 /*
@@ -313,7 +324,7 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 		hif->napi_counters[NAPI_DESC_COUNT]++;
 
 		len = BD_BUF_LEN(local_desc.ctrl);
-		dma_unmap_single(hif->dev, local_desc.data, pfe_pkt_size, DMA_FROM_DEVICE);
+		/* Coherent memory -- no dma_unmap_single() needed. */
 
 		pkt_hdr_ptr = hif->rx_buf_addr[rtc];
 
@@ -365,7 +376,7 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 
 pkt_drop:
 		hif->rx_buf_addr[rtc] = free_buf;
-		desc->data = dma_map_single(hif->dev, free_buf, pfe_pkt_size, DMA_FROM_DEVICE);
+		desc->data = pfe_hif_buf_dma(free_buf);
 		wmb();
 		desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
 			     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);

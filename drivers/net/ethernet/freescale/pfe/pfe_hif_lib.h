@@ -20,6 +20,8 @@
 #ifndef _PFE_HIF_LIB_H_
 #define _PFE_HIF_LIB_H_
 
+#include <linux/dma-mapping.h>
+
 #include "pfe_hif.h"
 
 enum {
@@ -124,10 +126,108 @@ struct tx_queue_desc {
 #define PFE_PKT_HEADROOM	128
 #define PFE_PKT_SIZE		1544	/* maximum ethernet packet size */
 
-#define GFP_DMA_PFE		0
-
 extern unsigned int pfe_pkt_size;
 extern unsigned int pfe_pkt_headroom;
+
+/*
+ * Rx packet buffers need to be genuinely non-cacheable, not just
+ * cacheable memory wrapped in dma_map_single()/dma_unmap_single(). The
+ * 3.2.26 vendor driver gets this via kmalloc(GFP_DMA_NCNB), a custom
+ * flag that draws from a boot-time-remapped, Device-type-mapped
+ * (MT_MSP_NCNB, see the vendor's arch/arm/mm/mmu.c) physical zone --
+ * confirmed present and active (CONFIG_COMCERTO_ZONE_DMA_NCNB=y) in the
+ * config that produced a working Rx on real hardware, and confirmed
+ * absent (plain kmalloc(GFP_KERNEL)) in this port, which is Rx-stuck-
+ * at-0 on the same hardware/firmware/cable. Porting the custom zone
+ * itself would mean patching arch/arm/mm's lowmem mapping setup, too
+ * invasive for a fix scoped to one driver. dma_alloc_coherent() reaches
+ * the same guarantee (ARM's implementation maps it uncached) through
+ * the portable DMA API instead -- the same mechanism this driver
+ * already uses for the HIF descriptor ring itself (pfe_hif.c), where
+ * Tx has proven it works.
+ *
+ * dma_alloc_coherent() memory can't be handed to generic kfree() or to
+ * build_skb() (whose teardown path is kfree()-based) -- it comes from
+ * a different allocator and must be freed via dma_free_coherent() with
+ * the same size/dma_addr it was allocated with. That's why Rx moved
+ * off zero-copy build_skb() onto a copy into a normal skb (pfe_eth.c)
+ * -- once a buffer is handed to the network stack it would otherwise be
+ * kfree()'d somewhere down the line by code that has no idea it's
+ * DMA-coherent memory. This matches the vendor driver's own design:
+ * it never zero-copies out of its GFP_DMA_NCNB pool either (pfe_eth.c's
+ * pfe_eth_rx_skb() does dev_alloc_skb()+memcpy()), for exactly this
+ * reason.
+ *
+ * The dma_addr_t handed back by dma_alloc_coherent() is stashed in the
+ * buffer's own headroom (comfortably larger than sizeof(dma_addr_t))
+ * so it can travel alongside the plain "void *" pointer everywhere one
+ * is already passed around, without threading a second value through
+ * every call site.
+ */
+static inline void *pfe_hif_buf_alloc(struct device *dev, gfp_t flags)
+{
+	dma_addr_t dma;
+	void *base = dma_alloc_coherent(dev, PFE_BUF_SIZE, &dma, flags);
+
+	if (!base)
+		return NULL;
+
+	*(dma_addr_t *)base = dma;
+
+	return base + PFE_PKT_HEADROOM;
+}
+
+static inline void pfe_hif_buf_free(struct device *dev, void *pkt)
+{
+	void *base = pkt - PFE_PKT_HEADROOM;
+
+	dma_free_coherent(dev, PFE_BUF_SIZE, base, *(dma_addr_t *)base);
+}
+
+static inline dma_addr_t pfe_hif_buf_dma(void *pkt)
+{
+	return *(dma_addr_t *)(pkt - PFE_PKT_HEADROOM) + PFE_PKT_HEADROOM;
+}
+
+/*
+ * pfe_hif_buf_alloc()/_free() above are only safe to call from process
+ * context (GFP_KERNEL) -- real-hardware testing (Rx working for the
+ * first ~60 packets of live DHCP+ping traffic, then permanently
+ * stalled on one HIF descriptor, followed minutes later by an
+ * unrelated-looking kernel panic from ksoftirqd spinning at 100% CPU)
+ * traced back to client_put_rxpacket() in pfe_hif.c calling
+ * pfe_hif_buf_alloc(..., GFP_ATOMIC) on every single received packet,
+ * to refill the HIF descriptor the packet just came out of. A GFP_ATOMIC
+ * dma_alloc_coherent() can't sleep, so it's forced through the kernel's
+ * small, fixed-size boot-time atomic DMA pool (a few hundred KB, shared
+ * with every other atomic coherent-DMA user in the system) rather than
+ * the much larger general-purpose backing pfe_hif_shm_init()'s
+ * GFP_KERNEL calls can draw from -- once a modest burst of traffic
+ * exhausts it, allocation starts permanently failing, the descriptor
+ * it would have refilled never gets re-armed, and NAPI (which treats
+ * "client queue full" as "budget exhausted, poll again immediately")
+ * busy-spins forever trying to make progress on a descriptor that will
+ * never move again. Confirmed by temporarily growing the pool via the
+ * coherent_pool= boot argument, which fixed it -- but depending on a
+ * boot argument to not exhaust a shared, kernel-wide pool is fragile
+ * (and the vendor driver, which sources Rx buffers from its own
+ * kmalloc(GFP_DMA_NCNB) zone -- a normal slab allocator, not a fixed
+ * pool -- never had this problem or this bootarg to begin with).
+ *
+ * pfe_hif_spare_buf_get()/_put() below are the actual fix: a pool of
+ * HIF_RX_DESC_NT spare buffers, pre-allocated once via GFP_KERNEL
+ * (pfe_hif_lib_init(), process context, same as the ring's own initial
+ * fill) and recycled from then on via plain array push/pop -- no
+ * allocator call, atomic or otherwise, on the Rx hot path at all. Sized
+ * at HIF_RX_DESC_NT because that's a comfortable upper bound on how
+ * many buffers can be "in flight" between having just left the HIF ring
+ * and having been freed back by pfe_eth_rx_drain() -- in the common
+ * case that's at most one per packet (the drain is synchronous, called
+ * from within the same hif->lock critical section client_put_rxpacket()
+ * runs in), so this is generous headroom, not a tight budget.
+ */
+void *pfe_hif_spare_buf_get(void);
+void pfe_hif_spare_buf_put(void *buf);
 
 int pfe_hif_lib_init(struct pfe *pfe);
 void pfe_hif_lib_exit(struct pfe *pfe);

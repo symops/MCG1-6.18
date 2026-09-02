@@ -33,7 +33,85 @@ unsigned int pfe_pkt_headroom = PFE_PKT_HEADROOM;
  */
 static struct hif_shm ghif_shm;
 
-static void pfe_hif_shm_clean(struct hif_shm *hif_shm)
+/*
+ * Spare Rx buffer pool -- see the comment above pfe_hif_spare_buf_get()/
+ * _put() in pfe_hif_lib.h for why this exists. Single instance, same
+ * rationale as ghif_shm above.
+ */
+static void *ghif_spare_buf[HIF_RX_DESC_NT];
+static int ghif_spare_buf_count;
+static DEFINE_SPINLOCK(ghif_spare_buf_lock);
+
+static int pfe_hif_spare_pool_init(struct device *dev)
+{
+	int i;
+
+	for (i = 0; i < HIF_RX_DESC_NT; i++) {
+		void *buf = pfe_hif_buf_alloc(dev, GFP_KERNEL);
+
+		if (!buf) {
+			while (i-- > 0)
+				pfe_hif_buf_free(dev, ghif_spare_buf[i]);
+			ghif_spare_buf_count = 0;
+			return -ENOMEM;
+		}
+
+		ghif_spare_buf[i] = buf;
+	}
+
+	ghif_spare_buf_count = HIF_RX_DESC_NT;
+
+	return 0;
+}
+
+static void pfe_hif_spare_pool_exit(struct device *dev)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&ghif_spare_buf_lock, flags);
+
+	for (i = 0; i < ghif_spare_buf_count; i++)
+		pfe_hif_buf_free(dev, ghif_spare_buf[i]);
+	ghif_spare_buf_count = 0;
+
+	spin_unlock_irqrestore(&ghif_spare_buf_lock, flags);
+}
+
+void *pfe_hif_spare_buf_get(void)
+{
+	unsigned long flags;
+	void *buf = NULL;
+
+	spin_lock_irqsave(&ghif_spare_buf_lock, flags);
+
+	if (ghif_spare_buf_count > 0)
+		buf = ghif_spare_buf[--ghif_spare_buf_count];
+
+	spin_unlock_irqrestore(&ghif_spare_buf_lock, flags);
+
+	return buf;
+}
+
+void pfe_hif_spare_buf_put(void *buf)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ghif_spare_buf_lock, flags);
+
+	/*
+	 * Can't happen: every buffer ever put back here was popped from
+	 * this same pool to begin with, so outstanding-plus-pooled can
+	 * never exceed HIF_RX_DESC_NT. WARN and drop rather than
+	 * overflowing the array if it somehow ever does.
+	 */
+	if (!WARN_ON(ghif_spare_buf_count >= HIF_RX_DESC_NT))
+		ghif_spare_buf[ghif_spare_buf_count++] = buf;
+
+	spin_unlock_irqrestore(&ghif_spare_buf_lock, flags);
+}
+
+static void pfe_hif_shm_clean(struct device *dev, struct hif_shm *hif_shm)
 {
 	int i;
 	void *pkt;
@@ -42,7 +120,7 @@ static void pfe_hif_shm_clean(struct hif_shm *hif_shm)
 		pkt = (void *)hif_shm->rx_buf_pool[i];
 		if (pkt) {
 			hif_shm->rx_buf_pool[i] = NULL;
-			kfree(pkt - pfe_pkt_headroom);
+			pfe_hif_buf_free(dev, pkt);
 		}
 	}
 }
@@ -51,7 +129,7 @@ static void pfe_hif_shm_clean(struct hif_shm *hif_shm)
  * Allocate the Rx buffer pool the HIF Rx ring is filled from. Must run
  * before pfe_hif_init() (pfe_hif_init_buffers() checks rx_buf_pool_cnt).
  */
-static int pfe_hif_shm_init(struct hif_shm *hif_shm)
+static int pfe_hif_shm_init(struct device *dev, struct hif_shm *hif_shm)
 {
 	void *pkt;
 	int i;
@@ -60,18 +138,18 @@ static int pfe_hif_shm_init(struct hif_shm *hif_shm)
 	hif_shm->rx_buf_pool_cnt = HIF_RX_DESC_NT;
 
 	for (i = 0; i < hif_shm->rx_buf_pool_cnt; i++) {
-		pkt = kmalloc(PFE_BUF_SIZE, GFP_KERNEL);
+		pkt = pfe_hif_buf_alloc(dev, GFP_KERNEL);
 		if (!pkt)
 			goto err;
 
-		hif_shm->rx_buf_pool[i] = pkt + pfe_pkt_headroom;
+		hif_shm->rx_buf_pool[i] = pkt;
 	}
 
 	return 0;
 
 err:
 	pr_err("%s: low memory\n", __func__);
-	pfe_hif_shm_clean(hif_shm);
+	pfe_hif_shm_clean(dev, hif_shm);
 	return -ENOMEM;
 }
 
@@ -137,8 +215,13 @@ static void hif_lib_client_release_rx_buffers(struct hif_client_s *client)
 
 		for (i = 0; i < client->rx_q[qno].size; i++, desc++) {
 			buf = desc->data;
+			/*
+			 * Any straggler here came from pfe_hif_spare_buf_get()
+			 * (dma_alloc_coherent() memory, see pfe_hif_lib.h), not
+			 * kmalloc() -- return it to the spare pool, not kfree().
+			 */
 			if (buf)
-				kfree(buf - pfe_pkt_headroom);
+				pfe_hif_spare_buf_put(buf - pfe_pkt_headroom);
 		}
 	}
 
@@ -409,15 +492,24 @@ int pfe_hif_lib_init(struct pfe *pfe)
 	int rc;
 
 	pfe->hif.shm = &ghif_shm;
-	rc = pfe_hif_shm_init(pfe->hif.shm);
+	rc = pfe_hif_shm_init(pfe->dev, pfe->hif.shm);
+	if (rc)
+		return rc;
+
+	rc = pfe_hif_spare_pool_init(pfe->dev);
+	if (rc) {
+		pfe_hif_shm_clean(pfe->dev, pfe->hif.shm);
+		return rc;
+	}
 
 	dev_info(pfe->dev, "pfe_hif_lib_init: pkt size %u, rx buffers %u\n",
 		 pfe_pkt_size, HIF_RX_DESC_NT);
 
-	return rc;
+	return 0;
 }
 
 void pfe_hif_lib_exit(struct pfe *pfe)
 {
-	pfe_hif_shm_clean(pfe->hif.shm);
+	pfe_hif_spare_pool_exit(pfe->dev);
+	pfe_hif_shm_clean(pfe->dev, pfe->hif.shm);
 }
