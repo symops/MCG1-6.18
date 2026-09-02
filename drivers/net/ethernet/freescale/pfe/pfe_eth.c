@@ -43,6 +43,7 @@
  *    defensively rather than mishandle it if it ever does.
  */
 
+#include <linux/brcmphy.h>
 #include <linux/clk.h>
 #include <linux/ethtool.h>
 #include <linux/etherdevice.h>
@@ -296,15 +297,43 @@ static void pfe_eth_adjust_link(struct net_device *dev)
 static int pfe_phy_init(struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+	struct device_node *phy_np;
 	struct phy_device *phydev;
 
 	priv->oldlink = 0;
 	priv->oldspeed = 0;
 	priv->oldduplex = -1;
 
-	phydev = of_phy_get_and_connect(dev, priv->of_node, pfe_eth_adjust_link);
+	phy_np = of_parse_phandle(priv->of_node, "phy-handle", 0);
+	if (!phy_np) {
+		netdev_err(dev, "phy-handle not found\n");
+		return -ENODEV;
+	}
+
+	/*
+	 * Real hardware regression found post-Stage-P8: only one of this
+	 * port's two LEDs showed activity, vs. both on the 3.2.26 vendor
+	 * kernel on the same board/cable/switch. Traced to
+	 * bcm54612e_config_init() (drivers/net/phy/broadcom.c) -- mainline-
+	 * only code that didn't exist in the vendor's 2012-era kernel --
+	 * which by default repurposes this PHY's LED4 pin as a CLK125
+	 * reference-clock output rather than leaving it as an LED, unless
+	 * told PHY_BRCM_RX_REFCLK_UNUSED. Nothing on this board consumes a
+	 * PHY-sourced 125 MHz reference clock (RGMII carries its own TXC/
+	 * RXC), so that repurposing silently darkens an LED that's supposed
+	 * to just show activity. of_phy_get_and_connect() has no way to set
+	 * phydev->dev_flags before phy_connect_direct() runs config_init(),
+	 * so this uses of_phy_connect() instead, which does
+	 * ("phy->dev_flags |= flags;" before connecting, drivers/net/mdio/
+	 * of_mdio.c) -- priv->phy_mode already comes from of_get_phy_mode()
+	 * in pfe_eth_probe_gem(), same as of_phy_get_and_connect() would
+	 * look up internally.
+	 */
+	phydev = of_phy_connect(dev, phy_np, pfe_eth_adjust_link,
+				 PHY_BRCM_RX_REFCLK_UNUSED, priv->phy_mode);
+	of_node_put(phy_np);
 	if (!phydev) {
-		netdev_err(dev, "of_phy_get_and_connect() failed\n");
+		netdev_err(dev, "of_phy_connect() failed\n");
 		return -ENODEV;
 	}
 
