@@ -699,8 +699,22 @@ static int dw_spi_wait_mem_op_done(struct dw_spi *dws)
 	unsigned long ns, us;
 	u32 nents;
 
+	/*
+	 * nents (residual Tx FIFO entries) can genuinely read 0 here for a
+	 * short opcode-only transfer like WREN (1 byte, already fully
+	 * shifted into the FIFO and drained before this function is even
+	 * entered) -- confirmed on real hardware with a register dump
+	 * (opcode=0x06/WREN, nents=0). With nents=0 the delay this used to
+	 * compute was a literal 0ns, so the retry loop below burned through
+	 * all its iterations with no real wait at all, giving the
+	 * controller's internal BUSY flag no time to actually clear before
+	 * this function gave up and reported a permanent hang -- confirmed
+	 * by the same dump: BUSY read back clear moments later. Floor nents
+	 * at 1 so the computed delay always covers at least one byte's
+	 * transfer time.
+	 */
 	nents = dw_readl(dws, DW_SPI_TXFLR);
-	ns = NSEC_PER_SEC / dws->current_freq * nents;
+	ns = NSEC_PER_SEC / dws->current_freq * max(nents, 1U);
 	ns *= dws->n_bytes * BITS_PER_BYTE;
 	if (ns <= NSEC_PER_USEC) {
 		delay.unit = SPI_DELAY_UNIT_NSECS;
