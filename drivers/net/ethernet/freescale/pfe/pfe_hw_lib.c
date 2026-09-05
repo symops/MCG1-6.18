@@ -868,14 +868,45 @@ void gemac_allow_broadcast(void __iomem *base)
 	writel(readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_NO_BROADCAST, base + EMAC_NETWORK_CONFIG);
 }
 
+void gemac_no_broadcast(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) | EMAC_NO_BROADCAST, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_enable_unicast(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) | EMAC_ENABLE_UNICAST, base + EMAC_NETWORK_CONFIG);
+}
+
 void gemac_disable_unicast(void __iomem *base)
 {
 	writel(readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_ENABLE_UNICAST, base + EMAC_NETWORK_CONFIG);
 }
 
+void gemac_enable_multicast(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) | EMAC_ENABLE_MULTICAST, base + EMAC_NETWORK_CONFIG);
+}
+
 void gemac_disable_multicast(void __iomem *base)
 {
 	writel(readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_ENABLE_MULTICAST, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_enable_copy_all(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) | EMAC_ENABLE_COPY_ALL, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_disable_copy_all(void __iomem *base)
+{
+	writel(readl(base + EMAC_NETWORK_CONFIG) & ~EMAC_ENABLE_COPY_ALL, base + EMAC_NETWORK_CONFIG);
+}
+
+void gemac_set_hash(void __iomem *base, MAC_ADDR *hash)
+{
+	writel(hash->bottom, base + EMAC_HASH_BOT);
+	writel(hash->top, base + EMAC_HASH_TOP);
 }
 
 void gemac_disable_fcs_rx(void __iomem *base)

@@ -43,6 +43,7 @@
  *    defensively rather than mishandle it if it ever does.
  */
 
+#include <linux/bitops.h>
 #include <linux/brcmphy.h>
 #include <linux/clk.h>
 #include <linux/ethtool.h>
@@ -820,12 +821,128 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 	return NETDEV_TX_OK;
 }
 
+/*
+ * 6-bit CRC-free hash over a MAC address, ported unchanged from the
+ * vendor's pfe_eth_get_hash(): XOR-folds each 6-bit group of the 48-bit
+ * address together. The result selects one bit of the GEMAC's 64-bit
+ * hash register (gemac_set_hash()) -- this is the hardware's multicast
+ * (and overflow-unicast) address filter, not a general-purpose hash.
+ */
+static int pfe_eth_get_hash(const u8 *addr)
+{
+	u8 temp1, temp2, temp3, temp4, temp5, temp6, temp7, temp8;
+
+	temp1 = addr[0] & 0x3F;
+	temp2 = ((addr[0] & 0xC0) >> 6) | ((addr[1] & 0x0F) << 2);
+	temp3 = ((addr[1] & 0xF0) >> 4) | ((addr[2] & 0x03) << 4);
+	temp4 = (addr[2] & 0xFC) >> 2;
+	temp5 = addr[3] & 0x3F;
+	temp6 = ((addr[3] & 0xC0) >> 6) | ((addr[4] & 0x0F) << 2);
+	temp7 = ((addr[4] & 0xF0) >> 4) | ((addr[5] & 0x03) << 4);
+	temp8 = (addr[5] & 0xFC) >> 2;
+
+	return temp1 ^ temp2 ^ temp3 ^ temp4 ^ temp5 ^ temp6 ^ temp7 ^ temp8;
+}
+
+/*
+ * .ndo_set_rx_mode -- ported from the vendor's pfe_eth_set_multi(). Without
+ * this, the GEMAC's multicast filter stays in the disabled state
+ * pfe_gemac_init() leaves it in at probe time and never gets enabled, no
+ * matter what multicast groups the stack joins. IPv6 depends on this far
+ * more than IPv4 does: Neighbor Discovery and Router Advertisement are
+ * multicast-only (solicited-node ff02::1:ffXX:XXXX / MAC 33:33:ffXX:XXXX,
+ * all-nodes ff02::1), so without a working hash filter, neighbor/router
+ * resolution over IPv6 depends entirely on stale cache entries or timing
+ * luck instead of actually working -- indistinguishable from "IPv6 is
+ * flaky" until traced back here.
+ */
+static void pfe_eth_set_multi(struct net_device *dev)
+{
+	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+	struct netdev_hw_addr *ha;
+	MAC_ADDR hash_addr;
+	MAC_ADDR spec_addr;
+	int uc_count = 0;
+	int result;
+
+	if (dev->flags & IFF_PROMISC)
+		gemac_enable_copy_all(priv->EMAC_baseaddr);
+	else
+		gemac_disable_copy_all(priv->EMAC_baseaddr);
+
+	if (dev->flags & IFF_BROADCAST)
+		gemac_allow_broadcast(priv->EMAC_baseaddr);
+	else
+		gemac_no_broadcast(priv->EMAC_baseaddr);
+
+	if (dev->flags & IFF_ALLMULTI) {
+		/* Hash-match every multicast address. */
+		hash_addr.bottom = 0xFFFFFFFF;
+		hash_addr.top = 0xFFFFFFFF;
+		gemac_set_hash(priv->EMAC_baseaddr, &hash_addr);
+		gemac_enable_multicast(priv->EMAC_baseaddr);
+
+		netdev_for_each_uc_addr(ha, dev) {
+			if (uc_count >= EMAC_SPEC_ADDR_MAX - 1)
+				break;
+			spec_addr.bottom = get_unaligned_le32(ha->addr);
+			spec_addr.top = get_unaligned_le16(ha->addr + 4);
+			gemac_set_laddrN(priv->EMAC_baseaddr, &spec_addr, uc_count + 2);
+			uc_count++;
+		}
+	} else if (netdev_mc_count(dev) || netdev_uc_count(dev)) {
+		hash_addr.bottom = 0;
+		hash_addr.top = 0;
+
+		netdev_for_each_mc_addr(ha, dev) {
+			result = pfe_eth_get_hash(ha->addr);
+			if (result >= EMAC_HASH_REG_BITS)
+				break;
+			if (result < 32)
+				hash_addr.bottom |= BIT(result);
+			else
+				hash_addr.top |= BIT(result - 32);
+		}
+
+		uc_count = -1;
+		netdev_for_each_uc_addr(ha, dev) {
+			if (++uc_count < EMAC_SPEC_ADDR_MAX - 1) {
+				spec_addr.bottom = get_unaligned_le32(ha->addr);
+				spec_addr.top = get_unaligned_le16(ha->addr + 4);
+				gemac_set_laddrN(priv->EMAC_baseaddr, &spec_addr, uc_count + 2);
+			} else {
+				result = pfe_eth_get_hash(ha->addr);
+				if (result >= EMAC_HASH_REG_BITS)
+					break;
+				if (result < 32)
+					hash_addr.bottom |= BIT(result);
+				else
+					hash_addr.top |= BIT(result - 32);
+			}
+		}
+
+		gemac_set_hash(priv->EMAC_baseaddr, &hash_addr);
+		if (netdev_mc_count(dev))
+			gemac_enable_multicast(priv->EMAC_baseaddr);
+		else
+			gemac_disable_multicast(priv->EMAC_baseaddr);
+	} else {
+		gemac_disable_multicast(priv->EMAC_baseaddr);
+	}
+
+	if (netdev_uc_count(dev) >= EMAC_SPEC_ADDR_MAX - 1)
+		gemac_enable_unicast(priv->EMAC_baseaddr);
+	else
+		gemac_disable_unicast(priv->EMAC_baseaddr);
+}
+
 static const struct net_device_ops pfe_netdev_ops = {
 	.ndo_open = pfe_eth_open,
 	.ndo_stop = pfe_eth_close,
 	.ndo_start_xmit = pfe_eth_send_packet,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
+	.ndo_set_rx_mode = pfe_eth_set_multi,
 	/* SIOCGMIIPHY/SIOCGMIIREG/SIOCSMIIREG -- phy_do_ioctl() dispatches
 	 * to phy_mii_ioctl() when a phydev is attached. Wired up for raw
 	 * MII register access (mii-tool and similar), not otherwise used

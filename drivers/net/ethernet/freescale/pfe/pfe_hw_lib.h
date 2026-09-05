@@ -132,8 +132,10 @@ void util_disable(void);
 
 /*
  * Subset of the vendor pfe.c's GEMAC block needed for Stage P7 (net_device/
- * MDIO/PHY bring-up for GEM0, no traffic path yet). gemac_reset() is a
- * no-op in the vendor driver itself (nothing to port); the full 4-entry
+ * MDIO/PHY bring-up for GEM0, no traffic path yet), plus the multicast/
+ * unicast-promisc hash-filter accessors added later for .ndo_set_rx_mode
+ * (see pfe_eth_set_multi() in pfe_eth.c). gemac_reset() is a no-op in the
+ * vendor driver itself (nothing to port); the full 4-entry
  * gemac_set_address()/gemac_get_address() and single-entry
  * gemac_set_laddr1..4()/gemac_clear_laddr*() accessors aren't needed since
  * pfe_eth.c only ever uses the parametrized gemac_set_laddrN().
@@ -146,8 +148,14 @@ void gemac_enable(void __iomem *base);
 void gemac_disable(void __iomem *base);
 void gemac_set_laddrN(void __iomem *base, MAC_ADDR *address, unsigned int entry_index);
 void gemac_allow_broadcast(void __iomem *base);
+void gemac_no_broadcast(void __iomem *base);
+void gemac_enable_unicast(void __iomem *base);
 void gemac_disable_unicast(void __iomem *base);
+void gemac_enable_multicast(void __iomem *base);
 void gemac_disable_multicast(void __iomem *base);
+void gemac_enable_copy_all(void __iomem *base);
+void gemac_disable_copy_all(void __iomem *base);
+void gemac_set_hash(void __iomem *base, MAC_ADDR *hash);
 void gemac_disable_fcs_rx(void __iomem *base);
 void gemac_enable_1536_rx(void __iomem *base);
 void gemac_set_bus_width(void __iomem *base, int width);
