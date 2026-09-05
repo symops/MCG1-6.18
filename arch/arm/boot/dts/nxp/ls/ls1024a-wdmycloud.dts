@@ -2,6 +2,7 @@
 /dts-v1/;
 #include <dt-bindings/clock/ls1024a.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
 #include <dt-bindings/leds/common.h>
 #include "ls1024a.dtsi"
 
@@ -81,6 +82,46 @@
 		color = <LED_COLOR_ID_MULTI>;
 		function = LED_FUNCTION_WLAN;
 		leds = <&led_wifi_yellow>, <&led_wifi_blue>;
+	};
+
+	/*
+	 * Reset button, GPIO line 2 on the same controller as the LEDs
+	 * above (confirmed against the 3.2.26 vendor tree: both
+	 * commands/wd_button.c in barebox and drivers/input/misc/btn-wd.c
+	 * in the vendor kernel read this exact bit, GPIO_2 = 0x00000004,
+	 * out of COMCERTO_GPIO_INPUT_REG, active-low).
+	 *
+	 * The vendor kernel driver polls this at a 200 ms interval from a
+	 * dedicated kthread rather than using a GPIO interrupt -- this SoC's
+	 * GPIO controller was never wired up for edge-triggered IRQs on
+	 * this port (gpio-ls1024a.c has no irqchip support), and neither
+	 * did the vendor's, so that's not a gap specific to this port: the
+	 * hardware/vendor design for this button has always been polling.
+	 * gpio-keys-polled is mainline's driver for exactly this situation
+	 * ("buttons connected to GPIO pins that are not capable of
+	 * generating interrupts") -- same 200 ms poll rate, but exposed as
+	 * a standard evdev /dev/input/eventN instead of the vendor's
+	 * custom /dev/button character device protocol, whose actual
+	 * hold-to-factory-reset logic lives in a closed-source WD userspace
+	 * daemon not present in the GPL source drop.
+	 *
+	 * KEY_PROG1 rather than KEY_RESTART deliberately: KEY_RESTART is
+	 * treated as a real reboot request by systemd-logind (confirmed on
+	 * real hardware -- the whole board rebooted on a single press, with
+	 * no software of ours asking it to). This node only needs to expose
+	 * the button as a detectable event for now; whatever hold-duration
+	 * policy eventually replaces the vendor's factory-reset daemon can
+	 * remap this to something logind acts on once that policy exists.
+	 */
+	gpio_keys_polled: gpio-keys-polled {
+		compatible = "gpio-keys-polled";
+		poll-interval = <200>;
+
+		button-reset {
+			label = "Reset";
+			linux,code = <KEY_PROG1>;
+			gpios = <&gpio 2 GPIO_ACTIVE_LOW>;
+		};
 	};
 };
 
