@@ -394,6 +394,16 @@ config ARM_GLOBAL_TIMER
 	help
 	  This option enables support for the ARM global timer unit.
 
+config LS1024A_CLKSRC
+	bool "Clocksource support for Freescale LS1024A"
+	depends on OF && (ARCH_LS1024A || COMPILE_TEST)
+	select SYSCON
+	help
+	  Say Y here to include support for the free-running hardware
+	  counter embedded into the Freescale LS1024A SoC's "timer" block,
+	  used as a high-resolution clocksource. Without it, this SoC only
+	  has the low-resolution jiffies clocksource available.
+
 config ARM_GT_INITIAL_PRESCALER_VAL
 	int "ARM global timer initial prescaler value"
 	default 0

@@ -162,6 +162,15 @@
 				compatible = "fsl,ls1024a-wdt";
 				fsl,clkcore = <&clkcore>;
 			};
+
+			/*
+			 * A second, independent free-running counter in this
+			 * same register block (drivers/clocksource/timer-ls1024a.c),
+			 * used as a proper clocksource -- see that driver for why.
+			 */
+			clocksource: clocksource {
+				compatible = "fsl,ls1024a-clksrc";
+			};
 		};
 
 		pci_usb_ctrl: pci_usb_ctrl@90460000 {
