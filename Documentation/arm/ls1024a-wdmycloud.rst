@@ -5,7 +5,7 @@ WD My Cloud (Gen 1) -- LS1024A/Comcerto 2000 port, Stage 1
 ===========================================================
 
 This is a porting-progress note, not upstream-quality documentation.
-It tracks the state of bringing v6.18.49 up on the WD My Cloud gen1
+It tracks the state of bringing v6.18.50 up on the WD My Cloud gen1
 NAS (SoC: Mindspeed/Freescale "Comcerto 2000", later renamed
 LS1024A after the Mindspeed/MACOM/NXP lineage), starting from a
 working 3.2.26 vendor kernel (see symops/MCG1-3.2.26) and the WIP
@@ -15,7 +15,7 @@ mainline-style port at github.com/Bonstra/linux-ls1024a (branch
 Stage 1 goal (this repository's current state)
 ================================================
 
-v6.18.49 builds cleanly for this board::
+v6.18.50 builds cleanly for this board::
 
     make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- ls1024a_defconfig
     make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage dtbs uImage
@@ -230,7 +230,7 @@ is a build-time step::
         > arch/arm/boot/zImage-w-dtb
     mkimage -A arm -O linux -T kernel -C none \
         -a 0x00008000 -e 0x00008000 \
-        -n "Linux-6.18.49-ls1024a-wdmycloud" \
+        -n "Linux-6.18.50-ls1024a-wdmycloud" \
         -d arch/arm/boot/zImage-w-dtb arch/arm/boot/uImage
 
 (Load address history: earlier builds used ``0x0F008000`` -- the
@@ -356,7 +356,7 @@ udev/eudev populates ``/dev``, both filesystems (``md0`` and the
 existing Devuan userspace comes up: cron, Dropbear SSH (generates and
 installs all three host keys and restarts successfully), MD
 monitoring. This is the same rootfs the old 3.2.26 kernel booted
-(``mcg1-devuan.log``), now running unmodified under v6.18.49.
+(``mcg1-devuan.log``), now running unmodified under v6.18.50.
 
 Remaining issues visible in this boot, all expected and separate from
 the kernel-boot work above:
@@ -1747,11 +1747,67 @@ field, the get+deassert in probe, the assert in remove). The DT
 are completely gone from the boot log, with no regression to the rest
 of boot.
 
+Ping RTT quantized to 4ms -- missing hardware clocksource
+===========================================================
+
+Noticed on real hardware: every ``ping`` RTT, on any interface
+(IPv4, IPv6, even loopback-adjacent LAN hosts), landed on an exact
+multiple of 4ms -- e.g. ``9.97 ms``, ``14.4 ms``, never anything like
+``11.2 ms``.
+
+Root cause: this board's only registered clocksource was the generic
+``jiffies`` fallback (``rating`` 1), whose resolution is exactly one
+tick -- ``1/CONFIG_HZ``, which is ``4ms`` at this board's
+``CONFIG_HZ=250``. Every ``CLOCK_MONOTONIC`` timestamp, and therefore
+every RTT userspace ``ping`` computes from two such timestamps, is
+quantized to that same step. Confirmed early in boot::
+
+    [    0.000000] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
+    [    0.000000] sched_clock: 32 bits at 250 Hz, resolution 4000000ns, wraps every 8589934590000000ns
+
+The obvious candidate to fix this, the ARM Cortex-A9 Global Timer
+(``global_timer@fff00200`` in ``ls1024a.dtsi``), is left
+``status = "disabled"`` -- and for good reason not to blindly enable
+it: its clock (``LS1024A_CLK_A9DP_MPU``) is a fixed ``/4`` divider of
+the CPU's own core clock (``LS1024A_CLK_A9DP``), registered via
+``clk_hw_register_fixed_factor(NULL, "a9dp_mpu", "a9dp", 0, 1, 4)`` in
+``drivers/clk/clk-ls1024a.c`` -- sharing a clock domain with the CPU
+core is exactly the kind of thing that has bitten this port before.
+
+The 3.2.26 vendor tree never used the Global Timer either. Its own
+``arch/arm/mach-comcerto/time.c`` drove both ``sched_clock()`` and its
+clocksource from a completely different, independent peripheral: a
+free-running 32-bit up-counter (vendor name "timer2") inside the SoC's
+own "timer" register block at ``0x90450000`` -- the *same* block, and
+the same syscon regmap, already used by
+``drivers/watchdog/ls1024a_wdt.c`` in this port, clocked directly off
+``axi`` (200 MHz on this board, entirely independent of the CPU core
+clock).
+
+Fix: ``drivers/clocksource/timer-ls1024a.c``, a new driver that
+configures this same counter (low bound 0, high bound the full 32-bit
+span, ctrl 0 -- the vendor's own proven-working configuration for it,
+replicated verbatim since the ctrl bit's meaning is otherwise
+undocumented) and registers it as a clocksource (``rating`` 250, well
+above jiffies' 1). DT: a new ``clocksource`` child node next to
+``watchdog`` under the existing ``timer@90450000`` node in
+``ls1024a.dtsi``.
+
+**Confirmed on real hardware**::
+
+    [    2.336000] clocksource: ls1024a-timer2: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 9556302233 ns
+    [    2.340000] clocksource: Switched to clocksource ls1024a-timer2
+    [    2.344000] ls1024a-clksrc 90450000.timer:clocksource: LS1024A hardware clocksource running at 200000000 Hz
+
+``ping`` RTTs afterward show real sub-millisecond variation (e.g.
+``9.97``, ``14.4``, ``9.79``, ``9.59 ms`` in one IPv4 run) instead of
+the previous 4ms staircase.
+
 Toolchain note
 ==============
 
 Unlike the 3.2.26 port (which needed a matched-era GCC 4.7 + binutils
-2.22 toolchain to build at all), v6.18.49 builds cleanly with the
+2.22 toolchain to build at all), v6.18.50 builds cleanly with the
 modern host toolchain (GCC 13, binutils 2.42) already present in this
 environment -- no compiler-version workarounds were needed anywhere
 in this port.
