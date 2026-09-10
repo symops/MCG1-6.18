@@ -345,4 +345,15 @@ config POWER_MLXBF
 	help
 	  This driver supports reset or low power mode handling for Mellanox BlueField.
 
+config POWER_RESET_LS1024A
+	tristate "WD My Cloud (Gen 1) cosmetic power-off driver"
+	depends on ARCH_LS1024A || COMPILE_TEST
+	select MFD_SYSCON
+	help
+	  This driver does not cut real board power (no such mechanism is
+	  known to exist on this hardware, in either mainline or the vendor
+	  GPL source). It quiets the front-panel LEDs on the WD My Cloud
+	  (Gen 1) when the system powers off, since they otherwise stay
+	  fully lit after halt/poweroff on this board.
+
 endif

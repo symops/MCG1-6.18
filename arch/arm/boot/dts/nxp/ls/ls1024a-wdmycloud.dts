@@ -85,6 +85,21 @@
 	};
 
 	/*
+	 * Cosmetic power-off -- see drivers/power/reset/ls1024a-poweroff.c
+	 * for the full story on why this isn't a real power cut. Turns off
+	 * the same 5 LED lines defined above (system_leds red/green/blue =
+	 * GPIO 7/5/6, wifi_leds yellow/blue = GPIO 12/13) by poking the
+	 * "gpio" block's own output register directly -- gpio-leds already
+	 * owns those lines exclusively, so this can't request them itself a
+	 * second time.
+	 */
+	poweroff {
+		compatible = "wdc,mcg1-poweroff";
+		wdc,gpio-syscon = <&gpio>;
+		wdc,led-gpio-bits = <5 6 7 12 13>;
+	};
+
+	/*
 	 * Reset button, GPIO line 2 on the same controller as the LEDs
 	 * above (confirmed against the 3.2.26 vendor tree: both
 	 * commands/wd_button.c in barebox and drivers/input/misc/btn-wd.c
