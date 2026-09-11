@@ -38,6 +38,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/processor.h>
 #include <linux/reboot.h>
 #include <linux/regmap.h>
 
@@ -61,6 +62,25 @@ static int ls1024a_poweroff_do_poweroff(struct sys_off_data *data)
 
 	/* All LEDs on this board are active-high, so 0 == off. */
 	regmap_update_bits(priv->gpio_regs, GPIO_OUTPUT_REG, mask, 0);
+
+	/*
+	 * This board has no real power-off hardware at all (see the file
+	 * header), so this handler is the final stop, not a normal one that
+	 * hands back control. Returning here would unwind through
+	 * do_kernel_power_off() and machine_power_off() (arch/arm/kernel/
+	 * reboot.c) back to __do_sys_reboot(), which calls do_exit(0) on
+	 * PID 1 next -- fatal, since killing init panics the kernel.
+	 * machine_halt() avoids exactly this with its own "while (1);"
+	 * tail; machine_power_off() has no such fallback of its own
+	 * because real power-off hardware is expected to take the CPU down
+	 * before it would ever matter. Confirmed on real hardware: without
+	 * this loop, `poweroff` genuinely panicked ("Attempted to kill
+	 * init!") and rebooted a few seconds later instead of staying off.
+	 * IRQs are already disabled at this point (machine_power_off()
+	 * disables them before running this handler).
+	 */
+	for (;;)
+		cpu_relax();
 
 	return NOTIFY_DONE;
 }
