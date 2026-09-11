@@ -1,6 +1,6 @@
 # MCG1-6.18
 
-Porting Linux **v6.18.50** to the WD My Cloud (Gen 1) NAS.
+Porting Linux **v6.18.51** to the WD My Cloud (Gen 1) NAS.
 
 The stock kernel on this device is a vendor 3.2.26 build from 2012
 (see [symops/MCG1-3.2.26](https://github.com/symops/MCG1-3.2.26)).
@@ -19,7 +19,7 @@ Devuan-based) rootfs.
   [Bonstra/linux-ls1024a](https://github.com/Bonstra/linux-ls1024a)
   (branch `ls1024a`, based on v6.2.0, last updated 2023-03-11),
   written against the QNAP TS-x31 (a different product on the same
-  SoC). This repository forward-ports that work to v6.18.50 and
+  SoC). This repository forward-ports that work to v6.18.51 and
   adapts it to the WD My Cloud gen1 board specifically.
 
 ## Status: Stage 2 -- boots to a shell on real hardware
@@ -30,7 +30,7 @@ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= zImage dtbs modul
 cat arch/arm/boot/zImage arch/arm/boot/dts/nxp/ls/ls1024a-wdmycloud.dtb \
     > arch/arm/boot/zImage-w-dtb
 mkimage -A arm -O linux -T kernel -C none -a 0x00008000 -e 0x00008000 \
-    -n "Linux-6.18.50-ls1024a-wdmycloud" \
+    -n "Linux-6.18.51-ls1024a-wdmycloud" \
     -d arch/arm/boot/zImage-w-dtb arch/arm/boot/uImage
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= \
     INSTALL_MOD_PATH=/some/staging/dir modules_install
@@ -40,8 +40,8 @@ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION= \
 drops the `-g<commit>` suffix from `uname -r`, but `scripts/setlocalversion`
 still appends a bare `+` for an uncommitted/dirty tree unless the
 `LOCALVERSION` make variable is explicitly passed (even empty, as
-above) -- that's what makes the release string a clean `6.18.50`
-matching the module directory (`/lib/modules/6.18.50/`) installed
+above) -- that's what makes the release string a clean `6.18.51`
+matching the module directory (`/lib/modules/6.18.51/`) installed
 above.
 
 produces a `uImage` (~5.3 MiB) that, flashed to this board's kernel
@@ -49,17 +49,17 @@ partition, boots all the way to userspace: `md0` (the RAID1 rootfs)
 assembles and mounts, sysvinit runs, udev populates `/dev`, both
 filesystems get fscked, swap activates, cron/Dropbear SSH/MD
 monitoring start -- the *same* Devuan rootfs the old 3.2.26 kernel
-boots, now running under v6.18.50. (Plain `make uImage` still works
+boots, now running under v6.18.51. (Plain `make uImage` still works
 for a quick build check, but doesn't produce a bootable image for
 this board on its own -- see below for why.)
 
-The baseline has since been bumped twice from the original v6.18.46
-import, first to v6.18.49 (three upstream incremental patches) and
-then to v6.18.50 (one more) -- none touching any board-specific file
-(see git log for the `chore:` commits) -- **confirmed on real
-hardware** at each step: same clean boot to login, `eth0` link up, no
-regressions, size unchanged (~5.3 MiB, well under barebox's 10 MiB
-image budget).
+The baseline has since been bumped three times from the original
+v6.18.46 import: to v6.18.49 (three upstream incremental patches),
+then v6.18.50 and v6.18.51 (one more each) -- none touching any
+board-specific file (see git log for the `chore:` commits) --
+**confirmed on real hardware** at each step: same clean boot to
+login, `eth0` link up, no regressions, size unchanged (~5.3 MiB, well
+under barebox's 10 MiB image budget).
 
 Getting here surfaced a chain of board-specific fixes, each confirmed
 against real hardware, in order:
@@ -115,11 +115,11 @@ and "What's *not* ported yet" below.
 
 ## What's in this repo
 
-- One squashed baseline commit importing `linux-stable` v6.18.50
+- One squashed baseline commit importing `linux-stable` v6.18.51
   (full upstream history intentionally not carried here to keep the
   repo a reasonable size -- it's on
   [git.kernel.org](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git),
-  tag `v6.18.50`, for anyone who needs to trace a specific change).
+  tag `v6.18.51`, for anyone who needs to trace a specific change).
 - On top of that, one or two commits per subsystem, each importing
   the relevant file(s) from `Bonstra/linux-ls1024a@d751daba` and, if
   needed, a separate commit adapting them to the v6.18 kernel API:
@@ -189,7 +189,28 @@ and "What's *not* ported yet" below.
   design. **Confirmed on real hardware**: `clocksource: Switched to
   clocksource ls1024a-timer2` at 200 MHz, `ping` RTTs no longer
   quantized.
-- `CONFIG_THUMB2_KERNEL` enabled (from v6.18.50 on).
+- `CONFIG_THUMB2_KERNEL` enabled (from v6.18.51 on).
+- **`drivers/power/reset/ls1024a-poweroff.c`** -- cosmetic power-off
+  driver: neither mainline nor the vendor 3.2.26 source implements a
+  real power-off for this board (`arch/arm/mach-comcerto/` has zero
+  `pm_power_off` references anywhere), so `halt`/`poweroff` just parks
+  the CPU with the board still fully powered and the front-panel LEDs
+  stuck lit. This driver turns off the same 5 LED GPIO lines used
+  above (`system_leds`/`wifi_leds`) by reaching the "gpio" block's own
+  output register directly through its syscon regmap, the same
+  pattern the watchdog and clocksource drivers already use. No USB
+  VBUS cut-off exists for this board (checked the vendor kernel,
+  barebox, and -- empirically, on real hardware -- whether the
+  standard USB hub port-power-control protocol actually cuts power on
+  this board's USB hub chips; it doesn't), so this driver is LED-only,
+  unlike the equivalent driver on symops/monarch-6.18. **Confirmed on
+  real hardware**, including a bug the first version had: registering
+  any power-off handler makes the kernel actually attempt a real
+  power-off instead of silently falling back to `halt`, and if that
+  handler returns instead of parking forever, the kernel panics
+  ("Attempted to kill init!") and reboots a few seconds later. Fixed
+  by never returning from the handler, the same way `machine_halt()`
+  doesn't either.
 - **`arch/arm/configs/ls1024a_defconfig`** -- the config this was all
   built and verified against.
 - **`Documentation/arm/ls1024a-wdmycloud.rst`** -- longer-form porting

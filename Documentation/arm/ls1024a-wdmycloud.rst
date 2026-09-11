@@ -5,7 +5,7 @@ WD My Cloud (Gen 1) -- LS1024A/Comcerto 2000 port, Stage 1
 ===========================================================
 
 This is a porting-progress note, not upstream-quality documentation.
-It tracks the state of bringing v6.18.50 up on the WD My Cloud gen1
+It tracks the state of bringing v6.18.51 up on the WD My Cloud gen1
 NAS (SoC: Mindspeed/Freescale "Comcerto 2000", later renamed
 LS1024A after the Mindspeed/MACOM/NXP lineage), starting from a
 working 3.2.26 vendor kernel (see symops/MCG1-3.2.26) and the WIP
@@ -15,7 +15,7 @@ mainline-style port at github.com/Bonstra/linux-ls1024a (branch
 Stage 1 goal (this repository's current state)
 ================================================
 
-v6.18.50 builds cleanly for this board::
+v6.18.51 builds cleanly for this board::
 
     make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- ls1024a_defconfig
     make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage dtbs uImage
@@ -230,7 +230,7 @@ is a build-time step::
         > arch/arm/boot/zImage-w-dtb
     mkimage -A arm -O linux -T kernel -C none \
         -a 0x00008000 -e 0x00008000 \
-        -n "Linux-6.18.50-ls1024a-wdmycloud" \
+        -n "Linux-6.18.51-ls1024a-wdmycloud" \
         -d arch/arm/boot/zImage-w-dtb arch/arm/boot/uImage
 
 (Load address history: earlier builds used ``0x0F008000`` -- the
@@ -356,7 +356,7 @@ udev/eudev populates ``/dev``, both filesystems (``md0`` and the
 existing Devuan userspace comes up: cron, Dropbear SSH (generates and
 installs all three host keys and restarts successfully), MD
 monitoring. This is the same rootfs the old 3.2.26 kernel booted
-(``mcg1-devuan.log``), now running unmodified under v6.18.50.
+(``mcg1-devuan.log``), now running unmodified under v6.18.51.
 
 Remaining issues visible in this boot, all expected and separate from
 the kernel-boot work above:
@@ -1807,7 +1807,7 @@ Toolchain note
 ==============
 
 Unlike the 3.2.26 port (which needed a matched-era GCC 4.7 + binutils
-2.22 toolchain to build at all), v6.18.50 builds cleanly with the
+2.22 toolchain to build at all), v6.18.51 builds cleanly with the
 modern host toolchain (GCC 13, binutils 2.42) already present in this
 environment -- no compiler-version workarounds were needed anywhere
 in this port.
