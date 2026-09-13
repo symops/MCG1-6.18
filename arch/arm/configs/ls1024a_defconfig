@@ -225,6 +225,32 @@ CONFIG_ZD1211RW=m
 # as intended without needing an override).
 # CONFIG_BRCMFMAC_SDIO is not set
 # CONFIG_RSI_SDIO is not set
+#
+# Zigbee USB dongles: most retail products (Sonoff ZBDongle-P/E,
+# ConBee I/II, Elelabs, Nortek HUSBZB-1's Zigbee side, etc.) are a
+# radio chip running closed firmware that just speaks a serial
+# protocol (Zigbee's EmberZNet EZSP, or TI's Z-Stack MT protocol)
+# over USB through a generic USB-to-UART bridge chip. The kernel's
+# only job for these is exposing a /dev/ttyUSBx node; all actual
+# Zigbee protocol handling happens in userspace (zigbee2mqtt, deCONZ,
+# Home Assistant's ZHA/bellows/zigpy). Enabled the USB_SERIAL
+# subsystem plus the three most common bridge chips used on these
+# dongles (FTDI, CP210x, CH34x). Not CONFIG_USB_ACM (native CDC-ACM
+# dongles) -- narrowed to just this family on request.
+#
+# Deliberately not enabled: the real in-kernel IEEE 802.15.4 path
+# (CONFIG_IEEE802154/MAC802154/IEEE802154_ATUSB, a wpan0 netdev via
+# the mac802154 soft-MAC stack) -- ATUSB is dresden elektronik's own
+# open-hardware AT86RF231 USB stick, the only USB-attached chip this
+# kernel has an 802.15.4 driver for (every other one --
+# AT86RF230/231/233/212, MRF24J40, CC2520, ADF7242, CA8210, MCR20A --
+# is SPI-only, not applicable here), but not the hardware actually
+# being targeted.
+#
+CONFIG_USB_SERIAL=m
+CONFIG_USB_SERIAL_FTDI_SIO=m
+CONFIG_USB_SERIAL_CP210X=m
+CONFIG_USB_SERIAL_CH341=m
 CONFIG_RFKILL=y
 CONFIG_RFKILL_INPUT=y
 CONFIG_RFKILL_GPIO=y
