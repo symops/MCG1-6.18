@@ -81,7 +81,140 @@ CONFIG_BT=m
 CONFIG_BT_HCIUART=m
 CONFIG_BT_HCIUART_BCM=y
 CONFIG_BT_MRVL=m
-# CONFIG_WIRELESS is not set
+#
+# USB WiFi policy: this board has no PCIe/SDIO wifi slot, so the only
+# realistic way to attach a wireless adapter is USB. Every driver below
+# is enabled as a module (=m) specifically because its Kconfig entry is
+# USB-only (depends on USB, no other bus). Every non-USB WLAN driver
+# (PCI/PCIe, SDIO/MMC, AHB/SoC-integrated, virtual) is left at its
+# Kconfig default of "off" -- none of them are enabled anywhere in this
+# config chain (verified: the merged "rescue" base config this is
+# combined with only turns on the per-vendor WLAN_VENDOR_* menu gates,
+# never an actual leaf PCI/SDIO driver). Two explicit dedup calls were
+# needed where a genuine chip overlap exists between two different
+# driver implementations -- see the "not set" lines below for each.
+#
+CONFIG_WLAN=y
+CONFIG_CFG80211=m
+CONFIG_MAC80211=m
+# Atmel
+CONFIG_AT76C50X_USB=m
+# Intersil (p54)
+CONFIG_P54_COMMON=m
+CONFIG_P54_USB=m
+# Atheros/Qualcomm (ath) -- USB-only members of the ath family
+CONFIG_ATH9K_HTC=m
+CONFIG_CARL9170=m
+CONFIG_ATH6KL=m
+CONFIG_ATH6KL_USB=m
+CONFIG_AR5523=m
+CONFIG_ATH10K=m
+CONFIG_ATH10K_USB=m
+# Broadcom (brcmfmac FullMAC, USB bus only)
+CONFIG_BRCMFMAC=m
+CONFIG_BRCMFMAC_USB=y
+# Marvell
+CONFIG_LIBERTAS=m
+CONFIG_LIBERTAS_USB=m
+CONFIG_MWIFIEX=m
+CONFIG_MWIFIEX_USB=m
+# MediaTek
+CONFIG_MT7601U=m
+CONFIG_MT76x0U=m
+CONFIG_MT76x2U=m
+CONFIG_MT7663U=m
+CONFIG_MT7921U=m
+CONFIG_MT7925U=m
+# pureLiFi
+CONFIG_PLFXLC=m
+# Ralink rt2x00 -- USB-only chip families (RT2500/RT73/RT27xx-RT30xx over
+# USB); each targets chips the others don't, so no dedup needed here.
+CONFIG_RT2X00=m
+CONFIG_RT2500USB=m
+CONFIG_RT73USB=m
+CONFIG_RT2800USB=m
+CONFIG_RT2800USB_RT3573=y
+CONFIG_RT2800USB_RT53XX=y
+CONFIG_RT2800USB_RT55XX=y
+CONFIG_RT2800USB_UNKNOWN=y
+# Realtek
+# Dedup: CONFIG_RTL8XXXU kept over rtlwifi's CONFIG_RTL8192CU -- both
+# explicitly target the same RTL8192CU/RTL8188CU USB chips (confirmed
+# from each driver's own Kconfig help text). rtl8xxxu is the newer,
+# actively-developed mac80211-native rewrite written specifically to
+# replace rtlwifi's USB variants (its own help text: "an alternative
+# driver ... written to utilize the Linux mac80211 stack ... can
+# coexist with the rtlwifi driver but you will need to control which
+# module you wish to load"), so it's the one kept.
+CONFIG_RTL8187=m
+CONFIG_RTL8XXXU=m
+CONFIG_RTL8XXXU_UNTESTED=y
+# rtlwifi/RTL_CARDS: only enabled for RTL8192DU, which rtl8xxxu does
+# NOT cover (not in its supported-chip list) -- no dedup needed, no
+# alternative exists for this specific chip over USB.
+CONFIG_RTL_CARDS=m
+CONFIG_RTL8192DU=m
+# rtw88 (802.11ac) and rtw89 (802.11ax/be) -- distinct newer chip
+# families from both rtlwifi and rtl8xxxu, no overlap with either.
+CONFIG_RTW88=m
+CONFIG_RTW88_8822BU=m
+CONFIG_RTW88_8822CU=m
+CONFIG_RTW88_8723DU=m
+CONFIG_RTW88_8821CU=m
+CONFIG_RTW88_8821AU=m
+CONFIG_RTW88_8812AU=m
+CONFIG_RTW88_8814AU=m
+CONFIG_RTW89=m
+CONFIG_RTW89_8851BU=m
+CONFIG_RTW89_8852BU=m
+# Redpine/Silicon Labs RS9113
+CONFIG_RSI_91X=m
+CONFIG_RSI_USB=m
+# ZyDAS
+CONFIG_ZD1211RW=m
+#
+# Non-USB WLAN explicitly disabled (this board has no PCIe/SDIO wifi
+# slot, so these can never apply): PCI/PCIe -- ADM8211, ATH5K, ATH9K
+# (card driver; its USB sibling ATH9K_HTC above is kept), WIL6210,
+# ATH10K_PCI/_AHB/_SNOC, ATH11K, ATH12K, B43, B43LEGACY, BRCMSMAC,
+# BRCMFMAC_PCIE, IPW2100, IPW2200, IWL4965, IWL3945, IWLWIFI (Intel
+# never made a USB wifi chip), MWL8K, MWIFIEX_PCIE, QTNFMAC_PCIE,
+# RT2400PCI/RT2500PCI/RT61PCI/RT2800PCI, RTL8180, rtlwifi's PCIe
+# parts (RTL8192CE/SE/DE, RTL8723AE/BE, RTL8188EE, RTL8192EE,
+# RTL8821AE), RTW88_8822BE/8822CE/8723DE/8821CE/8814AE, RTW89's PCIe
+# parts (8851BE/8852AE/8852BE/8852BTE/8852CE/8922AE). SDIO/MMC --
+# ATH6KL_SDIO, ATH10K_SDIO, BRCMFMAC_SDIO, WILC1000 (SDIO/SPI only,
+# no USB variant exists), LIBERTAS_SDIO, MWIFIEX_SDIO, MT7663S,
+# MT7921S, RTW88_8822BS/8822CS/8723DS/8723CS/8821CS, RSI_SDIO, WFX
+# (SPI/SDIO only), CW1200 (+ its SDIO/SPI sub-options), RTL8723BS
+# (drivers/staging). SPI-only -- LIBERTAS_SPI, WL1251_SPI, WLCORE_SPI.
+# AHB/SoC-integrated, not a discrete adapter at all -- WCN36XX,
+# ATH9K_AHB, ATH10K_AHB, ATH11K_AHB, ATH12K_AHB, RT2800SOC, MT7622_WMAC,
+# MT798X_WMAC, WL1251/WL12XX/WL18XX/WLCORE (TI's whole wireless family
+# is SPI/SDIO-embedded, no USB member exists). Virtual/test tools, not
+# real hardware -- MAC80211_HWSIM, VIRT_WIFI.
+#
+# Dedup: CONFIG_LIBERTAS kept (full-firmware, cfg80211-native) over
+# CONFIG_LIBERTAS_THINFIRM's CONFIG_LIBERTAS_THINFIRM_USB -- both
+# explicitly target the same "Marvell Libertas 8388 USB" hardware
+# (confirmed from each driver's own Kconfig help text). Genuinely
+# ambiguous which is "modern": MAINTAINERS lists both under one
+# combined "Orphan" entry with no distinction, and this squashed-import
+# tree has no separate git history to compare recent activity between
+# them. Kept the full-firmware libertas driver as the primary/original
+# implementation (listed first in the source tree, richer feature set
+# per its own README) over the thin-firmware alternative, which exists
+# mainly as a fallback for when the closed vendor firmware blob isn't
+# available/wanted -- not a case of one driver superseding the other.
+# CONFIG_RTL8192CU is not set
+# CONFIG_LIBERTAS_THINFIRM is not set
+# BRCMFMAC_SDIO and RSI_SDIO both carry a Kconfig "default y"/"default m"
+# tied to their parent driver + MMC being enabled, so they silently turn
+# on on their own unless explicitly overridden here (confirmed via a real
+# olddefconfig run -- everything else in this whole block landed exactly
+# as intended without needing an override).
+# CONFIG_BRCMFMAC_SDIO is not set
+# CONFIG_RSI_SDIO is not set
 CONFIG_RFKILL=y
 CONFIG_RFKILL_INPUT=y
 CONFIG_RFKILL_GPIO=y
