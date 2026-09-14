@@ -323,6 +323,20 @@ CONFIG_SATA_MV=y
 CONFIG_MD=y
 CONFIG_BLK_DEV_MD=y
 CONFIG_MD_RAID1=y
+#
+# iSCSI target (server) support -- lets this NAS export a block device
+# or a file as a remote SCSI disk over the network (configured from
+# userspace via targetcli/configfs, e.g. LIO). CONFIG_ISCSI_TCP above
+# (from the merged rescue config) is the iSCSI *initiator* (client)
+# side -- a different, unrelated stack (open-iscsi) for consuming
+# someone else's iSCSI target, not this. TCM_IBLOCK exports whole
+# block devices/partitions directly via BIO (the common case for a
+# NAS); TCM_FILEIO exports a plain file as a virtual disk.
+#
+CONFIG_TARGET_CORE=m
+CONFIG_TCM_IBLOCK=m
+CONFIG_TCM_FILEIO=m
+CONFIG_ISCSI_TARGET=m
 CONFIG_INPUT_JOYDEV=y
 CONFIG_INPUT_EVDEV=y
 CONFIG_KEYBOARD_QT1070=m
@@ -743,7 +757,8 @@ CONFIG_EXT4_FS=y
 CONFIG_AUTOFS_FS=y
 CONFIG_MSDOS_FS=y
 CONFIG_VFAT_FS=y
-CONFIG_NTFS_FS=y
+# CONFIG_NTFS_FS is not set -- legacy read-mostly driver, superseded by
+# CONFIG_NTFS3_FS (full read-write, from the merged rescue config)
 CONFIG_TMPFS=y
 CONFIG_TMPFS_POSIX_ACL=y
 CONFIG_UBIFS_FS=y
