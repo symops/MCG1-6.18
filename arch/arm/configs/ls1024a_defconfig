@@ -757,6 +757,11 @@ CONFIG_EXT4_FS=y
 CONFIG_AUTOFS_FS=y
 CONFIG_MSDOS_FS=y
 CONFIG_VFAT_FS=y
+# Overrides the merged rescue config's "iso8859-1" (latin-only) --
+# utf8 matches exFAT's own default (CONFIG_EXFAT_DEFAULT_IOCHARSET
+# below) and handles non-Latin filenames (e.g. Cyrillic) correctly
+# without needing an explicit iocharset= mount option.
+CONFIG_FAT_DEFAULT_IOCHARSET="utf8"
 # CONFIG_NTFS_FS is not set -- legacy read-mostly driver, superseded by
 # CONFIG_NTFS3_FS (full read-write, from the merged rescue config)
 CONFIG_TMPFS=y
