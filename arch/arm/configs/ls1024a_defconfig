@@ -45,6 +45,15 @@ CONFIG_HIGHMEM=y
 CONFIG_ARM_APPENDED_DTB=y
 CONFIG_ARM_ATAG_DTB_COMPAT=y
 CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND=y
+# CONFIG_CMDLINE and CONFIG_COMPAT_32BIT_TIME explicit here (both
+# already match plain Kconfig defaults on their own -- no rescue-merge
+# interference to counteract anymore) so this defconfig stays
+# self-documenting about two real bugs a foreign "rescue" config once
+# caused when merged on top of this one: CMDLINE_FORCE=y baking in a
+# wrong earlycon address, and COMPAT_32BIT_TIME turned off breaking
+# touch(1)/select(2).
+CONFIG_CMDLINE=""
+CONFIG_COMPAT_32BIT_TIME=y
 CONFIG_EFI=y
 CONFIG_CPU_FREQ=y
 CONFIG_CPU_FREQ_STAT=y
@@ -585,7 +594,7 @@ CONFIG_USB_EHCI_FSL=m
 CONFIG_USB_EHCI_HCD_PLATFORM=y
 CONFIG_USB_OHCI_HCD=y
 CONFIG_USB_R8A66597_HCD=m
-CONFIG_USB_STORAGE=y
+CONFIG_USB_STORAGE=m
 CONFIG_USB_UAS=m
 CONFIG_USB_MUSB_HDRC=m
 CONFIG_USB_MUSB_TUSB6010=m
@@ -731,7 +740,7 @@ CONFIG_PWM_FSL_FTM=m
 CONFIG_PWM_TIECAP=m
 CONFIG_RESET_SIMPLE=y
 CONFIG_RESET_TI_SYSCON=m
-CONFIG_PHY_LS2014A_SERDES=y
+CONFIG_PHY_LS2014A_SERDES=m
 CONFIG_PHY_LS2014A_USB3=y
 CONFIG_PHY_CPCAP_USB=m
 CONFIG_PHY_QCOM_USB_HS=y
