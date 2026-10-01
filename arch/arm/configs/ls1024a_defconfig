@@ -883,6 +883,11 @@ CONFIG_NFSD_SCSILAYOUT=y
 CONFIG_NFSD_FLEXFILELAYOUT=y
 CONFIG_RPCSEC_GSS_KRB5=m
 CONFIG_CIFS=m
+# In-kernel SMB3 server (ksmbd) -- needs ksmbd-tools in userspace to
+# actually configure/run it. SMB_SERVER_SMBDIRECT (RDMA transport) not
+# enabled: this board has no InfiniBand hardware. CHECK_CAP_NET_ADMIN
+# and KERBEROS5 sub-options default to y on their own once this is on.
+CONFIG_SMB_SERVER=m
 CONFIG_NLS_DEFAULT="utf8"
 CONFIG_NLS_CODEPAGE_437=y
 CONFIG_NLS_ISO8859_1=y
