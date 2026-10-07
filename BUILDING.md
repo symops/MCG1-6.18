@@ -18,9 +18,11 @@ sudo apt install -y \
 ## 2. Clone the repository
 
 ```sh
-git clone git@github.com:symops/MCG1-6.18.git
+git clone https://github.com/symops/MCG1-6.18.git
 cd MCG1-6.18
 ```
+
+Use HTTPS, not the `git@github.com:...` SSH form, on a genuinely clean machine -- confirmed by actually trying it in a disposable VM with no prior setup: SSH clone fails twice over, first on `Host key verification failed` (no `known_hosts` entry for github.com yet) and, even past that, on having no deploy key at all. This repo is public, so HTTPS needs no authentication either way.
 
 ## 3. Get a `.config`
 
