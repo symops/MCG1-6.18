@@ -8,6 +8,10 @@ This repository tracks the effort to replace it with a current
 long-term-support kernel, keeping the same (already modernized,
 Devuan-based) rootfs.
 
+For a full step-by-step build walkthrough -- toolchain setup on a
+clean Debian 13 machine through packaging and deploying to real
+hardware for testing -- see [`BUILDING.md`](BUILDING.md).
+
 ## Hardware
 
 - **Board:** WD My Cloud, Gen 1
