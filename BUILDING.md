@@ -75,11 +75,11 @@ See `Documentation/arm/ls1024a-wdmycloud.rst` ("Boot protocol: appended DTB requ
 This board's root filesystem is a full Devuan/Debian install, maintained and updated independently of this kernel repository -- there's no `initramfs/` source tree here to build it from. What this repo's build does produce and expect is an initrd image (`uRamdisk`) wrapping that separately-maintained rootfs, for the initrd-based test-boot path (step 9):
 
 ```sh
-mkimage -A arm -O linux -T ramdisk -C gzip -a 0x04008000 -e 0x04008000 \
+mkimage -A arm -O linux -T ramdisk -C none -a 0x04008000 -e 0x04008000 \
     -n initramfs -d <path-to-rootfs.cpio.gz> uRamdisk
 ```
 
-`-A arm -O linux` are not optional despite looking like boilerplate: leaving them out doesn't error, it silently defaults to **`-A powerpc`** (confirmed by actually running the command without them -- `mkimage -l` on the result reports "PowerPC Linux RAMDisk Image" instead of "ARM Linux RAMDisk Image"). The load/entry address (`0x04008000`) must match the memory window the boot script below maps the initrd into -- it is not arbitrary.
+`-A arm -O linux` are not optional despite looking like boilerplate: leaving them out doesn't error, it silently defaults to **`-A powerpc`** (confirmed by actually running the command without them -- `mkimage -l` on the result reports "PowerPC Linux RAMDisk Image" instead of "ARM Linux RAMDisk Image"). `-C none` is deliberate, not a mislabel, even though `<path-to-rootfs.cpio.gz>` is itself gzip data: this barebox never parses an image's declared compression field for *any* image type -- the same reasoning `make uImage` already relies on for the kernel image itself (see the "Kernel image size budget" section of the RST doc: `make uImage` on ARM always writes `-C none` into the header regardless of the real payload's compression, because the bootloader never acts on that field at all). Whatever decompression needs to happen is the *kernel's* job, at initrd-unpack time, which auto-detects gzip from the payload's own magic bytes -- not barebox's. The load/entry address (`0x04008000`) must match the memory window the boot script below maps the initrd into -- it is not arbitrary.
 
 ## 7. Install and package the modules
 
