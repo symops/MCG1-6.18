@@ -75,11 +75,11 @@ See `Documentation/arm/ls1024a-wdmycloud.rst` ("Boot protocol: appended DTB requ
 This board's root filesystem is a full Devuan/Debian install, maintained and updated independently of this kernel repository -- there's no `initramfs/` source tree here to build it from. What this repo's build does produce and expect is an initrd image (`uRamdisk`) wrapping that separately-maintained rootfs, for the initrd-based test-boot path (step 9):
 
 ```sh
-mkimage -T ramdisk -C none -a 0x04008000 -e 0x04008000 \
-    -d <path-to-rootfs.cpio.gz> uRamdisk
+mkimage -A arm -O linux -T ramdisk -C gzip -a 0x04008000 -e 0x04008000 \
+    -n initramfs -d <path-to-rootfs.cpio.gz> uRamdisk
 ```
 
-The load/entry address (`0x04008000`) must match the memory window the boot script below maps the initrd into -- it is not arbitrary.
+`-A arm -O linux` are not optional despite looking like boilerplate: leaving them out doesn't error, it silently defaults to **`-A powerpc`** (confirmed by actually running the command without them -- `mkimage -l` on the result reports "PowerPC Linux RAMDisk Image" instead of "ARM Linux RAMDisk Image"). The load/entry address (`0x04008000`) must match the memory window the boot script below maps the initrd into -- it is not arbitrary.
 
 ## 7. Install and package the modules
 
