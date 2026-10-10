@@ -32,28 +32,21 @@ generic host tooling, unrelated to any board-specific vendor patching.
 
 ```sh
 make -C tools/bareboxenv-host
+tools/bareboxenv-host/bareboxenv-host -s -p 568 tools/bareboxenv-host/boot.sh boot.scr
 ```
 
 Plain host `cc`, no cross-compiler -- this runs on the build machine, not
 the target board.
 
-## What this is NOT
+## `boot.sh`
 
-**This does not rebuild this board's real, production `boot.scr`.**
-Confirmed by actually extracting the strings of the `boot.scr` already
-shipped in this project's GitHub releases (and sitting in `build/mcg1/`):
-it reads button state (`get_button_status`, `btn_status`) and passes extra
-`bootargs` (`mac_addr`, `model`, `serial`, `board_test`, `btn_status`) that
-`boot-initrd-test.sh` in this directory simply doesn't have -- the two are
-different scripts for different purposes, not two copies of the same
-content. The *production* script's own source isn't tracked anywhere in
-this project (same situation as the busybox/mdadm binaries in
-`initramfs/` -- vendored as a built artifact, not source); only this
-simplified **test-path** script (`BUILDING.md` step 8) is.
-
-So: this tool builds a `boot.scr` for the *optional initrd test boot path*
-only (`BUILDING.md` step 9, "Initrd test boot") -- temporarily replacing
-partition 7's contents to test `uImage`/`uRamdisk` in isolation, with the
-real production environment backed up first and restored afterward, exactly
-as step 9 already describes. It must never be written to `build/mcg1/boot.scr`
-or published as a release's `boot.scr` in place of the real one.
+This **is** this board's real, production `boot.scr` source -- not a
+simplified stand-in. Confirmed by building it with the tool above and
+comparing the result against the `boot.scr` already shipped in this
+project's GitHub releases (and sitting in `build/mcg1/`): byte-for-byte
+identical (same SHA-256), including the button-state handling
+(`get_button_status`, `btn_status`) and the full `bootargs`
+(`mac_addr`, `model`, `serial`, `board_test`, `btn_status`). Rebuild it
+and copy the result into `build/mcg1/boot.scr` (and any release) instead
+of carrying one forward from a previous release -- this tracked source
+is now the authoritative one.

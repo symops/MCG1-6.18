@@ -95,18 +95,16 @@ cp .config /tmp/default.config
 
 Archiving from *inside* `lib/modules/` (not with `lib/modules/` as a prefix) matters here too: it makes the tar root `./<kernelrelease>/...`, so `tar -C /lib/modules -xf modules.tar.xz` on the target lands the version directory at the correct path directly.
 
-## 8. Boot script (optional -- only for the initrd test-boot path)
+## 8. Boot script
 
-The custom boot script used for step 9's initrd-based test path is packed with `bareboxenv-host`, barebox's own environment-image tool -- a **completely different** format from `mkimage` (no relation to the legacy U-Boot image format at all; comparing it against a `mkimage` magic number, as an earlier mistake in this project did, produces a false "corrupted file" diagnosis). Its source is vendored in this repo at `tools/bareboxenv-host/` (upstream barebox `v2011.06.0` -- the same release this board's own barebox is built from), so it builds right here, no separate barebox tree needed:
+This board's real `boot.scr` -- the one barebox runs from partition 7, shipped in this project's GitHub releases and sitting in `build/mcg1/` -- is packed with `bareboxenv-host`, barebox's own environment-image tool, a **completely different** format from `mkimage` (no relation to the legacy U-Boot image format at all; comparing it against a `mkimage` magic number, as an earlier mistake in this project did, produces a false "corrupted file" diagnosis). Both the tool's source and the script's own source (`boot.sh`) are tracked in this repo at `tools/bareboxenv-host/` (the tool vendored from upstream barebox `v2011.06.0` -- the same release this board's own barebox is built from), so it builds right here, no separate barebox tree needed:
 
 ```sh
 make -C tools/bareboxenv-host
-tools/bareboxenv-host/bareboxenv-host -s -p 568 tools/bareboxenv-host/boot-initrd-test.sh boot.scr
+tools/bareboxenv-host/bareboxenv-host -s -p 568 tools/bareboxenv-host/boot.sh boot.scr
 ```
 
-Note there's no `root=`/`rootfstype=`/`noinitrd` in `bootargs` in that script: with an initrd, the kernel unpacks the cpio image as root itself.
-
-**This is not this board's real, production `boot.scr`** (the one shipped in this project's GitHub releases and sitting in `build/mcg1/`) -- confirmed by actually extracting both and comparing: the production script also handles button state (`get_button_status`/`btn_status`) and passes extra `bootargs` (`mac_addr`, `model`, `serial`, `board_test`) that this simplified test-only script doesn't. Its own source isn't tracked in this repo (same situation as the busybox/mdadm binaries in `initramfs/` -- vendored as a built artifact, not source). See `tools/bareboxenv-host/README.md` for the full story. **Never write the `boot.scr` built here over `build/mcg1/boot.scr` or a release's `boot.scr`** -- step 9 below covers using it safely, as a temporary, backed-up swap onto partition 7.
+Confirmed byte-for-byte identical to the `boot.scr` already shipped in this project's GitHub releases. Note there's no `root=`/`rootfstype=`/`noinitrd` in `bootargs` in that script: with an initrd, the kernel unpacks the cpio image as root itself. Copy the result straight into `build/mcg1/boot.scr`, replacing whatever was carried forward from a previous release -- see `tools/bareboxenv-host/README.md` for background on why this tracked source, not the release asset, is now the source of truth.
 
 ## 9. Deploy for testing on real hardware
 
