@@ -10,10 +10,10 @@ sudo apt install -y \
     git make bc bison flex \
     gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
     libssl-dev libelf-dev \
-    python3 cpio gzip xz-utils kmod rsync u-boot-tools
+    python3 cpio gzip pigz xz-utils kmod rsync u-boot-tools
 ```
 
-`u-boot-tools` (for `mkimage`) **is** needed here, unlike some sibling ports in this family of repos -- this board's bootloader (barebox) genuinely expects the legacy U-Boot `uImage` header format, not a raw patched `Image`. `xz-utils` is needed too: `ls1024a_defconfig` sets `CONFIG_KERNEL_XZ` (see step 4 for why), and the kernel build invokes the host `xz` binary directly to compress the self-decompressing payload. Device-tree compiler is not required system-wide -- the kernel build tree compiles its own `scripts/dtc` from source.
+`u-boot-tools` (for `mkimage`) **is** needed here, unlike some sibling ports in this family of repos -- this board's bootloader (barebox) genuinely expects the legacy U-Boot `uImage` header format, not a raw patched `Image`. `xz-utils` is needed too: `ls1024a_defconfig` sets `CONFIG_KERNEL_XZ` (see step 4 for why), and the kernel build invokes the host `xz` binary directly to compress the self-decompressing payload. `pigz` is for step 6 (packaging the rescue `uRamdisk`'s cpio with `pigz -11`, for a smaller image than plain `gzip -9`). Device-tree compiler is not required system-wide -- the kernel build tree compiles its own `scripts/dtc` from source.
 
 ## 2. Clone the repository
 
@@ -72,13 +72,14 @@ Two things this board's barebox (2011.06.0, Dec 2013 build) requires that aren't
 
 See `Documentation/arm/ls1024a-wdmycloud.rst` ("Boot protocol: appended DTB required" and the uImage-size section right before it) for the full story.
 
-## 6. The root filesystem is not part of this repo
+## 6. The board's real root filesystem is not part of this repo
 
-This board's root filesystem is a full Devuan/Debian install, maintained and updated independently of this kernel repository -- there's no `initramfs/` source tree here to build it from. What this repo's build does produce and expect is an initrd image (`uRamdisk`) wrapping that separately-maintained rootfs, for the initrd-based test-boot path (step 9):
+This board's real root filesystem is a full Devuan/Debian install, maintained and updated independently of this kernel repository. What this repo *does* ship is `initramfs/` -- the source tree for a separate, minimal rescue/test rootfs (static busybox + mdadm, telnet/ftp network rescue), unrelated to that Devuan/Debian install; see `initramfs/README.md` for what it contains and why. Packaging it into the `uRamdisk` the initrd-based test-boot path (step 9) expects:
 
 ```sh
+(cd initramfs && find . | cpio -o -H newc 2>/dev/null | pigz -11) > rootfs.cpio.gz
 mkimage -A arm -O linux -T ramdisk -C none -a 0x04008000 -e 0x04008000 \
-    -n initramfs -d <path-to-rootfs.cpio.gz> uRamdisk
+    -n initramfs -d rootfs.cpio.gz uRamdisk
 ```
 
 `-A arm -O linux` are not optional despite looking like boilerplate: leaving them out doesn't error, it silently defaults to **`-A powerpc`** (confirmed by actually running the command without them -- `mkimage -l` on the result reports "PowerPC Linux RAMDisk Image" instead of "ARM Linux RAMDisk Image"). `-C none` is deliberate, not a mislabel, even though `<path-to-rootfs.cpio.gz>` is itself gzip data: this barebox never parses an image's declared compression field for *any* image type -- the same reasoning `make uImage` already relies on for the kernel image itself (see the "Kernel image size budget" section of the RST doc: `make uImage` on ARM always writes `-C none` into the header regardless of the real payload's compression, because the bootloader never acts on that field at all). Whatever decompression needs to happen is the *kernel's* job, at initrd-unpack time, which auto-detects gzip from the payload's own magic bytes -- not barebox's. The load/entry address (`0x04008000`) must match the memory window the boot script below maps the initrd into -- it is not arbitrary.
