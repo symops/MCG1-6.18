@@ -1,0 +1,71 @@
+#!/bin/sh
+# MCG1 rescue initramfs init.
+#
+# This is NOT the board's normal boot path (the shipped Devuan/Debian
+# rootfs boots directly via barebox, no initrd involved). This uRamdisk
+# is an alternate, optional path wired to partition 6 of the SATA disk
+# (see BUILDING.md section 9) for testing/recovery without touching the
+# real boot setup.
+#
+# AHCI SATA, software RAID and ext4 are all built into the kernel
+# (=y in ls1024a_defconfig), so they need no insmod here. But three
+# other drivers this board actually needs are built as modules
+# (=m), the same way pelican/monarch need their own insmod set:
+#   - phy-ls1024a-serdes.ko: SerDes PHY, needed for the physical
+#     SATA/USB3 link to come up at all, even with AHCI built in.
+#   - usb-storage.ko / uas.ko: USB mass-storage support, for booting
+#     this rescue image off a USB drive as a recovery path.
+
+mkdir -p /proc /sys /dev /mnt/root
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+if ! mount -t devtmpfs devtmpfs /dev 2>/dev/null; then
+	mdev -s
+fi
+
+echo ""
+echo "=== MCG1 rescue initramfs ==="
+echo ""
+
+insmod /lib/modules/phy-ls1024a-serdes.ko 2>&1 || echo "warning: insmod phy-ls1024a-serdes.ko failed"
+insmod /lib/modules/usb-storage.ko 2>&1 || echo "warning: insmod usb-storage.ko failed"
+insmod /lib/modules/uas.ko 2>&1 || echo "warning: insmod uas.ko failed"
+
+# The board's real root filesystem is a software RAID1 array at
+# /dev/md0 (see README.md: "md0 (the RAID1 rootfs) assembles and
+# mounts"). md1/md2 are other arrays on this board whose purpose has
+# not been established in this project -- this script does not touch
+# them.
+if [ -x /sbin/mdadm ]; then
+	/sbin/mdadm --assemble --scan 2>&1
+else
+	echo "mdadm not present in this image; relying on kernel MD_AUTODETECT"
+fi
+
+i=0
+while [ ! -e /dev/md0 ] && [ "$i" -lt 10 ]; do
+	sleep 1
+	i=$((i + 1))
+done
+
+if [ -e /dev/md0 ]; then
+	# rw: switch_root hands off to the real system's own /sbin/init,
+	# which expects to continue booting a normal read-write root (it
+	# will remount/fsck as needed itself) -- mounting ro here would
+	# just make the real init's own startup fail instead.
+	if mount -t ext4 -o rw /dev/md0 /mnt/root 2>&1; then
+		if [ -x /mnt/root/sbin/init ]; then
+			exec switch_root /mnt/root /sbin/init
+		fi
+		echo "mounted /dev/md0 but /mnt/root/sbin/init is missing or not executable"
+	else
+		echo "failed to mount /dev/md0 as ext4"
+	fi
+else
+	echo "/dev/md0 did not appear after ${i}s"
+fi
+
+echo ""
+echo "=== Rescue shell (could not switch_root into the real rootfs) ==="
+echo ""
+exec /bin/sh
