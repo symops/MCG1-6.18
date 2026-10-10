@@ -48,34 +48,31 @@ without touching the normal boot setup.
 
 ## What `init` does
 
+This image **is** the rootfs. It does not mount the board's real
+Devuan/Debian install and `switch_root` into it -- it just brings the
+hardware up and drops to an interactive shell, so the real rootfs can
+be inspected/repaired by hand (fsck, mount read-only, etc.) with no
+risk of this script itself writing to it or chain-booting into it.
+
 1. Mounts `/proc`, `/sys`, and `/dev` (via `devtmpfs`, falling back to
    `mdev -s` if that fails).
 2. `insmod`s the three modules above (best-effort -- a failure prints a
    warning but isn't fatal, since a missing USB module just means no
    USB-attached rescue media, not a dead image).
 3. If `/sbin/mdadm` is present, runs `mdadm --assemble --scan` to
-   assemble the board's software RAID. If mdadm were ever dropped from
-   a future build of this image, `CONFIG_MD_AUTODETECT=y` (already set
-   in `ls1024a_defconfig`) would still let the kernel auto-assemble
-   0.90-superblock arrays on its own before userspace ever runs --
-   mdadm here is present, but this is why the script doesn't treat a
-   missing mdadm as fatal either.
-4. Waits (up to 10 seconds) for `/dev/md0` to appear. This board's real
-   root filesystem is the software RAID1 array at `/dev/md0` (see the
-   project `README.md`: "`md0` (the RAID1 rootfs) assembles and
-   mounts"). `md1`/`md2` are other arrays on this board whose purpose
-   hasn't been established anywhere in this project's history, so this
-   script doesn't touch them, and doesn't guess.
-5. Mounts `/dev/md0` as `ext4`, **read-write** (not read-only): the
-   handoff target is the real system's own `/sbin/init`, which expects
-   to keep booting a normal read-write root and will fsck/remount it
-   itself as needed -- mounting read-only here would just make the real
-   init's own startup fail instead of helping anything.
-6. On success, `exec switch_root /mnt/root /sbin/init` -- hands off to
-   the real system exactly as if it had booted normally.
-7. On any failure along the way (no `/dev/md0`, mount failure, no
-   `/sbin/init` on it), prints why, and falls back to an interactive
-   `/bin/sh` on the console.
+   assemble the board's software RAID, so `/dev/md0` is available for
+   the operator to mount by hand from the shell below if they want to.
+   This board's real root filesystem is the software RAID1 array at
+   `/dev/md0` (see the project `README.md`: "`md0` (the RAID1 rootfs)
+   assembles and mounts"). `md1`/`md2` are other arrays on this board
+   whose purpose hasn't been established anywhere in this project's
+   history, so this script doesn't touch them, and doesn't guess. If
+   mdadm were ever dropped from a future build of this image,
+   `CONFIG_MD_AUTODETECT=y` (already set in `ls1024a_defconfig`) would
+   still let the kernel auto-assemble 0.90-superblock arrays on its own
+   before userspace ever runs -- mdadm here is present, but this is why
+   the script doesn't treat a missing mdadm as fatal either.
+4. Drops to an interactive `/bin/sh` on the console.
 
 Deliberately **not** carried over from pelican/monarch's `init`, because
 it's either not applicable to this board or would require inventing

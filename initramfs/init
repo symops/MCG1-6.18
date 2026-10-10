@@ -7,6 +7,13 @@
 # (see BUILDING.md section 9) for testing/recovery without touching the
 # real boot setup.
 #
+# This image IS the rootfs -- it does not mount and switch_root into
+# the board's real Debian/Devuan install. It just brings up the
+# hardware and drops to an interactive busybox shell, so the real
+# rootfs on /dev/md0 can be inspected/repaired manually (fsck, mount
+# read-only, etc.) without any risk of this script itself writing to
+# it or chain-booting into it.
+#
 # AHCI SATA, software RAID and ext4 are all built into the kernel
 # (=y in ls1024a_defconfig), so they need no insmod here. But three
 # other drivers this board actually needs are built as modules
@@ -35,37 +42,16 @@ insmod /lib/modules/uas.ko 2>&1 || echo "warning: insmod uas.ko failed"
 # /dev/md0 (see README.md: "md0 (the RAID1 rootfs) assembles and
 # mounts"). md1/md2 are other arrays on this board whose purpose has
 # not been established in this project -- this script does not touch
-# them.
+# them. Assembling it here (but not mounting/switch_root'ing into it)
+# just makes /dev/md0 available for the operator to mount by hand from
+# the shell below, if they want to.
 if [ -x /sbin/mdadm ]; then
 	/sbin/mdadm --assemble --scan 2>&1
 else
 	echo "mdadm not present in this image; relying on kernel MD_AUTODETECT"
 fi
 
-i=0
-while [ ! -e /dev/md0 ] && [ "$i" -lt 10 ]; do
-	sleep 1
-	i=$((i + 1))
-done
-
-if [ -e /dev/md0 ]; then
-	# rw: switch_root hands off to the real system's own /sbin/init,
-	# which expects to continue booting a normal read-write root (it
-	# will remount/fsck as needed itself) -- mounting ro here would
-	# just make the real init's own startup fail instead.
-	if mount -t ext4 -o rw /dev/md0 /mnt/root 2>&1; then
-		if [ -x /mnt/root/sbin/init ]; then
-			exec switch_root /mnt/root /sbin/init
-		fi
-		echo "mounted /dev/md0 but /mnt/root/sbin/init is missing or not executable"
-	else
-		echo "failed to mount /dev/md0 as ext4"
-	fi
-else
-	echo "/dev/md0 did not appear after ${i}s"
-fi
-
 echo ""
-echo "=== Rescue shell (could not switch_root into the real rootfs) ==="
+echo "=== Rescue shell ==="
 echo ""
 exec /bin/sh
