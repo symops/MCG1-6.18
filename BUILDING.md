@@ -97,35 +97,16 @@ Archiving from *inside* `lib/modules/` (not with `lib/modules/` as a prefix) mat
 
 ## 8. Boot script (optional -- only for the initrd test-boot path)
 
-The custom boot script used for step 9's initrd-based test path is packed with `bareboxenv-host`, barebox's own environment-image tool -- a **completely different** format from `mkimage` (no relation to the legacy U-Boot image format at all; comparing it against a `mkimage` magic number, as an earlier mistake in this project did, produces a false "corrupted file" diagnosis). `bareboxenv-host` is a barebox host-side build product, out of scope for this kernel-only guide -- build it from this board's own barebox 2011.06.0 source (see `symops/MCG1-3.2.26` or the vendor GPL source drop) if you need to regenerate `boot.scr`.
+The custom boot script used for step 9's initrd-based test path is packed with `bareboxenv-host`, barebox's own environment-image tool -- a **completely different** format from `mkimage` (no relation to the legacy U-Boot image format at all; comparing it against a `mkimage` magic number, as an earlier mistake in this project did, produces a false "corrupted file" diagnosis). Its source is vendored in this repo at `tools/bareboxenv-host/` (upstream barebox `v2011.06.0` -- the same release this board's own barebox is built from), so it builds right here, no separate barebox tree needed:
 
 ```sh
-bareboxenv-host -s -p 568 boot.sh boot.scr
+make -C tools/bareboxenv-host
+tools/bareboxenv-host/bareboxenv-host -s -p 568 tools/bareboxenv-host/boot-initrd-test.sh boot.scr
 ```
 
-`boot.sh` itself (not tracked in this repo) is barebox shell, structured like this:
+Note there's no `root=`/`rootfstype=`/`noinitrd` in `bootargs` in that script: with an initrd, the kernel unpacks the cpio image as root itself.
 
-```sh
-#!/bin/sh
-sata
-
-# Kernel: partition 5 -> the /dev/mem.uImage window (already registered
-# in barebox's own /env/bin/init via "addpart /dev/mem 3M@0x3008000(uImage)").
-satapart 0x3008000 5 0x5000
-
-# initrd: partition 6 -> a new memory window (not registered by default,
-# so add it here; guarded so re-running this script doesn't error on
-# "partition already exists").
-[ -e /dev/mem.initrd ] || addpart /dev/mem 10M@0x4008000(initrd)
-satapart 0x4008000 6 0x5000
-
-sata stop
-
-bootargs="console=ttyS0,115200n8, init=/sbin/init swapaccount=1 panic=3"
-bootm -r /dev/mem.initrd /dev/mem.uImage
-```
-
-Note there's no `root=`/`rootfstype=`/`noinitrd` in `bootargs` here: with an initrd, the kernel unpacks the cpio image as root itself.
+**This is not this board's real, production `boot.scr`** (the one shipped in this project's GitHub releases and sitting in `build/mcg1/`) -- confirmed by actually extracting both and comparing: the production script also handles button state (`get_button_status`/`btn_status`) and passes extra `bootargs` (`mac_addr`, `model`, `serial`, `board_test`) that this simplified test-only script doesn't. Its own source isn't tracked in this repo (same situation as the busybox/mdadm binaries in `initramfs/` -- vendored as a built artifact, not source). See `tools/bareboxenv-host/README.md` for the full story. **Never write the `boot.scr` built here over `build/mcg1/boot.scr` or a release's `boot.scr`** -- step 9 below covers using it safely, as a temporary, backed-up swap onto partition 7.
 
 ## 9. Deploy for testing on real hardware
 
