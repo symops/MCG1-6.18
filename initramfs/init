@@ -1,57 +1,191 @@
 #!/bin/sh
-# MCG1 rescue initramfs init.
+# MCG1 rescue initramfs init, structured by analogy with pelican-6.18's
+# own init (console -> base fs -> reboot helpers -> storage modules ->
+# [board-specific power hack] -> banner -> unconditional netrescue ->
+# wait for disk -> partitions -> RAID assemble -> console shell ->
+# keep PID 1 alive), adapted to this board's own confirmed facts.
 #
 # This is NOT the board's normal boot path (the shipped Devuan/Debian
 # rootfs boots directly via barebox, no initrd involved). This uRamdisk
 # is an alternate, optional path wired to partition 6 of the SATA disk
 # (see BUILDING.md section 9) for testing/recovery without touching the
-# real boot setup.
-#
-# This image IS the rootfs -- it does not mount and switch_root into
-# the board's real Debian/Devuan install. It just brings up the
-# hardware and drops to an interactive busybox shell, so the real
-# rootfs on /dev/md0 can be inspected/repaired manually (fsck, mount
-# read-only, etc.) without any risk of this script itself writing to
-# it or chain-booting into it.
-#
-# AHCI SATA, software RAID and ext4 are all built into the kernel
-# (=y in ls1024a_defconfig), so they need no insmod here. But three
-# other drivers this board actually needs are built as modules
-# (=m), the same way pelican/monarch need their own insmod set:
+# real boot setup. This image IS the rootfs -- it never mounts and
+# switch_root's into the board's real Debian/Devuan install; the point
+# is a safe standalone shell (console and network) to inspect/repair
+# the real rootfs on /dev/md0 by hand.
+
+# ---------------------------------------------------------------- console
+# Ensure the kernel can open a console even before devtmpfs is mounted.
+mkdir -p /dev
+[ -c /dev/console ] || mknod /dev/console c 5 1
+[ -c /dev/null ] || mknod /dev/null c 1 3
+
+# Bind init stdio to the serial console to keep /init interactive.
+exec </dev/console >/dev/console 2>&1
+
+# -------------------------------------------------------------- base fs
+mkdir -p /proc /sys /tmp /run /mnt/root
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mdev -s
+mkdir -p /dev/pts
+
+# ----------------------------------------------------------- reboot helpers
+cat > /bin/reboot-now << 'EOF'
+#!/bin/sh
+echo b > /proc/sysrq-trigger
+EOF
+chmod 755 /bin/reboot-now
+
+cat > /bin/poweroff-now << 'EOF'
+#!/bin/sh
+echo o > /proc/sysrq-trigger
+EOF
+chmod 755 /bin/poweroff-now
+
+# ------------------------------------------------------------- storage
+# AHCI SATA, software RAID and ext4 are all built into the kernel (=y
+# in ls1024a_defconfig) -- no insmod needed for the disk itself. But
+# three other drivers this board actually needs are built as modules
+# (=m), the same way pelican/monarch insmod their own RTD129x set. No
+# modprobe/depmod here, so load order matters the same way it does for
+# them: usb-storage before uas, since uas depends on it.
 #   - phy-ls1024a-serdes.ko: SerDes PHY, needed for the physical
 #     SATA/USB3 link to come up at all, even with AHCI built in.
 #   - usb-storage.ko / uas.ko: USB mass-storage support, for booting
 #     this rescue image off a USB drive as a recovery path.
+echo "[initramfs] loading storage modules"
+for ko in /lib/modules/phy-ls1024a-serdes.ko /lib/modules/usb-storage.ko /lib/modules/uas.ko; do
+	if [ -f "$ko" ]; then
+		insmod "$ko" && echo "[initramfs] insmod $ko ok" || echo "[initramfs] insmod $ko FAILED"
+	else
+		echo "[initramfs] NOT FOUND: $ko"
+	fi
+done
 
-mkdir -p /proc /sys /dev /mnt/root
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-if ! mount -t devtmpfs devtmpfs /dev 2>/dev/null; then
-	mdev -s
-fi
+# ---------------------------------------------------------------- USB power
+# pelican/monarch poke CRT clock-gate and misc-gpio VBUS registers here
+# because RTD129x has no clk driver or gpio wired for USB VBUS in the
+# kernel. LS1024A's USB controllers (CONFIG_USB_XHCI_PLATFORM / EHCI/OHCI
+# platform drivers) are regular platform devices with no equivalent gap
+# documented anywhere in this project's history -- there's no confirmed
+# register to poke here, so this step is intentionally a no-op on MCG1.
 
-echo ""
-echo "=== MCG1 rescue initramfs ==="
-echo ""
+echo "[initramfs] booted. kernel cmdline: $(cat /proc/cmdline)"
 
-insmod /lib/modules/phy-ls1024a-serdes.ko 2>&1 || echo "warning: insmod phy-ls1024a-serdes.ko failed"
-insmod /lib/modules/usb-storage.ko 2>&1 || echo "warning: insmod usb-storage.ko failed"
-insmod /lib/modules/uas.ko 2>&1 || echo "warning: insmod uas.ko failed"
+# ---------------------------------------------------------------- netrescue
+# Unconditional on every boot of this image -- unlike pelican/monarch,
+# which gate this behind a one-shot marker file on a FAT32 CONFIG
+# partition, MCG1 has no such partition confirmed anywhere in this
+# project (the SATA layout here is just partition 5=kernel, 6=initrd,
+# 7=barebox env), so there's nothing to gate on without inventing a
+# device node. Booting this partition at all is itself the opt-in step.
+#
+# NOTE: the rescue shell is unauthenticated, same as pelican/monarch's.
+start_netrescue() {
+	echo ""
+	echo "[initramfs] ===== NETWORK RESCUE MODE ====="
 
-# The board's real root filesystem is a software RAID1 array at
+	[ -d /etc ] || mkdir -p /etc
+	[ -f /etc/passwd ] || echo "root::0:0:root:/:/bin/sh" > /etc/passwd
+
+	# telnetd needs a pty for every login; without devpts it accepts
+	# the connection, fails to allocate one and exits.
+	grep -qs ' /dev/pts ' /proc/mounts || mount -t devpts devpts /dev/pts
+
+	ifconfig lo 127.0.0.1 up 2>/dev/null
+
+	# The interface name isn't assumed: this board's single ethernet
+	# port is a built-in "fsl,ls1024a-pfe-gem" device (firmware
+	# already embedded in the kernel image via CONFIG_EXTRA_FIRMWARE,
+	# so no insmod needed for it either) -- but whatever the kernel
+	# ends up naming it, it's just picked as the first non-loopback
+	# interface that shows up.
+	iface=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -1)
+	if [ -z "$iface" ]; then
+		echo "[initramfs] no network interface found, skipping telnet/ftp"
+		return
+	fi
+	echo "[initramfs] using interface $iface"
+	ifconfig "$iface" up 2>/dev/null
+
+	echo "[initramfs] requesting a DHCP lease on $iface ..."
+	udhcpc -i "$iface" -s /etc/udhcpc.script -t 10 -T 2 -A 3 -n -q 2>/dev/null
+
+	addr=$(ifconfig "$iface" 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -1)
+	if [ -z "$addr" ]; then
+		echo "[initramfs] DHCP failed, falling back to 192.168.1.222/24"
+		ifconfig "$iface" 192.168.1.222 netmask 255.255.255.0 up 2>/dev/null
+		addr=192.168.1.222
+	fi
+
+	# Assemble the RAID members so the rescue user can mount and work
+	# with the data disks over the network too. Harmless if already up.
+	if [ -x /sbin/mdadm ]; then
+		/sbin/mdadm --assemble --scan >/dev/null 2>&1 || true
+	fi
+
+	telnetd -l /bin/sh 2>/dev/null &
+	tcpsvd -vE 0.0.0.0 21 ftpd -w / 2>/dev/null &
+
+	echo "[initramfs]"
+	echo "[initramfs]   telnet $addr        <- root shell, no password"
+	echo "[initramfs]   ftp    $addr        <- upload/download files"
+	echo "[initramfs]"
+	echo "[initramfs] disks:"
+	cat /proc/partitions
+	[ -f /proc/mdstat ] && grep -E "^md" /proc/mdstat
+	echo "[initramfs] ================================"
+}
+start_netrescue
+
+echo "[initramfs] quick reboot: reboot -f  or  reboot-now"
+
+# ------------------------------------------------------------ wait for disk
+# phy-ls1024a-serdes.ko being inserted above doesn't make the physical
+# SATA link instant; racing mdadm against it just makes assembly fail.
+# pelican/monarch wait on ahci_rtd1295's fixed SCSI host numbers
+# (1:0:0:0 / 2:0:0:0) -- no equivalent fixed host number is confirmed
+# for this board's ahci_platform anywhere in this project's history, so
+# this waits generically for any /dev/sd* to appear instead of guessing
+# a host number.
+echo "[initramfs] waiting for SATA disk to link up..."
+i=0
+while [ $i -lt 12 ]; do
+	if [ -n "$(ls /sys/block 2>/dev/null | grep '^sd')" ]; then
+		echo "[initramfs] disk present after ${i}s, settling..."
+		sleep 1
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+[ $i -ge 12 ] && echo "[initramfs] timed out waiting for SATA disk"
+
+echo "[initramfs] block devices:"
+cat /proc/partitions
+
+# Second assemble, for the benefit of the local console shell below
+# (the one in start_netrescue above was for the network rescue path).
+# The board's real root filesystem is the software RAID1 array at
 # /dev/md0 (see README.md: "md0 (the RAID1 rootfs) assembles and
-# mounts"). md1/md2 are other arrays on this board whose purpose has
-# not been established in this project -- this script does not touch
-# them. Assembling it here (but not mounting/switch_root'ing into it)
-# just makes /dev/md0 available for the operator to mount by hand from
-# the shell below, if they want to.
+# mounts"). md1/md2 are other arrays on this board whose purpose hasn't
+# been established anywhere in this project's history, so this script
+# doesn't touch them, and doesn't guess. It never mounts /dev/md0 or
+# switch_root's into it either -- just assembles it so the operator can
+# mount it by hand if they want to.
 if [ -x /sbin/mdadm ]; then
-	/sbin/mdadm --assemble --scan 2>&1
+	echo "[initramfs] mdadm found, assembling arrays"
+	/sbin/mdadm --assemble --scan 2>/dev/null || true
+	[ -f /proc/mdstat ] && cat /proc/mdstat
 else
-	echo "mdadm not present in this image; relying on kernel MD_AUTODETECT"
+	echo "[initramfs] mdadm not found; relying on kernel MD_AUTODETECT"
 fi
 
-echo ""
-echo "=== Rescue shell ==="
-echo ""
-exec /bin/sh
+echo "[initramfs] shell on the serial console:"
+/bin/sh -i
+
+echo "[initramfs] shell exited, keeping init alive"
+while true; do
+	sleep 3600
+done

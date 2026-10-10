@@ -1,0 +1,24 @@
+#!/bin/sh
+# Minimal busybox udhcpc callback -- applies what the DHCP server handed
+# back using the applets this image actually has (ifconfig/route), the
+# same division of labour as any stock busybox udhcpc.script.
+
+case "$1" in
+	deconfig)
+		ifconfig "$interface" 0.0.0.0
+		;;
+	bound|renew)
+		ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}" up
+		if [ -n "$router" ]; then
+			route del default dev "$interface" 2>/dev/null
+			route add default gw "$router" dev "$interface"
+		fi
+		if [ -n "$dns" ]; then
+			: > /etc/resolv.conf
+			for d in $dns; do
+				echo "nameserver $d" >> /etc/resolv.conf
+			done
+		fi
+		;;
+esac
+exit 0
