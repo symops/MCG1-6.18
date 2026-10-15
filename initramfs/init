@@ -100,8 +100,19 @@ start_netrescue() {
 	# already embedded in the kernel image via CONFIG_EXTRA_FIRMWARE,
 	# so no insmod needed for it either) -- but whatever the kernel
 	# ends up naming it, it's just picked as the first non-loopback
-	# interface that shows up.
-	iface=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -1)
+	# interface that shows up. Pure shell glob + parameter expansion,
+	# not "ls | grep | head" -- this busybox build has neither sed nor
+	# head (see initramfs/README.md: it's a deliberately minimal,
+	# hand-picked applet set, unlike pelican/monarch's much larger
+	# one), so a pipeline copied verbatim from their script would have
+	# silently broken interface detection on every boot.
+	iface=""
+	for netdev in /sys/class/net/*; do
+		candidate=${netdev##*/}
+		[ "$candidate" = "lo" ] && continue
+		iface="$candidate"
+		break
+	done
 	if [ -z "$iface" ]; then
 		echo "[initramfs] no network interface found, skipping telnet/ftp"
 		return
@@ -112,7 +123,12 @@ start_netrescue() {
 	echo "[initramfs] requesting a DHCP lease on $iface ..."
 	udhcpc -i "$iface" -s /etc/udhcpc.script -t 10 -T 2 -A 3 -n -q 2>/dev/null
 
-	addr=$(ifconfig "$iface" 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -1)
+	# Same reason as the interface pick above: no sed/head in this
+	# busybox, so the address is pulled out with grep (which this
+	# build does have) plus plain parameter expansion instead.
+	addr_line=$(ifconfig "$iface" 2>/dev/null | grep 'inet addr:')
+	addr_rest=${addr_line#*inet addr:}
+	addr=${addr_rest%% *}
 	if [ -z "$addr" ]; then
 		echo "[initramfs] DHCP failed, falling back to 192.168.1.222/24"
 		ifconfig "$iface" 192.168.1.222 netmask 255.255.255.0 up 2>/dev/null
@@ -122,7 +138,7 @@ start_netrescue() {
 	# Assemble the RAID members so the rescue user can mount and work
 	# with the data disks over the network too. Harmless if already up.
 	if [ -x /sbin/mdadm ]; then
-		/sbin/mdadm --assemble --scan >/dev/null 2>&1 || true
+		/sbin/mdadm --assemble --scan --auto=yes >/dev/null 2>&1 || true
 	fi
 
 	telnetd -l /bin/sh 2>/dev/null &
@@ -176,7 +192,7 @@ cat /proc/partitions
 # mount it by hand if they want to.
 if [ -x /sbin/mdadm ]; then
 	echo "[initramfs] mdadm found, assembling arrays"
-	/sbin/mdadm --assemble --scan 2>/dev/null || true
+	/sbin/mdadm --assemble --scan --auto=yes 2>/dev/null || true
 	[ -f /proc/mdstat ] && cat /proc/mdstat
 else
 	echo "[initramfs] mdadm not found; relying on kernel MD_AUTODETECT"

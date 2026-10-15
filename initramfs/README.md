@@ -108,6 +108,26 @@ carried over as-is, or adapted/dropped against this board's own facts:
    `telnetd -l /bin/sh` and `tcpsvd ... ftpd -w /` in the background --
    **unauthenticated root**, same as pelican/monarch's own rescue
    shell. Prints the telnet/ftp addresses and `/proc/partitions`.
+
+   The interface pick and the DHCP/static address extracted from
+   `ifconfig`'s output are done with a plain shell glob loop and
+   parameter expansion (`${var#pattern}`/`${var%%pattern}`), not
+   `ls | grep | head` / `sed -n ... | head -1` the way pelican/monarch's
+   own script does it -- confirmed (by actually running both busybox
+   binaries under `qemu-arm`/`qemu-aarch64`) that pelican/monarch ship
+   a near-full-featured busybox (`sed`, `head`, `ip`, and nearly
+   everything else busybox has), while this board's build is the
+   deliberately minimal, hand-picked applet set described above, which
+   has neither `sed` nor `head`. Copying their pipeline verbatim here
+   would have silently broken interface detection on every boot
+   (`head: applet not found`, captured as an empty string) -- caught by
+   this comparison, not by anything that failed loudly.
+
+   For the same reason this also lacks pelican/monarch's IPv6 address
+   in the banner (their script reads it via `ip -6 addr show`, which
+   needs the `ip` applet and `CONFIG_FEATURE_IPV6`, neither built here)
+   -- the kernel still does normal IPv6 autoconfiguration on the
+   interface regardless, it's just not queried/printed by this image.
 8. **Wait for the SATA disk.** pelican/monarch wait on
    `ahci_rtd1295`'s fixed SCSI host numbers (`1:0:0:0` / `2:0:0:0`,
    since their phy driver's link-up takes several seconds). No
@@ -116,7 +136,7 @@ carried over as-is, or adapted/dropped against this board's own facts:
    12s) for any `/dev/sd*` to show up in `/sys/block` instead of
    guessing a host number.
 9. **Partitions.** Prints `/proc/partitions` again.
-10. **RAID assemble, again.** Runs `mdadm --assemble --scan` a second
+10. **RAID assemble, again.** Runs `mdadm --assemble --scan --auto=yes` a second
     time for the console shell's benefit (step 7's assemble was for the
     network path, which doesn't wait for the disk first). This board's
     real root filesystem is the software RAID1 array at `/dev/md0` (see
