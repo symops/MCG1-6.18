@@ -159,18 +159,29 @@ echo "[initramfs] quick reboot: reboot -f  or  reboot-now"
 # for this board's ahci_platform anywhere in this project's history, so
 # this waits generically for any /dev/sd* to appear instead of guessing
 # a host number.
+#
+# A `for i in <literal list>` loop, not `while ...; i=$((i + 1))` --
+# this busybox has no arithmetic expansion at all (confirmed:
+# `syntax error: support for $((arith)) is disabled`, and
+# busybox-src/.config: CONFIG_FEATURE_SH_MATH is not set). That form
+# isn't just cosmetically different: ash aborts the *entire remaining
+# script* on that syntax error the moment it's reached, so on any boot
+# where the disk doesn't link up within the very first check -- the
+# whole reason this wait loop exists -- init would have died here,
+# never reaching the console shell below, and the kernel would panic
+# on PID 1 exiting.
 echo "[initramfs] waiting for SATA disk to link up..."
-i=0
-while [ $i -lt 12 ]; do
+disk_found=""
+for i in 0 1 2 3 4 5 6 7 8 9 10 11; do
 	if [ -n "$(ls /sys/block 2>/dev/null | grep '^sd')" ]; then
 		echo "[initramfs] disk present after ${i}s, settling..."
 		sleep 1
+		disk_found=yes
 		break
 	fi
 	sleep 1
-	i=$((i + 1))
 done
-[ $i -ge 12 ] && echo "[initramfs] timed out waiting for SATA disk"
+[ -z "$disk_found" ] && echo "[initramfs] timed out waiting for SATA disk"
 
 echo "[initramfs] block devices:"
 cat /proc/partitions

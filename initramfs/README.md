@@ -140,7 +140,14 @@ carried over as-is, or adapted/dropped against this board's own facts:
    equivalent fixed host number for this board's `ahci_platform` is
    confirmed anywhere in this project, so this waits generically (up to
    12s) for any `/dev/sd*` to show up in `/sys/block` instead of
-   guessing a host number.
+   guessing a host number. The retry count is a `for i in 0 1 2 ... 11`
+   loop over a literal list, not a `while`/`$((i + 1))` counter --
+   confirmed this busybox has no arithmetic expansion at all
+   (`CONFIG_FEATURE_SH_MATH is not set`; `ash` reports `syntax error:
+   support for $((arith)) is disabled` and aborts the *rest of the
+   script* right there, which would have killed `init` -- and panicked
+   the kernel -- on any boot where the disk didn't link up on the very
+   first check, i.e. the normal case this loop exists for).
 9. **Partitions.** Prints `/proc/partitions` again.
 10. **RAID assemble, again.** Runs `mdadm --assemble --scan --auto=yes` a second
     time for the console shell's benefit (step 7's assemble was for the
