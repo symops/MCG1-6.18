@@ -73,9 +73,15 @@ carried over as-is, or adapted/dropped against this board's own facts:
    stdio to it.
 2. **Base filesystems.** Mounts `/proc`, `/sys`, `/dev` (`devtmpfs`,
    falling back to `mdev -s`), creates `/tmp`, `/run`, `/dev/pts`.
-3. **Reboot helpers.** Writes `/bin/reboot-now` and `/bin/poweroff-now`
-   (both just `echo b`/`echo o` > `/proc/sysrq-trigger`), for a serial
-   operator with no other way to signal the box.
+3. **Reboot helpers.** `/bin/reboot-now` and `/bin/poweroff-now` (both
+   just `echo b`/`echo o` > `/proc/sysrq-trigger`), for a serial
+   operator with no other way to signal the box -- vendored as real
+   files under `initramfs/bin/`, mode 755 in git, not written by
+   `init` itself with `cat > ... << EOF` + `chmod 755` the way an
+   earlier version of this script did: this busybox build has no
+   `chmod` applet either (confirmed: `chmod: applet not found`), so
+   that heredoc-written copy would have come out without its execute
+   bit and silently failed to run.
 4. **Storage modules.** `insmod`s `phy-ls1024a-serdes.ko`, then
    `usb-storage.ko`, then `uas.ko`, in that order -- no modprobe/depmod
    here, so load order matters the same way it does for pelican's own

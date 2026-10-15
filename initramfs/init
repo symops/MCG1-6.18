@@ -31,17 +31,11 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || mdev -s
 mkdir -p /dev/pts
 
 # ----------------------------------------------------------- reboot helpers
-cat > /bin/reboot-now << 'EOF'
-#!/bin/sh
-echo b > /proc/sysrq-trigger
-EOF
-chmod 755 /bin/reboot-now
-
-cat > /bin/poweroff-now << 'EOF'
-#!/bin/sh
-echo o > /proc/sysrq-trigger
-EOF
-chmod 755 /bin/poweroff-now
+# Vendored as real files in initramfs/bin/ (like busybox/mdadm), not
+# generated here with `cat > ... << EOF` + `chmod 755` -- this busybox
+# build has no chmod applet either (confirmed: `chmod: applet not
+# found`), so a heredoc-written copy would have come out without its
+# execute bit and silently failed to run as a command.
 
 # ------------------------------------------------------------- storage
 # AHCI SATA, software RAID and ext4 are all built into the kernel (=y
