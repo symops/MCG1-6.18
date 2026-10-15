@@ -172,6 +172,38 @@ because it's Android-vendor-specific and doesn't apply to this board's
 plain Devuan/Debian rootfs: adbd rc patching, and a vendor gzip-rootfs
 fallback on a fixed partition.
 
+## Known testing limitation: `telnetd`/`ftpd` not verified under emulation
+
+The telnet/ftp rescue path (step 7 above) could not be verified end to
+end with this project's usual `qemu-arm`-based testing method. Every
+connection to `tcpsvd -vE ... telnetd -l /bin/sh` (and the structurally
+identical `tcpsvd ... ftpd -w /`) crashes the spawned child with a
+busybox-ash-shaped `Syntax error: word unexpected (expecting ")")`,
+reproducible with a plain `echo` in place of `telnetd` too -- so the
+fault isn't in `telnetd`/`ftpd` themselves. Traced it down to
+`tcpsvd`'s `vfork()` + `execve()` of its per-connection handler
+(`networking/tcpudp.c` in busybox 1.36.1), and confirmed with a
+minimal, busybox-free static ARM C program that `fork()`/`vfork()` +
+`execve()` of a *separate process* can fail with `ENOEXEC` under this
+`qemu-arm` build, with or without a socket involved. But that doesn't
+fully add up either: the same emulator session's `ash` forks and execs
+`grep`/`printf`/etc. for ordinary pipelines throughout this project's
+*other* testing (interface detection, address parsing -- see above)
+with correct results every time, so "fork+exec is broken here" can't
+be the whole story. The exact trigger inside `qemu-arm`'s user-mode
+syscall emulation was not isolated despite several rounds of
+controlled reproduction.
+
+Given the inconsistency, this is being treated as a limitation of the
+`qemu-arm` emulation-based test harness, not a confirmed defect in
+`init`, busybox, or this board's build -- `vfork()`/`fork()` +
+`execve()` of a per-connection handler is an completely ordinary,
+decades-old pattern on real Linux (it's exactly how classic
+`tcpserver`/`ucspi-tcp`-style daemons have always worked), with no
+reason to expect it to fail on the board's real CPU. **This has not
+been confirmed on real hardware.** If the telnet/ftp rescue shell ever
+turns out not to accept connections on a real unit, start here.
+
 ## Packaging into `uRamdisk`
 
 ```sh
