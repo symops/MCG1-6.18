@@ -12,39 +12,26 @@ without touching the normal boot setup.
 ## Contents
 
 - `bin/busybox` -- statically linked busybox (1.36.1), cross-compiled
-  with `arm-linux-gnueabihf-gcc`, `CONFIG_STATIC=y`, built from an
-  `allnoconfig` base with only the applets this `init` script actually
-  uses enabled: ash/sh, mount, umount, switch_root, mkdir, mknod, ls,
-  cat, echo, dmesg, sleep, uname, poweroff, reboot, blkid, mdev, insmod,
-  init, test, test as `[` (`CONFIG_TEST1`), true, false, dd, grep, find,
-  ps, vi, plus the network rescue set -- `telnetd`, `tcpsvd`, `ftpd`,
-  `udhcpc`, `ifconfig`, `route` -- and `CONFIG_LFS=y` (required for this
-  glibc toolchain -- without it, the build fails with
-  `BUG_off_t_size_is_misdetected`). The usual `defconfig` was not usable
-  as-is: its `tc` applet fails to build against current kernel headers
-  (the old CBQ qdisc structs it needs were removed upstream), and it
-  isn't needed here anyway.
-
-  `TEST1` (the `[` applet) was missing from the original build of this
-  image -- `TEST` (the `test` command) and `TEST1` (`[`) are two
-  *separate* Kconfig symbols in busybox's `coreutils/test.c`, both
-  defaulting to `y` on a normal config, but an `allnoconfig`-based
-  build only gets what's explicitly turned on, and only `TEST` was.
-  Confirmed on real hardware (not caught by this project's own
-  `qemu-arm` testing, which happened not to exercise this particular
-  gap): `init`'s console log was full of `[: not found` on literally
-  every `[ ... ]` test in the script, and ash's `||`/`&&` then always
-  took the "command failed" branch regardless of the real condition --
-  this is why the log showed `insmod` never attempted for any of the
-  three storage modules ("NOT FOUND" printed for files that do exist),
-  the netrescue interface picked as `dummy0` instead of skipping it
-  (the `[ "$candidate" = "lo" ]` guard always came out false), and the
-  telnet/ftp banner printed with no IP address at all (the DHCP-failed
-  fallback check also never fired). The console shell at the very end
-  still worked throughout all of this, since `/bin/sh -i` doesn't
-  depend on `[`.
-- `bin/<applet>` -- busybox-style symlinks to `bin/busybox` for each
-  enabled applet.
+  with `arm-linux-gnueabihf-gcc`. Built from the normal ARM `defconfig`
+  (`CONFIG_STATIC=y` added), the same starting point
+  `symops/pelican-6.18`/`symops/monarch-6.18` use for their own rescue
+  images, not an `allnoconfig`-based hand-picked applet list as this
+  image originally shipped with (see "History" below for why that
+  changed) -- ~400 applets, including `sed`, `ip`, `head`, full
+  `ifconfig` status display, and everything else a rescue shell's
+  operator might reach for interactively, not just what `init` itself
+  calls. The only thing disabled relative to stock `defconfig` is
+  `CONFIG_TC`: it fails to build against current kernel headers (the
+  old CBQ qdisc structs it needs were removed upstream), and nothing
+  here needs it.
+- `bin/<applet>` -- busybox-style symlinks to `bin/busybox` for every
+  applet `busybox busybox --list` reports (matching
+  pelican/monarch's own `BUILDING.md`-documented method), except
+  `busybox` itself and `init` (this image's actual PID 1 is the
+  top-level `init` script below, not busybox's own minimal init
+  applet). This busybox is not built with `FEATURE_SH_STANDALONE`, so
+  without these symlinks every one of them fails with `not found` --
+  confirmed the hard way (see "History").
 - `etc/udhcpc.script` -- the callback `udhcpc` runs on `bound`/`renew`/
   `deconfig`, using only the applets this image has (`ifconfig`/
   `route`) to apply the lease, default route and DNS servers.
@@ -220,9 +207,50 @@ Given the inconsistency, this is being treated as a limitation of the
 `execve()` of a per-connection handler is an completely ordinary,
 decades-old pattern on real Linux (it's exactly how classic
 `tcpserver`/`ucspi-tcp`-style daemons have always worked), with no
-reason to expect it to fail on the board's real CPU. **This has not
-been confirmed on real hardware.** If the telnet/ftp rescue shell ever
-turns out not to accept connections on a real unit, start here.
+reason to expect it to fail on the board's real CPU.
+
+**Update:** this image's first real-hardware boot (see "History"
+below) did *not* show the crash this section describes -- the
+`telnetd`/`tcpsvd` lines in the console log ran with no error, same
+as everything else. That's consistent with this having been a
+`qemu-arm` emulation artifact all along, but isn't by itself
+confirmation that a client actually connected and got a shell -- that
+specific check still hasn't been done on real hardware.
+
+## History: real-hardware findings
+
+This image's actual first boot on a real unit (not `qemu-arm`) found
+two real bugs the emulation-based testing above never caught:
+
+1. **Missing `[` applet.** The original `allnoconfig`-based busybox
+   build (see "Contents" above for why that changed) had `test` but
+   not `test as [` -- `TEST` and `TEST1` are two *separate* Kconfig
+   symbols in busybox's `coreutils/test.c`, both default `y` on a
+   normal config, but an `allnoconfig` build only gets what's
+   explicitly turned on, and only `TEST` was. Since this busybox's
+   `ash` has no built-in `[` either (`CONFIG_ASH_TEST` was off), every
+   `[ ... ]` in `init` resolved via `PATH` to a file that didn't
+   exist. The real console log was full of `/init: line N: [: not
+   found`, and ash's `||`/`&&` then always took the "command failed"
+   branch regardless of the real condition -- this alone explained
+   every other symptom in that boot: `insmod` never attempted for any
+   of the three storage modules (`[ -f "$ko" ]` always "failed"), the
+   netrescue interface picked as `dummy0` instead of skipping it
+   (`[ "$candidate" = "lo" ]` never matched), and the telnet/ftp banner
+   printed with no IP address (the DHCP-failed static fallback check
+   never fired either). The console shell at the end still worked
+   throughout, since `/bin/sh -i` doesn't depend on `[`. Fixed by the
+   switch to a `defconfig`-based busybox (`TEST1` is on by default
+   there).
+2. **`dummy0` beat the real interface.** Even with `[` fixed, the next
+   real boot *still* picked the wrong interface -- not because of a
+   bug in the "skip `lo`" check, but because `ls1024a_defconfig` also
+   sets `CONFIG_DUMMY=y`, which auto-creates a `dummy0` netdev with no
+   backing hardware, and it enumerated in `/sys/class/net` ahead of
+   the real PFE `eth0`. "First interface that isn't `lo`" was never
+   specific enough. Fixed by also requiring a `/sys/class/net/<if>/
+   device` symlink (real netdevs have one; `dummy0`, like other
+   software-only netdevs, doesn't) -- see the comment in `init` itself.
 
 ## Packaging into `uRamdisk`
 

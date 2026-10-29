@@ -93,17 +93,21 @@ start_netrescue() {
 	# port is a built-in "fsl,ls1024a-pfe-gem" device (firmware
 	# already embedded in the kernel image via CONFIG_EXTRA_FIRMWARE,
 	# so no insmod needed for it either) -- but whatever the kernel
-	# ends up naming it, it's just picked as the first non-loopback
-	# interface that shows up. Pure shell glob + parameter expansion,
-	# not "ls | grep | head" -- this busybox build has neither sed nor
-	# head (see initramfs/README.md: it's a deliberately minimal,
-	# hand-picked applet set, unlike pelican/monarch's much larger
-	# one), so a pipeline copied verbatim from their script would have
-	# silently broken interface detection on every boot.
+	# ends up naming it, it's picked as the first interface backed by
+	# a real device. Not just "skip lo" -- confirmed on real hardware
+	# that's not enough: ls1024a_defconfig also sets CONFIG_DUMMY=y,
+	# which auto-creates a "dummy0" netdev at boot with no backing
+	# hardware at all, and it enumerated in /sys/class/net ahead of
+	# the real "eth0" every time, so a plain "first non-lo" pick
+	# always grabbed dummy0 instead. Real netdevs have a
+	# /sys/class/net/<if>/device symlink to their hardware; dummy0
+	# (and other software-only netdevs: veth, bridge, vlan, ...)
+	# don't, so that's what actually distinguishes them.
 	iface=""
 	for netdev in /sys/class/net/*; do
 		candidate=${netdev##*/}
 		[ "$candidate" = "lo" ] && continue
+		[ -e "$netdev/device" ] || continue
 		iface="$candidate"
 		break
 	done
@@ -117,9 +121,10 @@ start_netrescue() {
 	echo "[initramfs] requesting a DHCP lease on $iface ..."
 	udhcpc -i "$iface" -s /etc/udhcpc.script -t 10 -T 2 -A 3 -n -q 2>/dev/null
 
-	# Same reason as the interface pick above: no sed/head in this
-	# busybox, so the address is pulled out with grep (which this
-	# build does have) plus plain parameter expansion instead.
+	# grep + parameter expansion, not sed -- works fine now that this
+	# busybox has sed too, but this was already confirmed working on
+	# real hardware, so left as-is rather than changed just because a
+	# newer tool is now available.
 	addr_line=$(ifconfig "$iface" 2>/dev/null | grep 'inet addr:')
 	addr_rest=${addr_line#*inet addr:}
 	addr=${addr_rest%% *}
