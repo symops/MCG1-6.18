@@ -252,6 +252,17 @@ two real bugs the emulation-based testing above never caught:
    device` symlink (real netdevs have one; `dummy0`, like other
    software-only netdevs, doesn't) -- see the comment in `init` itself.
 
+Both fixes (and the `defconfig`-based busybox switch) confirmed together
+on a third real-hardware boot: `using interface eth0` (not `dummy0`),
+a real DHCP lease (`192.168.2.123`, no static fallback needed this
+time), all three storage modules `insmod`'d successfully, `sda` and
+its partitions enumerated, and -- the point of the busybox switch --
+`ifconfig` with no arguments now shows full interface status instead
+of refusing. The telnet/ftp daemons also started with no crash on this
+boot either, consistent with the "Known testing limitation" note above
+about that having likely been a `qemu-arm`-only artifact (an actual
+external telnet/ftp connection still hasn't been tried, though).
+
 ## Packaging into `uRamdisk`
 
 ```sh
