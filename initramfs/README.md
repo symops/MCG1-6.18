@@ -16,13 +16,33 @@ without touching the normal boot setup.
   `allnoconfig` base with only the applets this `init` script actually
   uses enabled: ash/sh, mount, umount, switch_root, mkdir, mknod, ls,
   cat, echo, dmesg, sleep, uname, poweroff, reboot, blkid, mdev, insmod,
-  init, test, true, false, dd, grep, find, ps, vi, plus the network
-  rescue set -- `telnetd`, `tcpsvd`, `ftpd`, `udhcpc`, `ifconfig`,
-  `route` -- and `CONFIG_LFS=y` (required for this glibc toolchain --
-  without it, the build fails with `BUG_off_t_size_is_misdetected`).
-  The usual `defconfig` was not usable as-is: its `tc` applet fails to
-  build against current kernel headers (the old CBQ qdisc structs it
-  needs were removed upstream), and it isn't needed here anyway.
+  init, test, test as `[` (`CONFIG_TEST1`), true, false, dd, grep, find,
+  ps, vi, plus the network rescue set -- `telnetd`, `tcpsvd`, `ftpd`,
+  `udhcpc`, `ifconfig`, `route` -- and `CONFIG_LFS=y` (required for this
+  glibc toolchain -- without it, the build fails with
+  `BUG_off_t_size_is_misdetected`). The usual `defconfig` was not usable
+  as-is: its `tc` applet fails to build against current kernel headers
+  (the old CBQ qdisc structs it needs were removed upstream), and it
+  isn't needed here anyway.
+
+  `TEST1` (the `[` applet) was missing from the original build of this
+  image -- `TEST` (the `test` command) and `TEST1` (`[`) are two
+  *separate* Kconfig symbols in busybox's `coreutils/test.c`, both
+  defaulting to `y` on a normal config, but an `allnoconfig`-based
+  build only gets what's explicitly turned on, and only `TEST` was.
+  Confirmed on real hardware (not caught by this project's own
+  `qemu-arm` testing, which happened not to exercise this particular
+  gap): `init`'s console log was full of `[: not found` on literally
+  every `[ ... ]` test in the script, and ash's `||`/`&&` then always
+  took the "command failed" branch regardless of the real condition --
+  this is why the log showed `insmod` never attempted for any of the
+  three storage modules ("NOT FOUND" printed for files that do exist),
+  the netrescue interface picked as `dummy0` instead of skipping it
+  (the `[ "$candidate" = "lo" ]` guard always came out false), and the
+  telnet/ftp banner printed with no IP address at all (the DHCP-failed
+  fallback check also never fired). The console shell at the very end
+  still worked throughout all of this, since `/bin/sh -i` doesn't
+  depend on `[`.
 - `bin/<applet>` -- busybox-style symlinks to `bin/busybox` for each
   enabled applet.
 - `etc/udhcpc.script` -- the callback `udhcpc` runs on `bound`/`renew`/
