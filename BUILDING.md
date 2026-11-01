@@ -7,13 +7,15 @@ This describes building this port from scratch on a fresh Debian 13 ("trixie") m
 ```sh
 sudo apt update
 sudo apt install -y \
-    git make bc bison flex \
+    git make bc bison flex gcc \
     gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
     libssl-dev libelf-dev \
     python3 cpio gzip pigz xz-utils kmod rsync u-boot-tools
 ```
 
 `u-boot-tools` (for `mkimage`) **is** needed here, unlike some sibling ports in this family of repos -- this board's bootloader (barebox) genuinely expects the legacy U-Boot `uImage` header format, not a raw patched `Image`. `xz-utils` is needed too: `ls1024a_defconfig` sets `CONFIG_KERNEL_XZ` (see step 4 for why), and the kernel build invokes the host `xz` binary directly to compress the self-decompressing payload. `pigz` is for step 6 (packaging the rescue `uRamdisk`'s cpio with `pigz -11`, for a smaller image than plain `gzip -9`). Device-tree compiler is not required system-wide -- the kernel build tree compiles its own `scripts/dtc` from source.
+
+A plain `gcc` (native, not the `-arm-linux-gnueabihf` cross one) is listed explicitly rather than left implicit: the kernel build needs a *host* compiler of its own for `HOSTCC` steps (`scripts/kconfig/conf`, `scripts/dtc`, `fixdep`, ...), and so does building `tools/bareboxenv-host` in step 8 -- but `gcc-arm-linux-gnueabihf` does **not** pull a native `gcc` in as a dependency (confirmed: `apt-cache depends gcc-arm-linux-gnueabihf` lists only cross packages). The only reason earlier end-to-end validation of this guide didn't already hit this on a clean machine is that `libssl-dev` happens to *Recommend* `gcc` (not a hard `Depends`), and plain `apt install` pulls Recommends by default -- true on a stock `apt` config, but not guaranteed (e.g. `APT::Install-Recommends "false"`), so it isn't something this guide should keep relying on by accident.
 
 ## 2. Clone the repository
 
@@ -74,7 +76,7 @@ See `Documentation/arm/ls1024a-wdmycloud.rst` ("Boot protocol: appended DTB requ
 
 ## 6. The board's real root filesystem is not part of this repo
 
-This board's real root filesystem is a full Devuan/Debian install, maintained and updated independently of this kernel repository. What this repo *does* ship is `initramfs/` -- the source tree for a separate, minimal rescue/test rootfs (static busybox + mdadm, telnet/ftp network rescue), unrelated to that Devuan/Debian install; see `initramfs/README.md` for what it contains and why. Packaging it into the `uRamdisk` the initrd-based test-boot path (step 9) expects:
+This board's real root filesystem is a full Devuan/Debian install, maintained and updated independently of this kernel repository. What this repo *does* ship is `initramfs/` -- the source tree for a separate rescue/test rootfs (static busybox + mdadm, telnet/ftp network rescue), unrelated to that Devuan/Debian install; see `initramfs/README.md` for what it contains and why. Packaging it into the `uRamdisk` the initrd-based test-boot path (step 9) expects:
 
 ```sh
 (cd initramfs && find . | cpio -o -H newc 2>/dev/null | pigz -11) > rootfs.cpio.gz
