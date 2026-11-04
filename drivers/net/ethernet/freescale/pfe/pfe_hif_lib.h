@@ -214,6 +214,12 @@ static inline dma_addr_t pfe_hif_buf_map(struct device *dev, void *pkt)
 	return dma;
 }
 
+/* Bus address of the current mapping (0 if unmapped). */
+static inline dma_addr_t pfe_hif_buf_dma(void *pkt)
+{
+	return *(dma_addr_t *)(pkt - PFE_PKT_HEADROOM);
+}
+
 static inline void pfe_hif_buf_unmap(struct device *dev, void *pkt)
 {
 	dma_addr_t *slot = pkt - PFE_PKT_HEADROOM;

@@ -218,12 +218,12 @@ static void hif_lib_client_release_rx_buffers(struct hif_client_s *client)
 		for (i = 0; i < client->rx_q[qno].size; i++, desc++) {
 			buf = desc->data;
 			/*
-			 * Any straggler here came from pfe_hif_spare_buf_get()
-			 * (dma_alloc_coherent() memory, see pfe_hif_lib.h), not
-			 * kmalloc() -- return it to the spare pool, not kfree().
+			 * Any straggler here came from the spare pool (see
+			 * pfe_hif_lib.h); desc->data is the usable pointer
+			 * (base + headroom), which is what the pool holds.
 			 */
 			if (buf)
-				pfe_hif_spare_buf_put(buf - pfe_pkt_headroom);
+				pfe_hif_spare_buf_put(buf);
 		}
 	}
 

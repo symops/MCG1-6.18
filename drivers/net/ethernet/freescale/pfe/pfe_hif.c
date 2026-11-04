@@ -287,6 +287,16 @@ static void *client_put_rxpacket(struct pfe_hif *hif, void *pkt, u32 len, u32 fl
 	if (!free_pkt)
 		return NULL;
 
+	/*
+	 * Map the replacement before the hand-off: a mapping failure is
+	 * then reported like a full client queue, the HIF descriptor is
+	 * left untouched and retried on the next poll.
+	 */
+	if (!pfe_hif_buf_map(hif->dev, free_pkt)) {
+		pfe_hif_spare_buf_put(free_pkt);
+		return NULL;
+	}
+
 	desc->data = pkt;
 	desc->client_ctrl = client_ctrl;
 	smp_wmb();
@@ -380,10 +390,18 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 
 pkt_drop:
 		hif->rx_buf_addr[rtc] = free_buf;
-		desc->data = pfe_hif_buf_map(hif->dev, free_buf);
-		wmb();
-		desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
-			     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);
+		/* The drop path re-posts the (now unmapped) buffer itself. */
+		if (!pfe_hif_buf_dma(free_buf) && !pfe_hif_buf_map(hif->dev, free_buf)) {
+			WARN_ON_ONCE(1);
+			desc->data = 0;
+			wmb();
+			desc->ctrl = 0;	/* leave it disabled rather than DMA to 0 */
+		} else {
+			desc->data = pfe_hif_buf_dma(free_buf);
+			wmb();
+			desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
+				     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);
+		}
 
 		inc_hif_rxidx(rtc);
 
