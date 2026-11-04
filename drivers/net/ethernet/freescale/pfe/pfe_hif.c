@@ -121,7 +121,7 @@ static void pfe_hif_release_buffers(struct pfe_hif *hif)
 	for (i = 0; i < hif->RxRingSize; i++) {
 		if (desc->data) {
 			if (i < hif->shm->rx_buf_pool_cnt && !hif->shm->rx_buf_pool[i]) {
-				/* Coherent memory -- no dma_unmap_single() needed. */
+				pfe_hif_buf_unmap(hif->dev, hif->rx_buf_addr[i]);
 				hif->shm->rx_buf_pool[i] = hif->rx_buf_addr[i];
 			} else {
 				dev_err(hif->dev, "%s: buffer pool already full\n", __func__);
@@ -155,7 +155,9 @@ static int pfe_hif_init_buffers(struct pfe_hif *hif)
 	first_desc_p = (struct hif_desc *)hif->descr_baseaddr_p;
 
 	for (i = 0; i < hif->RxRingSize; i++) {
-		data = pfe_hif_buf_dma((void *)hif->shm->rx_buf_pool[i]);
+		data = pfe_hif_buf_map(hif->dev, (void *)hif->shm->rx_buf_pool[i]);
+		if (!data)
+			return -ENOMEM;
 		hif->rx_buf_addr[i] = (void *)hif->shm->rx_buf_pool[i];
 		hif->shm->rx_buf_pool[i] = NULL;
 
@@ -281,6 +283,8 @@ static void *client_put_rxpacket(struct pfe_hif *hif, void *pkt, u32 len, u32 fl
 	 */
 	free_pkt = pfe_hif_spare_buf_get();
 	if (!free_pkt)
+		free_pkt = pfe_hif_buf_alloc(hif->dev, GFP_ATOMIC);
+	if (!free_pkt)
 		return NULL;
 
 	desc->data = pkt;
@@ -324,9 +328,9 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 		hif->napi_counters[NAPI_DESC_COUNT]++;
 
 		len = BD_BUF_LEN(local_desc.ctrl);
-		/* Coherent memory -- no dma_unmap_single() needed. */
 
 		pkt_hdr_ptr = hif->rx_buf_addr[rtc];
+		pfe_hif_buf_unmap(hif->dev, pkt_hdr_ptr);
 
 		/* Track the last HIF header received, for multi-buffer packets. */
 		if (!hif->started) {
@@ -376,7 +380,7 @@ static int pfe_hif_rx_process(struct pfe_hif *hif, int budget)
 
 pkt_drop:
 		hif->rx_buf_addr[rtc] = free_buf;
-		desc->data = pfe_hif_buf_dma(free_buf);
+		desc->data = pfe_hif_buf_map(hif->dev, free_buf);
 		wmb();
 		desc->ctrl = BD_CTRL_PKT_INT_EN | BD_CTRL_LIFM | BD_CTRL_DIR |
 			     BD_CTRL_DESC_EN | BD_BUF_LEN(pfe_pkt_size);

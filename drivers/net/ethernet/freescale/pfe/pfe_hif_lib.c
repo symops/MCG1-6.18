@@ -105,8 +105,10 @@ void pfe_hif_spare_buf_put(void *buf)
 	 * never exceed HIF_RX_DESC_NT. WARN and drop rather than
 	 * overflowing the array if it somehow ever does.
 	 */
-	if (!WARN_ON(ghif_spare_buf_count >= HIF_RX_DESC_NT))
+	if (ghif_spare_buf_count < HIF_RX_DESC_NT)
 		ghif_spare_buf[ghif_spare_buf_count++] = buf;
+	else
+		pfe_hif_buf_free(NULL, buf);
 
 	spin_unlock_irqrestore(&ghif_spare_buf_lock, flags);
 }

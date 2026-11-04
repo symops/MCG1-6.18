@@ -568,15 +568,20 @@ static void pfe_eth_rx_drain(struct pfe_eth_priv_s *priv, unsigned int qno)
 			continue;
 		}
 
-		skb = netdev_alloc_skb_ip_align(dev, length);
+		/* Zero-copy: wrap the whole fragment, the stack frees it
+		 * (skb_free_frag()) when done. offset already skips the
+		 * headroom + HIF header, and PFE_BUF_SIZE leaves room for
+		 * skb_shared_info after the packet area.
+		 */
+		skb = build_skb(buf_addr, PFE_BUF_SIZE);
 		if (!skb) {
 			pfe_hif_spare_buf_put(buf_addr + PFE_PKT_HEADROOM);
 			dev->stats.rx_dropped++;
 			continue;
 		}
 
-		skb_put_data(skb, buf_addr + offset, length);
-		pfe_hif_spare_buf_put(buf_addr + PFE_PKT_HEADROOM);
+		skb_reserve(skb, offset);
+		skb_put(skb, length);
 
 		skb->dev = dev;
 		skb->protocol = eth_type_trans(skb, dev);

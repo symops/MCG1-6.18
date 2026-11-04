@@ -164,29 +164,64 @@ extern unsigned int pfe_pkt_headroom;
  * is already passed around, without threading a second value through
  * every call site.
  */
+/*
+ * Zero-copy Rx (stage 2): buffers are ordinary cached page fragments
+ * (netdev_alloc_frag_align(), 128-byte aligned so the metadata word at
+ * base[0] and the DMA region at base + PFE_PKT_HEADROOM never share a
+ * cache line) and go through the streaming DMA API: pfe_hif_buf_map()
+ * when posted to the HIF ring, pfe_hif_buf_unmap() when the descriptor
+ * completes, before the CPU touches the data. Once received, the whole
+ * fragment is handed to the stack with build_skb() (pfe_eth.c) and freed
+ * by skb_free_frag() on the way out -- the same lifecycle every mainline
+ * page-fragment Rx path uses.
+ *
+ * The dma_addr_t of the current mapping is stashed in the buffer's own
+ * headroom so it travels alongside the plain "void *" pointer.
+ *
+ * The 3.2.26 vendor driver did the same thing on top of its uncached
+ * GFP_DMA_NCNB pool (alloc_skb_header() around the buffer, no copy), and
+ * also dma_map_single()s every Rx buffer (pfe_hif.c there).
+ */
+#define PFE_BUF_ALIGN		128
+
 static inline void *pfe_hif_buf_alloc(struct device *dev, gfp_t flags)
 {
-	dma_addr_t dma;
-	void *base = dma_alloc_coherent(dev, PFE_BUF_SIZE, &dma, flags);
+	void *base = netdev_alloc_frag_align(PFE_BUF_SIZE, PFE_BUF_ALIGN);
 
 	if (!base)
 		return NULL;
 
-	*(dma_addr_t *)base = dma;
+	*(dma_addr_t *)base = 0;
 
 	return base + PFE_PKT_HEADROOM;
 }
 
 static inline void pfe_hif_buf_free(struct device *dev, void *pkt)
 {
-	void *base = pkt - PFE_PKT_HEADROOM;
-
-	dma_free_coherent(dev, PFE_BUF_SIZE, base, *(dma_addr_t *)base);
+	skb_free_frag(pkt - PFE_PKT_HEADROOM);
 }
 
-static inline dma_addr_t pfe_hif_buf_dma(void *pkt)
+/* Map the packet area for the HIF to write into; returns the bus address to post. */
+static inline dma_addr_t pfe_hif_buf_map(struct device *dev, void *pkt)
 {
-	return *(dma_addr_t *)(pkt - PFE_PKT_HEADROOM) + PFE_PKT_HEADROOM;
+	dma_addr_t dma = dma_map_single(dev, pkt, PFE_PKT_SIZE, DMA_FROM_DEVICE);
+
+	if (dma_mapping_error(dev, dma))
+		return 0;
+
+	*(dma_addr_t *)(pkt - PFE_PKT_HEADROOM) = dma;
+
+	return dma;
+}
+
+static inline void pfe_hif_buf_unmap(struct device *dev, void *pkt)
+{
+	dma_addr_t *slot = pkt - PFE_PKT_HEADROOM;
+
+	if (*slot) {
+		dma_unmap_single(dev, *slot, PFE_PKT_SIZE, DMA_FROM_DEVICE);
+		*slot = 0;
+	}
 }
 
 /*
