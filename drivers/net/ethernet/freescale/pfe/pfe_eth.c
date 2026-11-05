@@ -238,8 +238,14 @@ static void pfe_gemac_init(struct pfe_eth_priv_s *priv)
 	gemac_disable_fcs_rx(priv->EMAC_baseaddr);
 	gemac_enable_1536_rx(priv->EMAC_baseaddr);
 	gemac_set_bus_width(priv->EMAC_baseaddr, 64);
-	/* No NETIF_F_RXCSUM feature bit declared yet -- see pfe_hw_lib.c. */
-	gemac_disable_rx_checksum_offload(priv->EMAC_baseaddr);
+	/* GEM verifies IPv4/TCP/UDP checksums; the class PE reports the
+	 * result as HIF_CTRL_RX_CHECKSUMMED in the per-packet client_ctrl
+	 * (see pfe_eth_rx_drain()).
+	 */
+	if (priv->dev->features & NETIF_F_RXCSUM)
+		gemac_enable_rx_checksum_offload(priv->EMAC_baseaddr);
+	else
+		gemac_disable_rx_checksum_offload(priv->EMAC_baseaddr);
 }
 
 static void pfe_eth_adjust_link(struct net_device *dev)
@@ -562,24 +568,36 @@ static void pfe_eth_rx_drain(struct pfe_eth_priv_s *priv, unsigned int qno)
 			continue;
 		}
 
-		skb = netdev_alloc_skb_ip_align(dev, length);
+		/* Zero-copy: wrap the whole fragment, the stack frees it
+		 * (skb_free_frag()) when done. offset already skips the
+		 * headroom + HIF header, and PFE_BUF_SIZE leaves room for
+		 * skb_shared_info after the packet area.
+		 */
+		skb = build_skb(buf_addr, PFE_BUF_SIZE);
 		if (!skb) {
 			pfe_hif_spare_buf_put(buf_addr + PFE_PKT_HEADROOM);
 			dev->stats.rx_dropped++;
 			continue;
 		}
 
-		skb_put_data(skb, buf_addr + offset, length);
-		pfe_hif_spare_buf_put(buf_addr + PFE_PKT_HEADROOM);
+		skb_reserve(skb, offset);
+		skb_put(skb, length);
 
 		skb->dev = dev;
 		skb->protocol = eth_type_trans(skb, dev);
-		skb_checksum_none_assert(skb);
+		if ((dev->features & NETIF_F_RXCSUM) && (rx_ctrl & HIF_CTRL_RX_CHECKSUMMED))
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+		else
+			skb_checksum_none_assert(skb);
 
 		dev->stats.rx_packets++;
 		dev->stats.rx_bytes += length;
 
-		netif_receive_skb(skb);
+		/* Runs inside the HIF NAPI poll (pfe_hif_rx_poll()), so GRO can
+		 * coalesce consecutive TCP segments before they hit the stack;
+		 * napi_complete_done() in the poll flushes whatever is held.
+		 */
+		napi_gro_receive(&priv->pfe->hif.napi, skb);
 	}
 }
 
@@ -776,6 +794,14 @@ static int pfe_eth_close(struct net_device *dev)
 static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+	u32 ctrl = 0;
+
+	/* The class PE computes the IPv4 header and TCP/UDP checksums when
+	 * HIF_CTRL_TX_CHECKSUM is set in the HIF header (vendor
+	 * pfe_eth_send_packet() does the same for CHECKSUM_PARTIAL).
+	 */
+	if (skb->ip_summed == CHECKSUM_PARTIAL)
+		ctrl = HIF_CTRL_TX_CHECKSUM;
 
 	if (skb_headroom(skb) < sizeof(struct hif_hdr) &&
 	    pskb_expand_head(skb, sizeof(struct hif_hdr), 0, GFP_ATOMIC)) {
@@ -807,7 +833,7 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 	 * without a stop/wake-queue implementation should, rather than
 	 * returning NETDEV_TX_BUSY with nothing to ever un-stick it.
 	 */
-	if (hif_lib_xmit_pkt(&priv->client, PFE_ETH_TXQ, skb->data, skb->len, 0, skb)) {
+	if (hif_lib_xmit_pkt(&priv->client, PFE_ETH_TXQ, skb->data, skb->len, ctrl, skb)) {
 		dev_kfree_skb_any(skb);
 		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
@@ -936,8 +962,21 @@ static void pfe_eth_set_multi(struct net_device *dev)
 		gemac_disable_unicast(priv->EMAC_baseaddr);
 }
 
+static int pfe_eth_set_features(struct net_device *dev, netdev_features_t features)
+{
+	struct pfe_eth_priv_s *priv = netdev_priv(dev);
+
+	if (features & NETIF_F_RXCSUM)
+		gemac_enable_rx_checksum_offload(priv->EMAC_baseaddr);
+	else
+		gemac_disable_rx_checksum_offload(priv->EMAC_baseaddr);
+
+	return 0;
+}
+
 static const struct net_device_ops pfe_netdev_ops = {
 	.ndo_open = pfe_eth_open,
+	.ndo_set_features = pfe_eth_set_features,
 	.ndo_stop = pfe_eth_close,
 	.ndo_start_xmit = pfe_eth_send_packet,
 	.ndo_set_mac_address = eth_mac_addr,
@@ -1083,6 +1122,13 @@ static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 	 * needed for an skb that came from somewhere unusual.
 	 */
 	dev->needed_headroom = sizeof(struct hif_hdr);
+
+	/* Rx/Tx checksum offload is done by the GEMAC + class PE (same
+	 * firmware the vendor driver uses, which advertises the same bits);
+	 * GRO is pure software on top of the HIF NAPI poll.
+	 */
+	dev->hw_features = NETIF_F_RXCSUM | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
+	dev->features |= dev->hw_features | NETIF_F_GRO;
 
 	priv = netdev_priv(dev);
 	priv->pfe = pfe;
