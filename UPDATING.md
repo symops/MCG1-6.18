@@ -46,10 +46,6 @@ depmod -a 6.18.59
 
 ### Things that are easy to get wrong
 
-- **PHY drivers must be built in.** `ls1024a_defconfig` on `main` builds the SerDes PHY as a module; the SATA
-  controller's `phys = <&serdes1 ...>` then defers probing forever on a root-on-SATA system and the kernel never
-  finds `/dev/md0`. Build with `CONFIG_PHY_LS2014A_SERDES=y` (and the USB3 PHY likewise) unless you boot with an
-  initrd that carries the module. The symptom from outside is "no ping, ever".
 - **10 MiB ceiling.** Check `ls -la uImage` after every config change; barebox truncates silently.
 - **Image name.** `mkimage -n` is limited to 32 characters; longer names are cut, which only matters if something
   reads the header back (a status page, `dumpimage`).
