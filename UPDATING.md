@@ -25,7 +25,7 @@ reboot
 
 The board is back on the network about 100 s after `reboot` (roughly 60 s of barebox + kernel, 40 s of userspace).
 If it answers `ping` but not SSH within three minutes, give it another minute; if it never answers `ping`, go to
-section 2.
+section 3.
 
 ### Modules and `vermagic`
 
@@ -56,7 +56,64 @@ depmod -a 6.18.59
 - **Keep the known-good image on `/srv/data`**, not on the root filesystem: the recovery image below can mount the
   data partition directly, mounting the RAID1 root is one more step.
 
-## 2. Recovery without a serial console
+## 2. Update the rescue `uRamdisk` and `boot.scr`
+
+Neither matters for day-to-day operation the way the kernel does -- the board's normal boot doesn't depend on either
+changing -- but both live on the SATA disk too, so the same from-the-running-system approach as section 1 applies,
+with partition-specific caveats below.
+
+### `uRamdisk` (partition 6)
+
+Same fixed-size raw-region convention as the kernel partition (`BUILDING.md` step 6 and step 5's "A hard 10 MiB
+ceiling" note): barebox reads a fixed 10 MiB region starting at the partition, regardless of the real image size.
+
+```sh
+mkdir -p /srv/data/_newfw
+dd if=/dev/sda6 of=/srv/data/_newfw/sda6-known-good.img bs=1M count=10
+
+dd if=uRamdisk of=/dev/sda6 bs=1M conv=fsync
+cmp -n "$(stat -c %s uRamdisk)" uRamdisk /dev/sda6 && echo OK
+sync
+```
+
+This only matters for the **initrd test boot** path (`BUILDING.md` step 9) -- the board's normal boot (direct
+`root=/dev/md0`, no initrd) never reads this partition on its own, so there is no reboot to wait on here; the new
+image just sits there until something actually boots off it.
+
+### `boot.scr` (partition 7)
+
+This is barebox's own environment image, not a fixed-size raw-region read like the two partitions above -- its own
+superblock carries the real size, so there is no 10 MiB (or any other) ceiling to watch here.
+
+**Back this up before writing anything new.** Unlike partitions 5/6, this one already holds the board's real
+production boot environment in normal operation -- it is not something this repo's own build produces by default.
+The script `tools/bareboxenv-host/boot.sh` in this repo (built per `BUILDING.md` step 8) is the simplified
+**test-path** script for the initrd test boot above, not a copy of the production one: the real production script
+also handles button state (`get_button_status`/`btn_status`) and passes extra `bootargs`
+(`mac_addr`/`model`/`serial`/`board_test`) that the test-path one does not -- see `tools/bareboxenv-host/README.md`
+for the full story.
+
+```sh
+dd if=/dev/sda7 of=/srv/data/_newfw/sda7-production.img   # keep this -- see above
+dd if=boot.scr of=/dev/sda7 conv=fsync
+sync
+```
+
+Restore the production script the same way once done testing: `dd if=/srv/data/_newfw/sda7-production.img
+of=/dev/sda7`.
+
+### Things that are easy to get wrong
+
+- **`boot.scr` overwrites the production boot environment**, not something inert -- confirm this unit is meant to
+  run the test-path script before writing it, and keep the backup from above.
+- **`uRamdisk`'s vendored modules are vermagic-pinned.** The three `.ko` files inside it
+  (`phy-ls1024a-serdes`/`usb-storage`/`uas`) must match the kernel it boots alongside -- update `uImage` and
+  `uRamdisk` together from the same release/build, not a kernel from one and a `uRamdisk` built for another (see
+  `initramfs/README.md`).
+- **10 MiB ceiling applies to `uRamdisk` too**, same as `uImage` -- check `ls -la uRamdisk` after any change to
+  `initramfs/`.
+
+## 3. Recovery without a serial console
 
 The stock WD barebox (2011.06.0) has a network recovery hook: during the first seconds after power-on it listens for
 an ICMP echo request whose payload is the string `WD-ICMP-BEACON`, sent to the board's MAC address. On receipt it
