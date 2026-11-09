@@ -393,6 +393,17 @@
 			status = "disabled";
 		};
 
+		crypto: crypto@9b000000 {
+			compatible = "fsl,ls1024a-spacc";
+			reg = <0x9b000000 0x80000>;
+			interrupts = <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkcore LS1024A_CLK_IPSEC_SPACC>;
+			clock-names = "spacc";
+			resets = <&clkreset LS1024A_AXI_IPSEC_SPACC_RST>;
+			reset-names = "spacc";
+			status = "okay";
+		};
+
 		sata: sata@9d000000 {
 			compatible = "fsl,ls1024a-sata", "generic-ahci";
 			reg = <0x9d000000 0x10000>;
