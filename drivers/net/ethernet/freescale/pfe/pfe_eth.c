@@ -21,11 +21,16 @@
  *
  *  - pfe_eth_send_packet() (.ndo_start_xmit) submits via
  *    hif_lib_xmit_pkt() (Stage P8, pfe_hif_lib.c) -- one full,
- *    non-fragmented packet per call, no TSO, no QoS classification
- *    (everything goes on a single fixed queue, PFE_ETH_TXQ). No stop/
- *    wake-queue flow control either: the 1024-deep ring (EMAC_TXQ_DEPTH)
- *    is comfortably more than this baseline's DHCP+ping target needs,
- *    so a full ring just drops the packet instead.
+ *    non-fragmented packet per call, no QoS classification (everything
+ *    goes on a single fixed queue, PFE_ETH_TXQ). No stop/wake-queue flow
+ *    control either: the 1024-deep ring (EMAC_TXQ_DEPTH) is comfortably
+ *    more than this baseline's DHCP+ping target needs, so a full ring
+ *    just drops the packet instead.
+ *  - TSO/TSO6 is software GSO only (pfe_eth_send_packet() re-segments
+ *    with skb_gso_segment() before calling pfe_eth_send_one() per
+ *    resulting packet) -- the firmware's own hardware TSO submission
+ *    path (struct hif_tso_hdr) exists but its exact wire semantics
+ *    aren't confirmed, so it's not wired up yet.
  *  - pfe_eth_rx_drain() consumes what hif_lib_client_register() (Stage
  *    P7) made this GEM reachable for, called directly from
  *    pfe_eth_event_handler() -- itself called synchronously from
@@ -58,6 +63,8 @@
 #include <linux/phy.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+
+#include <net/gso.h>
 
 #include "pfe_eth.h"
 #include "pfe_hw_lib.h"
@@ -791,7 +798,7 @@ static int pfe_eth_close(struct net_device *dev)
 	return 0;
 }
 
-static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t pfe_eth_send_one(struct sk_buff *skb, struct net_device *dev)
 {
 	struct pfe_eth_priv_s *priv = netdev_priv(dev);
 	u32 ctrl = 0;
@@ -843,6 +850,42 @@ static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *d
 	dev->stats.tx_bytes += skb->len;
 
 	pfe_eth_flush_txq(priv, PFE_ETH_TXQ, PFE_ETH_TX_FREE_MAX);
+
+	return NETDEV_TX_OK;
+}
+
+static netdev_tx_t pfe_eth_send_packet(struct sk_buff *skb, struct net_device *dev)
+{
+	struct sk_buff *segs, *seg, *next;
+	netdev_features_t features;
+
+	if (likely(!skb_is_gso(skb)))
+		return pfe_eth_send_one(skb, dev);
+
+	/*
+	 * Software GSO: dev->features advertises NETIF_F_TSO/_TSO6 only so
+	 * TCP composes large skbs instead of one per MSS (see the comment
+	 * at the hw_features assignment in pfe_eth_probe_gem()) -- this
+	 * driver has no hardware segmentation wired up, so re-segment here
+	 * into real, individually-submitted packets. Clearing NETIF_F_GSO_MASK
+	 * (but not NETIF_F_SG/_IP_CSUM/_IPV6_CSUM) forces skb_gso_segment()
+	 * to actually split the skb, while still leaving each resulting
+	 * segment's ip_summed as CHECKSUM_PARTIAL so it goes through the
+	 * existing, already-working HIF_CTRL_TX_CHECKSUM offload path below.
+	 */
+	features = dev->features & ~NETIF_F_GSO_MASK;
+	segs = skb_gso_segment(skb, features);
+	if (IS_ERR(segs) || !segs) {
+		dev_kfree_skb_any(skb);
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+	dev_consume_skb_any(skb);
+
+	skb_list_walk_safe(segs, seg, next) {
+		skb_mark_not_on_list(seg);
+		pfe_eth_send_one(seg, dev);
+	}
 
 	return NETDEV_TX_OK;
 }
@@ -1126,8 +1169,24 @@ static int pfe_eth_probe_gem(struct pfe *pfe, struct device_node *np)
 	/* Rx/Tx checksum offload is done by the GEMAC + class PE (same
 	 * firmware the vendor driver uses, which advertises the same bits);
 	 * GRO is pure software on top of the HIF NAPI poll.
+	 *
+	 * TSO/TSO6 here is software GSO, not firmware-assisted segmentation:
+	 * the HIF wire protocol does define a hardware TSO submission path
+	 * (struct hif_tso_hdr, HIF_CTRL_TX_TSO/_TSO6/_TSO_END in pfe_hif.h),
+	 * but its exact field semantics (byte order and units of ip_off/
+	 * ip_id/ip_len/tcp_off/tcp_seq) aren't confirmed anywhere accessible
+	 * right now, and guessing wrong there risks silently corrupting TCP
+	 * streams -- not an acceptable trade for a performance optimization.
+	 * Advertising TSO/SG here still gives a real, safe win: it lets TCP
+	 * compose large (up to 64K) skbs instead of one skb per MSS, which
+	 * pfe_eth_send_packet() below then re-segments in software with
+	 * skb_gso_segment() before handing each real packet to the existing,
+	 * already-verified single-descriptor path. Revive the hardware
+	 * path (struct hif_tso_hdr) once that firmware protocol is
+	 * actually confirmed.
 	 */
-	dev->hw_features = NETIF_F_RXCSUM | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
+	dev->hw_features = NETIF_F_RXCSUM | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
+			    NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
 	dev->features |= dev->hw_features | NETIF_F_GRO;
 
 	priv = netdev_priv(dev);
