@@ -49,3 +49,4 @@ obj-y += intel/
 obj-y += starfive/
 obj-y += cavium/
 obj-y += ti/
+obj-$(CONFIG_CRYPTO_DEV_LS1024A_SPACC) += ls1024a-spacc.o
