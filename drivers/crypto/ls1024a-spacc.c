@@ -13,7 +13,6 @@
 #include <crypto/skcipher.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
-#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmapool.h>
 #include <linux/err.h>
@@ -443,18 +442,6 @@ static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 		}
 	} else {
 		err = spacc->req_err;
-	}
-
-	/*
-	 * The engine can still have the final burst in flight when the status is
-	 * reported; unmapping the SG list that early drops those last bytes.
-	 * CTRL has no usable busy bit (bit0 reads 0 even while running), so a
-	 * short fixed settle time (1 us) is used, then posted writes are flushed.
-	 */
-	if (!err) {
-		(void)readl(spacc->crypto_regs + SPACC_REG_STATUS);
-		dma_rmb();
-		udelay(1);
 	}
 
 	if (src == dst) {
