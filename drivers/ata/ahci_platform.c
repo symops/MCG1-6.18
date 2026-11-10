@@ -59,14 +59,6 @@ static int ahci_probe(struct platform_device *pdev)
 	if (device_is_compatible(dev, "hisilicon,hisi-ahci"))
 		hpriv->flags |= AHCI_HFLAG_NO_FBS | AHCI_HFLAG_NO_NCQ;
 
-	/*
-	 * This SoC's SATA PHY supports partial/slumber link power states;
-	 * let libahci manage ALPM instead of leaving the link at full power
-	 * around the clock on this always-on NAS hardware.
-	 */
-	if (device_is_compatible(dev, "fsl,ls1024a-sata"))
-		hpriv->flags |= AHCI_HFLAG_YES_ALPM;
-
 	port = device_get_match_data(dev);
 	if (!port)
 		port = &ahci_port_info;

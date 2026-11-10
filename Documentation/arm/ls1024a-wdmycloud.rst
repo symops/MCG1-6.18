@@ -1812,15 +1812,15 @@ modern host toolchain (GCC 13, binutils 2.42) already present in this
 environment -- no compiler-version workarounds were needed anywhere
 in this port.
 
-Four more fixes/features, ported from petoknm/linux (pending hardware test)
-=============================================================================
+Three fixes/features ported from petoknm/linux, and one that was withdrawn
+===========================================================================
 
-Cross-compiled clean (``make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-
--j$(nproc) uImage dtbs modules``) but **not yet booted on the real
-board** -- unlike every other item in this document, none of the four
-below has a real-hardware confirmation log yet. Run
-``Documentation/arm/ls1024a-verify-pending-fixes.sh`` (see below) after
-the next boot and update this section with the result.
+Four items were ported together; all four were then run on the real
+board on 2026-11-10 (kernel ``6.18.60+`` built from this branch,
+``Documentation/arm/ls1024a-verify-pending-fixes.sh`` plus the manual
+checks quoted below). Three hold up; the SATA/PCIe link power saving
+does not and was taken out again -- its section is kept as a record of
+why.
 
 CPU1 hotplug/wakeup fix
 -----------------------
@@ -1856,31 +1856,43 @@ CPU1 permanently offline)::
 Every line should print ``1``; ``dmesg`` should show no
 "CPU%d did not reach standby" warning and no hang.
 
-PCIe ASPM / SATA ALPM power saving
------------------------------------
+**Result on hardware (2026-11-10)**: five offline/online cycles pass.
+After a cycle CPU1 computes at the same speed as CPU0 (``taskset -c N
+openssl speed``: 2798 vs 2794 ops), its local timer (``twd``) keeps
+counting, and a process on CPU0 wakes one on CPU1 in 0.14 ms median,
+4.1 ms worst over 300 tries.
 
-This always-on NAS previously ran its SATA link and any PCIe links at
-full power around the clock. ``CONFIG_PCIEASPM_POWERSAVE=y`` (plus
-``CONFIG_PCIEASPM=y``) lets the PCIe core actually negotiate ASPM L0s/
-L1 instead of leaving it at the kernel's conservative default; the
-SATA side gets ``AHCI_HFLAG_YES_ALPM`` for the ``"fsl,ls1024a-sata"``
-compatible in ``drivers/ata/ahci_platform.c`` plus
-``CONFIG_SATA_MOBILE_LPM_POLICY=3`` so the link actually requests
-partial/slumber states by default. Ported from
-petoknm/linux@159ddf714e69.
+PCIe ASPM / SATA ALPM power saving -- withdrawn
+-------------------------------------------------
 
-**How to verify**::
+Ported from petoknm/linux@159ddf714e69 as ``AHCI_HFLAG_YES_ALPM`` for
+``"fsl,ls1024a-sata"`` in ``drivers/ata/ahci_platform.c`` plus
+``CONFIG_SATA_MOBILE_LPM_POLICY=3`` and ``CONFIG_PCIEASPM_POWERSAVE=y``.
+**Removed again after the hardware test**, for two reasons:
 
-    cat /sys/class/scsi_host/host0/link_power_management_policy
-    # expect "med_power_with_dipm", not "max_performance"
+- As ported it did nothing. ``CONFIG_SATA_MOBILE_LPM_POLICY`` is applied
+  by ``ahci_update_initial_lpm_policy()``, which exists only in the PCI
+  driver (``drivers/ata/ahci.c``); ``ahci_platform`` never sets a target
+  policy, so the board kept reporting ``keep_firmware_settings``.
+- Turning the policy on by hand breaks the link. With
+  ``echo med_power_with_dipm > /sys/class/scsi_host/host0/link_power_management_policy``
+  a read right away ran at 111 MB/s, but after 30 s of idle the next
+  512 MiB read took 57.6 s (9.3 MB/s) and the kernel logged::
 
-    lspci -vv 2>/dev/null | grep -A3 LnkCtl
-    # expect "ASPM L0s L1 Enabled" on any link that supports it
+      ata1.00: exception Emask 0x0 SAct 0x0 SErr 0x50000 action 0x6 frozen
+      ata1: SError: { PHYRdyChg CommWake }
+      ata1.00: failed command: FLUSH CACHE EXT
+      ata1: hard resetting link
+      ata1: SATA link up 3.0 Gbps (SStatus 123 SControl 300)
 
-A rough idle-power sanity check (compare against a pre-change boot if
-one is available, e.g. via a USB power meter on the board's supply):
-drive power/temperature should drop measurably with the array idle
-and the disk spun up.
+  i.e. the link does not come back from the low-power state in time, a
+  command times out and libata resets the link. One disk, one board, one
+  run -- but a timed-out FLUSH is not something to make the default on a
+  NAS.
+
+Do not set a link power management policy on this board. PCIe is unused
+on this SKU, so the ASPM half could not be tested at all and went out
+with it.
 
 Clocksource/clockevent timer upgrade (sched_clock precision)
 ---------------------------------------------------------------
@@ -1902,19 +1914,24 @@ Ported from petoknm/linux@6232ceae55cd; DT change is one
 
 **How to verify**::
 
-    dmesg | grep -i "ls1024a.*timer\|clockevent\|sched_clock"
-    # expect something like:
-    #   clockevents: ls1024a-timer1 added
-    #   LS1024A hardware timer initialized @ 200000000 Hz
-    # and NOT "sched_clock: 32 bits at 250 Hz" (that's the old jiffies-
-    # based sched_clock message this upgrade replaces)
+    dmesg | grep -i "sched_clock\|hardware timer\|clocksource"
+    # expect:
+    #   sched_clock: 32 bits at 200MHz, resolution 5ns, ...
+    #   timer_ls1024a: LS1024A hardware timer initialized @ 200000000 Hz
+    #   clocksource: Switched to clocksource ls1024a-timer2
+    # and NOT "sched_clock: 32 bits at 250 Hz" (the old jiffies-based one)
 
     cat /sys/devices/system/clocksource/clocksource0/current_clocksource
     # expect "ls1024a-timer2", same as before this change
 
-    cat /proc/timer_list | head -20
-    # the "Active clock source" / tick device should both show the
-    # ls1024a-timer1/timer2 names, not "jiffies" anywhere
+    cat /sys/devices/system/clockevents/broadcast/current_device
+    # expect "ls1024a-timer1" (the kernel does not log clockevent names,
+    # so dmesg cannot be used for this)
+
+**Result on hardware (2026-11-10)**: exactly the lines above.
+``ls1024a-timer1`` is the *broadcast* clockevent; each CPU keeps its
+``local_timer`` (twd), so the ``ls1024a-timer`` interrupt count staying
+at 0 during normal operation is expected.
 
 PFE software TSO (GSO batching, no firmware segmentation)
 ------------------------------------------------------------
@@ -1941,10 +1958,12 @@ larger skbs during sendmsg instead of one skb per MSS.
     # (tx-tcp6-segmentation should also read "on")
 
     # Functional + throughput check (replace $PEER with another host on
-    # the LAN); run twice, once with TSO forced off, to see the delta:
-    iperf3 -c $PEER -t 20
+    # the LAN); run twice, once with TSO forced off, to see the delta.
+    # Pin iperf3 to one CPU and read only the summary line -- see the
+    # note below:
+    taskset -c 1 iperf3 -c $PEER -t 20 | tail -4
     ethtool -K eth0 tso off
-    iperf3 -c $PEER -t 20
+    taskset -c 1 iperf3 -c $PEER -t 20 | tail -4
     ethtool -K eth0 tso on
 
     # Correctness check -- capture during the transfer and confirm no
@@ -1957,3 +1976,22 @@ a throughput number at or above the no-TSO run is the expected
 outcome; a *lower* number with TSO on would mean the software
 re-segmentation overhead isn't paying for itself on this CPU and is
 worth revisiting.
+
+**Result on hardware (2026-11-10)**: ``tcp-segmentation-offload: on``,
+transfers run at 330-375 Mbit/s with 0 retransmits. The on/off
+throughput delta has **not** been measured properly yet: an unpinned
+run varies by more than the expected effect (about 330 Mbit/s with the
+sending thread on CPU0, which also does all the network softirq work,
+365-375 with it on CPU1), which is why the commands above pin it.
+
+A note on reading ``iperf3`` on this board: per-second lines showing
+``0.00 Bytes`` for seconds at a time, and a ``-t 20`` test that runs for
+30 s, are **not** a transmit stall. ``iperf3`` (3.16 and later) sends
+from one thread and reports from another, which calls
+``getsockopt(TCP_INFO)`` on the data socket once a second; with the
+reporting thread on CPU0 and the sender on CPU1 it can wait seconds for
+the socket lock the sender keeps re-taking (seen as state ``D`` in
+``__lock_sock``). The data keeps flowing at full rate throughout
+(``tx_bytes`` sampled four times a second never stops; the summary line
+is right). It reproduces on a fresh boot by pinning the two threads
+that way, independent of any change in this section.
