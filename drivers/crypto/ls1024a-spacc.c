@@ -312,6 +312,51 @@ static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+/*
+ * The engine costs a fixed ~165 us per command: MMIO programming, DMA mapping
+ * and the completion round trip.  Below roughly 8 KiB that dominates the AES
+ * work itself, so small requests are cheaper to compute in software.  Measured
+ * on this SoC through AF_ALG (Documentation/arm/ls1024a-spacc-bench.sh,
+ * AES-128-CBC, engine vs OpenSSL's software AES): 8 KiB -> 25.0 vs 22.9 MB/s,
+ * 16 KiB -> 34.2 vs 22.9, 64 KiB -> 47.8 vs 22.2, 1 MiB -> 54.5 vs 22.4.  The
+ * engine side is the same with a 256-bit key; software drops to ~17 MB/s.
+ * An earlier run with the engine forced at 4 KiB gave 5.9 MB/s.
+ */
+#define SPACC_MIN_HW_BYTES	(8 * 1024)
+
+/* Compute @len bytes in software; @iv is updated like the engine path does. */
+static int spacc_sw_crypt(struct spacc_ctx *ctx, struct scatterlist *src,
+			  struct scatterlist *dst, unsigned int len, u8 *iv,
+			  bool is_encrypt, u32 flags)
+{
+	SYNC_SKCIPHER_REQUEST_ON_STACK(subreq, ctx->fallback_tfm);
+	int err;
+
+	skcipher_request_set_sync_tfm(subreq, ctx->fallback_tfm);
+	skcipher_request_set_callback(subreq, flags, NULL, NULL);
+	skcipher_request_set_crypt(subreq, src, dst, len, iv);
+
+	if (is_encrypt)
+		err = crypto_skcipher_encrypt(subreq);
+	else
+		err = crypto_skcipher_decrypt(subreq);
+
+	skcipher_request_zero(subreq);
+	return err;
+}
+
+/* Bytes from the start of @sg that @max_ents DDT entries can describe, up to @len. */
+static unsigned int spacc_sg_span(struct scatterlist *sg, unsigned int len,
+				  unsigned int max_ents)
+{
+	unsigned int span = 0;
+
+	for (; sg && max_ents && span < len; sg = sg_next(sg), max_ents--)
+		span += min(sg->length, len - span);
+
+	return span;
+}
+
 #define SPACC_MAX_CHUNK_BYTES	(128 * 1024)
 
 /* Program the engine for one contiguous chunk and wait for its completion. */
@@ -440,22 +485,27 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 	if (req->cryptlen == 0)
 		goto finalize;
 
-	if (unlikely(ctx->use_fallback))
-		goto fallback;
+	/* AES-192 is not supported by the engine. */
+	if (unlikely(ctx->use_fallback)) {
+		err = spacc_sw_crypt(ctx, req->src, req->dst, req->cryptlen,
+				     req->iv, rctx->is_encrypt, req->base.flags);
+		goto finalize;
+	}
 
 	if (ivsize)
 		memcpy(iv, req->iv, ivsize);
 
 	/*
-	 * The DDT holds at most SPACC_MAX_DDT_ENTS entries, i.e. 64 pages.  Larger
-	 * requests used to be refused with -ENOMEM and dropped to software, so
-	 * split them into 128 KiB pieces and chain the CBC IV between pieces.
+	 * One engine command takes one DDT per direction: SPACC_MAX_DDT_ENTS - 1
+	 * scatterlist entries plus the terminator.  Cut the request into pieces
+	 * that fit, by entry count as well as by size, and chain the CBC IV
+	 * between pieces.  What the engine cannot take is computed in software.
 	 */
 	while (done < req->cryptlen) {
 		struct scatterlist src_chain[2], dst_chain[2];
 		struct scatterlist *src, *dst;
-		unsigned int chunk = min_t(unsigned int, req->cryptlen - done,
-					   SPACC_MAX_CHUNK_BYTES);
+		unsigned int left = req->cryptlen - done;
+		unsigned int chunk;
 
 		src = scatterwalk_ffwd(src_chain, req->src, done);
 		if (req->src == req->dst)
@@ -463,17 +513,39 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 		else
 			dst = scatterwalk_ffwd(dst_chain, req->dst, done);
 
-		/*
-		 * For decryption the next IV is the last ciphertext block of this
-		 * chunk.  With src == dst the engine overwrites it in place, so the
-		 * block has to be saved before the chunk is started.
-		 */
-		if (!rctx->is_encrypt && done + chunk < req->cryptlen && ivsize)
-			scatterwalk_map_and_copy(next_iv, src, chunk - ivsize,
-						 ivsize, 0);
+		chunk = min_t(unsigned int, left, SPACC_MAX_CHUNK_BYTES);
+		chunk = spacc_sg_span(src, chunk, SPACC_MAX_DDT_ENTS - 1);
+		if (dst != src)
+			chunk = spacc_sg_span(dst, chunk, SPACC_MAX_DDT_ENTS - 1);
+		chunk = round_down(chunk, AES_BLOCK_SIZE);
 
-		err = spacc_hw_chunk(spacc, ctx, src, dst, chunk, ivsize, iv,
-				     rctx->is_encrypt);
+		/*
+		 * Less than an engine round trip is worth -- a short tail, or a
+		 * list so fragmented that one DDT covers no more: finish in
+		 * software.  (Whole requests this small never get here.)
+		 */
+		if (chunk < SPACC_MIN_HW_BYTES) {
+			err = -ENOMEM;
+		} else {
+			/*
+			 * For decryption the next IV is the last ciphertext block
+			 * of this chunk.  With src == dst the engine overwrites it
+			 * in place, so save it before the chunk is started.
+			 */
+			if (!rctx->is_encrypt && chunk < left && ivsize)
+				scatterwalk_map_and_copy(next_iv, src,
+							 chunk - ivsize, ivsize, 0);
+
+			err = spacc_hw_chunk(spacc, ctx, src, dst, chunk, ivsize,
+					     iv, rctx->is_encrypt);
+		}
+
+		/* -ENOMEM: nothing was started (too small, or no mapping/DDT). */
+		if (err == -ENOMEM) {
+			err = spacc_sw_crypt(ctx, src, dst, left, iv,
+					     rctx->is_encrypt, req->base.flags);
+			break;
+		}
 		if (err)
 			break;
 
@@ -497,23 +569,6 @@ finalize:
 	crypto_finalize_skcipher_request(ce, req, err);
 	local_bh_enable();
 	return 0;
-
-fallback:
-	if (ctx->fallback_tfm) {
-		SYNC_SKCIPHER_REQUEST_ON_STACK(subreq, ctx->fallback_tfm);
-
-		skcipher_request_set_sync_tfm(subreq, ctx->fallback_tfm);
-		skcipher_request_set_callback(subreq, req->base.flags, NULL, NULL);
-		skcipher_request_set_crypt(subreq, req->src, req->dst, req->cryptlen, req->iv);
-		if (rctx->is_encrypt)
-			err = crypto_skcipher_encrypt(subreq);
-		else
-			err = crypto_skcipher_decrypt(subreq);
-		skcipher_request_zero(subreq);
-	} else {
-		err = -EINVAL;
-	}
-	goto finalize;
 }
 
 static int spacc_cra_init(struct crypto_skcipher *tfm)
@@ -579,38 +634,6 @@ static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
 	return 0;
 }
 
-/*
- * The engine costs a fixed ~165 us per command: MMIO programming, DMA mapping
- * and the completion round trip.  Below roughly 8 KiB that dominates the AES
- * work itself, so small requests are cheaper to compute in software.  Measured
- * on this SoC through AF_ALG (Documentation/arm/ls1024a-spacc-bench.sh,
- * AES-128-CBC, engine vs OpenSSL's software AES): 8 KiB -> 25.0 vs 22.9 MB/s,
- * 16 KiB -> 34.2 vs 22.9, 64 KiB -> 47.8 vs 22.2, 1 MiB -> 54.5 vs 22.4.  The
- * engine side is the same with a 256-bit key; software drops to ~17 MB/s.
- * An earlier run with the engine forced at 4 KiB gave 5.9 MB/s.
- */
-#define SPACC_MIN_HW_BYTES	(8 * 1024)
-
-static int spacc_sw_fallback(struct skcipher_request *req,
-			     struct spacc_ctx *ctx, bool is_encrypt)
-{
-	SYNC_SKCIPHER_REQUEST_ON_STACK(subreq, ctx->fallback_tfm);
-	int err;
-
-	skcipher_request_set_sync_tfm(subreq, ctx->fallback_tfm);
-	skcipher_request_set_callback(subreq, req->base.flags, NULL, NULL);
-	skcipher_request_set_crypt(subreq, req->src, req->dst, req->cryptlen,
-				   req->iv);
-
-	if (is_encrypt)
-		err = crypto_skcipher_encrypt(subreq);
-	else
-		err = crypto_skcipher_decrypt(subreq);
-
-	skcipher_request_zero(subreq);
-	return err;
-}
-
 static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
@@ -630,8 +653,9 @@ static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
 	 * completion pending in the caller's crypto_wait, which makes its next
 	 * asynchronous request "finish" before the engine has done it.
 	 */
-	if (req->cryptlen < SPACC_MIN_HW_BYTES && ctx->fallback_tfm)
-		return spacc_sw_fallback(req, ctx, is_encrypt);
+	if (req->cryptlen < SPACC_MIN_HW_BYTES)
+		return spacc_sw_crypt(ctx, req->src, req->dst, req->cryptlen,
+				      req->iv, is_encrypt, req->base.flags);
 
 	rctx->is_encrypt = is_encrypt;
 
