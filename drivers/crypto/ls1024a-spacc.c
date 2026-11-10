@@ -273,6 +273,7 @@ static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 {
 	struct spacc_dev *spacc = dev_id;
 	u32 stat = readl(spacc->pdu_regs + SPACC_REG_IRQ_STAT);
+	u32 status, code;
 
 	if (!(stat & (SPA_IRQ_STAT_STAT_MASK | SPA_IRQ_STAT_CMD)))
 		return IRQ_NONE;
@@ -286,18 +287,26 @@ static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 			writel(cstat, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
 	}
 
-	/* Check if FIFO has status */
-	if (!(readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT) & SPA_FIFO_STAT_EMPTY)) {
-		/* Pop status from FIFO */
-		writel(~0, spacc->crypto_regs + SPACC_REG_STAT_POP);
-		u32 status = readl(spacc->crypto_regs + SPACC_REG_STATUS);
-		u32 code = (status & SPA_STATUS_RES_CODE_MASK) >> SPA_STATUS_RES_CODE_OFFSET;
+	/*
+	 * A request is finished only when its status word is in the STATUS FIFO.
+	 * An interrupt with the FIFO still empty (e.g. the command-FIFO one) says
+	 * nothing about completion: reporting success here let the caller unmap
+	 * the buffers and free/reuse the DDT while the engine was still running,
+	 * and left the real status to be taken for the next request's.
+	 */
+	if (readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT) & SPA_FIFO_STAT_EMPTY)
+		return IRQ_HANDLED;
 
-		spacc->req_err = spacc_status_to_errno(code);
-	} else {
-		spacc->req_err = 0;
-	}
+	/* Pop status from FIFO */
+	writel(~0, spacc->crypto_regs + SPACC_REG_STAT_POP);
+	status = readl(spacc->crypto_regs + SPACC_REG_STATUS);
+	code = (status & SPA_STATUS_RES_CODE_MASK) >> SPA_STATUS_RES_CODE_OFFSET;
+	if (code != SPA_STATUS_OK)
+		dev_warn_ratelimited(spacc->dev,
+				     "SPACC: request failed, STATUS=0x%08x (code %u)\n",
+				     status, code);
 
+	spacc->req_err = spacc_status_to_errno(code);
 	complete(&spacc->done);
 
 	return IRQ_HANDLED;
@@ -574,8 +583,11 @@ static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
  * The engine costs a fixed ~165 us per command: MMIO programming, DMA mapping
  * and the completion round trip.  Below roughly 8 KiB that dominates the AES
  * work itself, so small requests are cheaper to compute in software.  Measured
- * on this SoC: 4 KiB -> 5.9 MB/s on the engine vs 22.7 MB/s in software,
- * 8 KiB -> 30.4 vs 22.8, 16 KiB -> 44 vs 22.8.
+ * on this SoC through AF_ALG (Documentation/arm/ls1024a-spacc-bench.sh,
+ * AES-128-CBC, engine vs OpenSSL's software AES): 8 KiB -> 25.0 vs 22.9 MB/s,
+ * 16 KiB -> 34.2 vs 22.9, 64 KiB -> 47.8 vs 22.2, 1 MiB -> 54.5 vs 22.4.  The
+ * engine side is the same with a 256-bit key; software drops to ~17 MB/s.
+ * An earlier run with the engine forced at 4 KiB gave 5.9 MB/s.
  */
 #define SPACC_MIN_HW_BYTES	(8 * 1024)
 
@@ -812,9 +824,12 @@ static int spacc_probe(struct platform_device *pdev)
 	if (spacc->crypto_regs != spacc->pdu_regs)
 		writel(~0, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
 
-	/* Set IRQ threshold to 1 and enable interrupts */
+	/*
+	 * Set IRQ threshold to 1 and enable the status interrupt only: the
+	 * command-FIFO interrupt carries no completion information.
+	 */
 	writel(1 << SPA_IRQ_CTRL_STAT_CNT_OFFSET, spacc->crypto_regs + SPACC_REG_IRQ_CTRL);
-	writel(SPA_IRQ_EN_CMD0_EN | SPA_IRQ_EN_STAT_EN | SPA_IRQ_EN_GLBL_EN,
+	writel(SPA_IRQ_EN_STAT_EN | SPA_IRQ_EN_GLBL_EN,
 	       spacc->pdu_regs + SPACC_REG_IRQ_EN);
 
 	/* Initialize crypto engine */
