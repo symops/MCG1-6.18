@@ -302,6 +302,11 @@ int pfe_firmware_init(struct pfe *pfe)
 	pfe->tmu_dmem_sh = get_elf_section(tmu_fw, ".dmem_sh");
 	dev_info(pfe->dev, "tmu firmware loaded %#lx\n", pfe->tmu_dmem_sh);
 
+	/* For the tmu_chip_rev test switch only; not finding it is not fatal. */
+	rc = get_elf_symbol_addr(tmu_fw, "g_qm_context");
+	pfe->tmu_qm_context_dmem = rc > 0 ? rc : 0;
+	dev_info(pfe->dev, "tmu g_qm_context at %#lx\n", pfe->tmu_qm_context_dmem);
+
 	rc = pfe_ctrl_set_mailbox_addrs(pfe, tmu_fw, TMU0_ID, TMU_MAX_ID);
 	if (rc < 0) {
 		dev_err(pfe->dev, "failed to locate tmu mailbox symbols\n");

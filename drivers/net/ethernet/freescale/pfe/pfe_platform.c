@@ -42,11 +42,15 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/sysfs.h>
+#include <linux/workqueue.h>
 
 #include "pfe_mod.h"
 #include "pfe_ctrl.h"
@@ -58,6 +62,103 @@
 #include "pfe_hw_lib.h"
 
 struct pfe *g_pfe;
+
+/*
+ * TEST SWITCH (not for release): the TMU firmware's "chip_revision".
+ *
+ * g_qm_context.chip_revision (byte +3 of the TMU PE's g_qm_context) gates
+ * one test in the firmware's M_QM_process_packet() for the three GEM TMUs:
+ *
+ *	if (chip_revision != 0 && !(port_ready & 1))
+ *		return;
+ *
+ * The firmware clears the whole context when it starts and never writes
+ * the byte itself, and this driver has never written it either, so the GEM
+ * TMUs have always run their revision-0 path here (dequeue without looking
+ * at the port-ready bit) although the SoC is revision 1. Whether that
+ * matters on hardware is unknown; this parameter exists to find out.
+ *
+ *	echo "1 30" > /sys/module/fsl_ls1024a_pfe/parameters/tmu_chip_rev
+ *
+ * writes revision 1 to TMU0..TMU2 and puts 0 back by itself after 30 s
+ * (so a transmit stall cannot lock out a remote session); "1" alone or
+ * "1 0" leaves it set, "0" restores the default at once. Reading the
+ * parameter shows the byte as each of the three PEs has it now. Nothing
+ * is written unless the parameter is.
+ */
+#define TMU_QM_CONTEXT_CHIP_REVISION_OFF	3
+
+static void pfe_tmu_chip_rev_write(u8 rev)
+{
+	struct pfe *pfe = g_pfe;
+	int id;
+
+	mutex_lock(&pfe->ctrl.mutex);
+	for (id = TMU0_ID; id <= TMU2_ID; id++)
+		pe_dmem_write(id, rev,
+			      pfe->tmu_qm_context_dmem + TMU_QM_CONTEXT_CHIP_REVISION_OFF, 1);
+	mutex_unlock(&pfe->ctrl.mutex);
+}
+
+static void pfe_tmu_chip_rev_revert(struct work_struct *work)
+{
+	if (!g_pfe)
+		return;
+
+	pfe_tmu_chip_rev_write(0);
+	pr_info("pfe: tmu_chip_rev: timer expired, TMU0-2 chip_revision back to 0\n");
+}
+
+static DECLARE_DELAYED_WORK(pfe_tmu_chip_rev_work, pfe_tmu_chip_rev_revert);
+
+static int pfe_tmu_chip_rev_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int rev, secs = 0;
+
+	if (!g_pfe || !g_pfe->tmu_qm_context_dmem)
+		return -ENODEV;
+
+	if (sscanf(val, "%u %u", &rev, &secs) < 1 || rev > 15 || secs > 3600)
+		return -EINVAL;
+
+	cancel_delayed_work_sync(&pfe_tmu_chip_rev_work);
+	pfe_tmu_chip_rev_write(rev);
+
+	if (rev && secs) {
+		schedule_delayed_work(&pfe_tmu_chip_rev_work, secs * HZ);
+		pr_info("pfe: tmu_chip_rev: TMU0-2 chip_revision = %u for %u s\n", rev, secs);
+	} else {
+		pr_info("pfe: tmu_chip_rev: TMU0-2 chip_revision = %u\n", rev);
+	}
+
+	return 0;
+}
+
+static int pfe_tmu_chip_rev_get(char *buf, const struct kernel_param *kp)
+{
+	struct pfe *pfe = g_pfe;
+	u32 v[3];
+	int id;
+
+	if (!pfe || !pfe->tmu_qm_context_dmem)
+		return -ENODEV;
+
+	mutex_lock(&pfe->ctrl.mutex);
+	for (id = TMU0_ID; id <= TMU2_ID; id++)
+		v[id - TMU0_ID] = pe_dmem_read(id, pfe->tmu_qm_context_dmem +
+					       TMU_QM_CONTEXT_CHIP_REVISION_OFF, 1);
+	mutex_unlock(&pfe->ctrl.mutex);
+
+	return sysfs_emit(buf, "%u %u %u\n", v[0], v[1], v[2]);
+}
+
+static const struct kernel_param_ops pfe_tmu_chip_rev_ops = {
+	.set = pfe_tmu_chip_rev_set,
+	.get = pfe_tmu_chip_rev_get,
+};
+module_param_cb(tmu_chip_rev, &pfe_tmu_chip_rev_ops, NULL, 0600);
+MODULE_PARM_DESC(tmu_chip_rev,
+		 "TEST: \"<rev> [seconds]\" writes chip_revision to the GEM TMU firmware, optionally reverting to 0 after <seconds>");
 
 static int pfe_platform_probe(struct platform_device *pdev)
 {
@@ -298,6 +399,7 @@ static void pfe_platform_remove(struct platform_device *pdev)
 {
 	struct pfe *pfe = platform_get_drvdata(pdev);
 
+	cancel_delayed_work_sync(&pfe_tmu_chip_rev_work);
 	pfe_eth_exit(pfe);
 	pfe_ctrl_exit(pfe);
 	pfe_firmware_exit(pfe);

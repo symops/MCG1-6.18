@@ -108,6 +108,13 @@ struct pfe {
 	 */
 	unsigned long class_phy_port_dmem;
 
+	/*
+	 * TMU PE DMEM address of the firmware's "g_qm_context" (0 if the
+	 * symbol was not found). Used only by the tmu_chip_rev test switch
+	 * in pfe_platform.c.
+	 */
+	unsigned long tmu_qm_context_dmem;
+
 	struct pfe_hif hif;
 
 	/* Control-message channel to the PE firmware (Stage P6) --
