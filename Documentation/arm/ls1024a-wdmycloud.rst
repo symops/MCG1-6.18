@@ -1978,11 +1978,11 @@ re-segmentation overhead isn't paying for itself on this CPU and is
 worth revisiting.
 
 **Result on hardware (2026-11-10)**: ``tcp-segmentation-offload: on``,
-transfers run at 330-375 Mbit/s with 0 retransmits. The on/off
-throughput delta has **not** been measured properly yet: an unpinned
-run varies by more than the expected effect (about 330 Mbit/s with the
-sending thread on CPU0, which also does all the network softirq work,
-365-375 with it on CPU1), which is why the commands above pin it.
+0 retransmits. Pinned to CPU1 (``ls1024a-verify-pending-fixes.sh``,
+one 10 s run each): **376 Mbit/s with TSO on, 318 Mbit/s with it off**,
+about +18%. The pinning matters: an unpinned run varies by as much as
+that on its own (about 330 Mbit/s with the sending thread on CPU0,
+which also does all the network softirq work, 365-375 with it on CPU1).
 
 A note on reading ``iperf3`` on this board: per-second lines showing
 ``0.00 Bytes`` for seconds at a time, and a ``-t 20`` test that runs for
