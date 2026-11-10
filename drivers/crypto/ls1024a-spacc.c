@@ -583,8 +583,11 @@ static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
  * The engine costs a fixed ~165 us per command: MMIO programming, DMA mapping
  * and the completion round trip.  Below roughly 8 KiB that dominates the AES
  * work itself, so small requests are cheaper to compute in software.  Measured
- * on this SoC: 4 KiB -> 5.9 MB/s on the engine vs 22.7 MB/s in software,
- * 8 KiB -> 30.4 vs 22.8, 16 KiB -> 44 vs 22.8.
+ * on this SoC through AF_ALG (Documentation/arm/ls1024a-spacc-bench.sh,
+ * AES-128-CBC, engine vs OpenSSL's software AES): 8 KiB -> 25.0 vs 22.9 MB/s,
+ * 16 KiB -> 34.2 vs 22.9, 64 KiB -> 47.8 vs 22.2, 1 MiB -> 54.5 vs 22.4.  The
+ * engine side is the same with a 256-bit key; software drops to ~17 MB/s.
+ * An earlier run with the engine forced at 4 KiB gave 5.9 MB/s.
  */
 #define SPACC_MIN_HW_BYTES	(8 * 1024)
 
