@@ -1811,3 +1811,188 @@ Unlike the 3.2.26 port (which needed a matched-era GCC 4.7 + binutils
 modern host toolchain (GCC 13, binutils 2.42) already present in this
 environment -- no compiler-version workarounds were needed anywhere
 in this port.
+
+Three fixes/features ported from petoknm/linux, and one that was withdrawn
+===========================================================================
+
+Four items were ported together; all four were then run on the real
+board on 2026-11-10 (kernel ``6.18.60+`` built from this branch,
+``Documentation/arm/ls1024a-verify-pending-fixes.sh`` plus the manual
+checks quoted below). Three hold up; the SATA/PCIe link power saving
+does not and was taken out again -- its section is kept as a record of
+why.
+
+CPU1 hotplug/wakeup fix
+-----------------------
+
+``arch/arm/mach-ls1024a/platsmp.c`` had three latent bugs in its
+``CONFIG_HOTPLUG_CPU`` path (``ls1024a_cpu_die()``/``ls1024a_cpu_kill()``):
+the SCU virtual mapping was ``iounmap()``'d right after
+``smp_prepare_cpus()`` (a one-time boot call), leaving nothing for a
+*later* hotplug cycle to drive SCU power-mode transitions with;
+``cpu_kill()`` cut CPU1's clock and asserted reset immediately, with no
+wait for the core to actually reach standby first (no poll of
+``A9DP_PWR_STAT``, offset 0x28 bit 1); and ``boot_secondary()`` never
+re-installed the reset trampoline / MPU debug reset / clock-pulse
+sequence on a *second* bring-up, only on the first one from
+``smp_prepare_cpus()``. None of this fires with ``CONFIG_HOTPLUG_CPU``
+off (the previous defconfig), so the bug was silent dead code -- this
+is plausibly the "CPU wakeup" issue the port had been meaning to chase.
+Fix ported from petoknm/linux@05231f085a8e; ``CONFIG_HOTPLUG_CPU=y``
+added to ``ls1024a_defconfig`` so the fixed path is actually reachable.
+
+**How to verify**: offline and re-online CPU1 a few times in a row and
+confirm it actually comes back (previously this either hung or left
+CPU1 permanently offline)::
+
+    for i in 1 2 3 4 5; do
+        echo 0 > /sys/devices/system/cpu/cpu1/online
+        sleep 1
+        echo 1 > /sys/devices/system/cpu/cpu1/online
+        sleep 1
+        grep ^ /sys/devices/system/cpu/cpu1/online
+    done
+
+Every line should print ``1``; ``dmesg`` should show no
+"CPU%d did not reach standby" warning and no hang.
+
+**Result on hardware (2026-11-10)**: five offline/online cycles pass.
+After a cycle CPU1 computes at the same speed as CPU0 (``taskset -c N
+openssl speed``: 2798 vs 2794 ops), its local timer (``twd``) keeps
+counting, and a process on CPU0 wakes one on CPU1 in 0.14 ms median,
+4.1 ms worst over 300 tries.
+
+PCIe ASPM / SATA ALPM power saving -- withdrawn
+-------------------------------------------------
+
+Ported from petoknm/linux@159ddf714e69 as ``AHCI_HFLAG_YES_ALPM`` for
+``"fsl,ls1024a-sata"`` in ``drivers/ata/ahci_platform.c`` plus
+``CONFIG_SATA_MOBILE_LPM_POLICY=3`` and ``CONFIG_PCIEASPM_POWERSAVE=y``.
+**Removed again after the hardware test**, for two reasons:
+
+- As ported it did nothing. ``CONFIG_SATA_MOBILE_LPM_POLICY`` is applied
+  by ``ahci_update_initial_lpm_policy()``, which exists only in the PCI
+  driver (``drivers/ata/ahci.c``); ``ahci_platform`` never sets a target
+  policy, so the board kept reporting ``keep_firmware_settings``.
+- Turning the policy on by hand breaks the link. With
+  ``echo med_power_with_dipm > /sys/class/scsi_host/host0/link_power_management_policy``
+  a read right away ran at 111 MB/s, but after 30 s of idle the next
+  512 MiB read took 57.6 s (9.3 MB/s) and the kernel logged::
+
+      ata1.00: exception Emask 0x0 SAct 0x0 SErr 0x50000 action 0x6 frozen
+      ata1: SError: { PHYRdyChg CommWake }
+      ata1.00: failed command: FLUSH CACHE EXT
+      ata1: hard resetting link
+      ata1: SATA link up 3.0 Gbps (SStatus 123 SControl 300)
+
+  i.e. the link does not come back from the low-power state in time, a
+  command times out and libata resets the link. One disk, one board, one
+  run -- but a timed-out FLUSH is not something to make the default on a
+  NAS.
+
+Do not set a link power management policy on this board. PCIe is unused
+on this SKU, so the ASPM half could not be tested at all and went out
+with it.
+
+Clocksource/clockevent timer upgrade (sched_clock precision)
+---------------------------------------------------------------
+
+The existing ``drivers/clocksource/timer-ls1024a.c`` (documented
+earlier in this file, "Ping RTT quantized to 4ms") only ever registered
+a *clocksource* -- ``sched_clock()`` itself, and the clockevent/tick
+source, both still ran off the coarse jiffies/broadcast-timer path.
+Replaced with a combined clocksource (Timer 2, same free-running
+counter, same register layout as before) **and** clockevent (Timer 1,
+IRQ ``GIC_SPI 56``, periodic+oneshot) driver, plus
+``sched_clock_register()`` wired up directly -- registered via
+``TIMER_OF_DECLARE`` so it initializes during ``time_init()``, early
+enough for ``sched_clock()`` precision to actually matter from boot.
+Ported from petoknm/linux@6232ceae55cd; DT change is one
+``interrupts`` property added to the existing ``timer@90450000`` node
+(the old, now-superseded child ``clocksource`` node was removed).
+``CONFIG_LS1024A_CLKSRC`` was renamed ``CONFIG_LS1024A_TIMER`` to match.
+
+**How to verify**::
+
+    dmesg | grep -i "sched_clock\|hardware timer\|clocksource"
+    # expect:
+    #   sched_clock: 32 bits at 200MHz, resolution 5ns, ...
+    #   timer_ls1024a: LS1024A hardware timer initialized @ 200000000 Hz
+    #   clocksource: Switched to clocksource ls1024a-timer2
+    # and NOT "sched_clock: 32 bits at 250 Hz" (the old jiffies-based one)
+
+    cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+    # expect "ls1024a-timer2", same as before this change
+
+    cat /sys/devices/system/clockevents/broadcast/current_device
+    # expect "ls1024a-timer1" (the kernel does not log clockevent names,
+    # so dmesg cannot be used for this)
+
+**Result on hardware (2026-11-10)**: exactly the lines above.
+``ls1024a-timer1`` is the *broadcast* clockevent; each CPU keeps its
+``local_timer`` (twd), so the ``ls1024a-timer`` interrupt count staying
+at 0 during normal operation is expected.
+
+PFE software TSO (GSO batching, no firmware segmentation)
+------------------------------------------------------------
+
+See ``drivers/net/ethernet/freescale/pfe/pfe_eth.c``: GEM netdevs now
+advertise ``NETIF_F_TSO``/``_TSO6``/``_SG``, and
+``pfe_eth_send_packet()`` re-segments any resulting GSO superskb with
+``skb_gso_segment()`` before handing each real packet to the existing,
+unchanged ``pfe_eth_send_one()`` single-descriptor path. This is
+**not** real hardware TSO: the firmware's own hardware TSO submission
+protocol (``struct hif_tso_hdr``, ``HIF_CTRL_TX_TSO``/``_TSO6``/
+``_TSO_END`` in ``pfe_hif.h``) was deliberately left unused, because
+its exact wire semantics were never confirmed anywhere accessible
+without either the paused PFE/ISA investigation or the confidential
+3.2.26 vendor source -- guessing wrong there risks silently corrupting
+TCP streams, not an acceptable trade for a performance optimization.
+The software path is still a real, safe win: TCP composes far fewer,
+larger skbs during sendmsg instead of one skb per MSS.
+
+**How to verify**::
+
+    ethtool -k eth0 | grep -i "tcp-segmentation\|generic-segmentation"
+    # tcp-segmentation-offload: on
+    # (tx-tcp6-segmentation should also read "on")
+
+    # Functional + throughput check (replace $PEER with another host on
+    # the LAN); run twice, once with TSO forced off, to see the delta.
+    # Pin iperf3 to one CPU and read only the summary line -- see the
+    # note below:
+    taskset -c 1 iperf3 -c $PEER -t 20 | tail -4
+    ethtool -K eth0 tso off
+    taskset -c 1 iperf3 -c $PEER -t 20 | tail -4
+    ethtool -K eth0 tso on
+
+    # Correctness check -- capture during the transfer and confirm no
+    # retransmits/out-of-order segments show up (would indicate a bad
+    # segmentation, not expected here since this is software GSO):
+    tcpdump -i eth0 -n 'tcp' -c 2000 -w /tmp/pfe-tso-test.pcap
+
+A clean capture (no retransmissions attributable to the driver) plus
+a throughput number at or above the no-TSO run is the expected
+outcome; a *lower* number with TSO on would mean the software
+re-segmentation overhead isn't paying for itself on this CPU and is
+worth revisiting.
+
+**Result on hardware (2026-11-10)**: ``tcp-segmentation-offload: on``,
+0 retransmits. Pinned to CPU1 (``ls1024a-verify-pending-fixes.sh``,
+one 10 s run each): **376 Mbit/s with TSO on, 318 Mbit/s with it off**,
+about +18%; repeated on the build merged with main: 383 vs 325, the
+same +18%. The pinning matters: an unpinned run varies by as much as
+that on its own (about 330 Mbit/s with the sending thread on CPU0,
+which also does all the network softirq work, 365-375 with it on CPU1).
+
+A note on reading ``iperf3`` on this board: per-second lines showing
+``0.00 Bytes`` for seconds at a time, and a ``-t 20`` test that runs for
+30 s, are **not** a transmit stall. ``iperf3`` (3.16 and later) sends
+from one thread and reports from another, which calls
+``getsockopt(TCP_INFO)`` on the data socket once a second; with the
+reporting thread on CPU0 and the sender on CPU1 it can wait seconds for
+the socket lock the sender keeps re-taking (seen as state ``D`` in
+``__lock_sock``). The data keeps flowing at full rate throughout
+(``tx_bytes`` sampled four times a second never stops; the summary line
+is right). It reproduces on a fresh boot by pinning the two threads
+that way, independent of any change in this section.

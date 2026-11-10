@@ -169,20 +169,19 @@
 			compatible = "fsl,ls1024a-timer",
 				     "syscon", "simple-mfd";
 			reg = <0x90450000 0x100>;
+			/*
+			 * Timer 1's interrupt, consumed by the clockevent
+			 * half of drivers/clocksource/timer-ls1024a.c; Timer 2
+			 * (same driver, same register block) is a free-running
+			 * counter polled as the clocksource/sched_clock source
+			 * and needs no interrupt.
+			 */
+			interrupts = <GIC_SPI 56 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkcore LS1024A_CLK_RTC_TIM>;
 			resets = <&clkreset LS1024A_AXI_RTC_TIM_RST>;
 			watchdog: watchdog {
 				compatible = "fsl,ls1024a-wdt";
 				fsl,clkcore = <&clkcore>;
-			};
-
-			/*
-			 * A second, independent free-running counter in this
-			 * same register block (drivers/clocksource/timer-ls1024a.c),
-			 * used as a proper clocksource -- see that driver for why.
-			 */
-			clocksource: clocksource {
-				compatible = "fsl,ls1024a-clksrc";
 			};
 		};
 
