@@ -273,6 +273,7 @@ static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 {
 	struct spacc_dev *spacc = dev_id;
 	u32 stat = readl(spacc->pdu_regs + SPACC_REG_IRQ_STAT);
+	u32 status, code;
 
 	if (!(stat & (SPA_IRQ_STAT_STAT_MASK | SPA_IRQ_STAT_CMD)))
 		return IRQ_NONE;
@@ -286,18 +287,26 @@ static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 			writel(cstat, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
 	}
 
-	/* Check if FIFO has status */
-	if (!(readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT) & SPA_FIFO_STAT_EMPTY)) {
-		/* Pop status from FIFO */
-		writel(~0, spacc->crypto_regs + SPACC_REG_STAT_POP);
-		u32 status = readl(spacc->crypto_regs + SPACC_REG_STATUS);
-		u32 code = (status & SPA_STATUS_RES_CODE_MASK) >> SPA_STATUS_RES_CODE_OFFSET;
+	/*
+	 * A request is finished only when its status word is in the STATUS FIFO.
+	 * An interrupt with the FIFO still empty (e.g. the command-FIFO one) says
+	 * nothing about completion: reporting success here let the caller unmap
+	 * the buffers and free/reuse the DDT while the engine was still running,
+	 * and left the real status to be taken for the next request's.
+	 */
+	if (readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT) & SPA_FIFO_STAT_EMPTY)
+		return IRQ_HANDLED;
 
-		spacc->req_err = spacc_status_to_errno(code);
-	} else {
-		spacc->req_err = 0;
-	}
+	/* Pop status from FIFO */
+	writel(~0, spacc->crypto_regs + SPACC_REG_STAT_POP);
+	status = readl(spacc->crypto_regs + SPACC_REG_STATUS);
+	code = (status & SPA_STATUS_RES_CODE_MASK) >> SPA_STATUS_RES_CODE_OFFSET;
+	if (code != SPA_STATUS_OK)
+		dev_warn_ratelimited(spacc->dev,
+				     "SPACC: request failed, STATUS=0x%08x (code %u)\n",
+				     status, code);
 
+	spacc->req_err = spacc_status_to_errno(code);
 	complete(&spacc->done);
 
 	return IRQ_HANDLED;
@@ -812,9 +821,12 @@ static int spacc_probe(struct platform_device *pdev)
 	if (spacc->crypto_regs != spacc->pdu_regs)
 		writel(~0, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
 
-	/* Set IRQ threshold to 1 and enable interrupts */
+	/*
+	 * Set IRQ threshold to 1 and enable the status interrupt only: the
+	 * command-FIFO interrupt carries no completion information.
+	 */
 	writel(1 << SPA_IRQ_CTRL_STAT_CNT_OFFSET, spacc->crypto_regs + SPACC_REG_IRQ_CTRL);
-	writel(SPA_IRQ_EN_CMD0_EN | SPA_IRQ_EN_STAT_EN | SPA_IRQ_EN_GLBL_EN,
+	writel(SPA_IRQ_EN_STAT_EN | SPA_IRQ_EN_GLBL_EN,
 	       spacc->pdu_regs + SPACC_REG_IRQ_EN);
 
 	/* Initialize crypto engine */
