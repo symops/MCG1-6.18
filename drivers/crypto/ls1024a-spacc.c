@@ -623,12 +623,15 @@ static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
 	if (req->cryptlen % AES_BLOCK_SIZE)
 		return -EINVAL;
 
-	if (req->cryptlen < SPACC_MIN_HW_BYTES && ctx->fallback_tfm) {
-		int err = spacc_sw_fallback(req, ctx, is_encrypt);
-
-		skcipher_request_complete(req, err);
-		return err;
-	}
+	/*
+	 * Synchronous software path: the result is the return value.  The
+	 * completion callback must not be called as well -- it belongs to
+	 * requests that returned -EINPROGRESS, and a stray call leaves a
+	 * completion pending in the caller's crypto_wait, which makes its next
+	 * asynchronous request "finish" before the engine has done it.
+	 */
+	if (req->cryptlen < SPACC_MIN_HW_BYTES && ctx->fallback_tfm)
+		return spacc_sw_fallback(req, ctx, is_encrypt);
 
 	rctx->is_encrypt = is_encrypt;
 
