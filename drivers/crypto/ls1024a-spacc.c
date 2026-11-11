@@ -140,7 +140,8 @@ struct spacc_dev {
 	int req_err;
 	unsigned int next_ctx;
 	bool is_spacc3;
-	struct spacc_alg algs[2];
+	/* ecb(aes), cbc(aes) and ctr(aes) */
+	struct spacc_alg algs[3];
 };
 
 struct spacc_ctx {
