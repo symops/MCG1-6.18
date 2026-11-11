@@ -152,6 +152,8 @@ struct spacc_ctx {
 	unsigned int keylen;
 	bool use_fallback;
 	bool is_ctr;
+	/* serializes lazy fallback allocation and rekeying */
+	struct mutex lock;
 };
 
 struct spacc_reqctx {
@@ -567,11 +569,17 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 
 		done += chunk;
 
-		/* Next chunk starts with the ciphertext block just produced. */
-		if (done < req->cryptlen && ivsize) {
-			if (ctx->is_ctr)
-				spacc_ctr_advance(iv, chunk);
-			else if (rctx->is_encrypt)
+		/*
+		 * ctr(aes) increments the request IV for every counter block it
+		 * consumes, the last one included.  Match that for the hardware
+		 * path as well, so the IV left behind does not depend on which
+		 * path the request took.
+		 */
+		if (ctx->is_ctr) {
+			spacc_ctr_advance(iv, chunk);
+		} else if (done < req->cryptlen && ivsize) {
+			/* Next chunk starts with the ciphertext block just produced. */
+			if (rctx->is_encrypt)
 				scatterwalk_map_and_copy(iv, dst, chunk - ivsize,
 							 ivsize, 0);
 			else
@@ -599,6 +607,7 @@ static int spacc_cra_init(struct crypto_skcipher *tfm)
 	ctx->spacc = spacc_alg->spacc;
 	ctx->ctrl_default = spacc_alg->ctrl_default;
 	ctx->is_ctr = spacc_alg->is_ctr;
+	mutex_init(&ctx->lock);
 
 	/*
 	 * CTR has no software fallback: allocating one here would ask the crypto
@@ -634,10 +643,11 @@ static void spacc_cra_exit(struct crypto_skcipher *tfm)
 		ctx->fallback_tfm = NULL;
 	}
 	memzero_explicit(ctx->key, sizeof(ctx->key));
+	mutex_destroy(&ctx->lock);
 }
 
-static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
-			    unsigned int keylen)
+static int spacc_aes_setkey_locked(struct crypto_skcipher *tfm, const u8 *key,
+				   unsigned int keylen)
 {
 	struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
 
@@ -682,6 +692,23 @@ static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
 	}
 
 	return 0;
+}
+
+static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
+			    unsigned int keylen)
+{
+	struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
+	int err;
+
+	/*
+	 * Callers may rekey concurrently; the key, the fallback key and the
+	 * lazy fallback allocation are all shared state of this transform.
+	 */
+	mutex_lock(&ctx->lock);
+	err = spacc_aes_setkey_locked(tfm, key, keylen);
+	mutex_unlock(&ctx->lock);
+
+	return err;
 }
 
 static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
