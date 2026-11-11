@@ -552,10 +552,12 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 					     iv, rctx->is_encrypt);
 		}
 
-		/* -ENOMEM: nothing was started (too small, or no mapping/DDT). */
+		/*
+		 * -ENOMEM: nothing was started (too small, or no mapping/DDT).
+		 * iv already points at this position -- every completed chunk
+		 * advanced it -- so the software part continues from here.
+		 */
 		if (err == -ENOMEM) {
-			if (ctx->is_ctr)
-				spacc_ctr_advance(iv, done);
 			err = spacc_sw_crypt(ctx, src, dst, left, iv,
 					     rctx->is_encrypt, req->base.flags);
 			break;
@@ -691,8 +693,17 @@ static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
 	if (req->cryptlen == 0)
 		return 0;
 
-	if (req->cryptlen % AES_BLOCK_SIZE)
-		return -EINVAL;
+	/*
+	 * CTR is a stream mode and the algorithm advertises blocksize 1, so a
+	 * length that is not a multiple of 16 is legitimate.  The engine works
+	 * in blocks, therefore such a request is computed in software.
+	 */
+	if (req->cryptlen % AES_BLOCK_SIZE) {
+		if (!ctx->is_ctr)
+			return -EINVAL;
+		return spacc_sw_crypt(ctx, req->src, req->dst, req->cryptlen,
+				      req->iv, is_encrypt, req->base.flags);
+	}
 
 	/*
 	 * Synchronous software path: the result is the return value.  The
