@@ -98,6 +98,7 @@
 #define SPA_CTRL_CIPH_ALG_AES		0x02
 #define SPA_CTRL_CIPH_MODE_ECB		(0x00 << 8)
 #define SPA_CTRL_CIPH_MODE_CBC		(0x01 << 8)
+#define SPA_CTRL_CIPH_MODE_CTR		(0x02 << 8)
 #define SPA_CTRL_CTX_IDX		16
 #define SPA_CTRL_ENCRYPT_IDX		24
 #define SPA_CTRL_KEY_EXP		29
@@ -118,6 +119,7 @@ struct spacc_alg {
 	struct skcipher_engine_alg alg;
 	struct spacc_dev *spacc;
 	u32 ctrl_default;
+	bool is_ctr;
 };
 
 struct spacc_dev {
@@ -148,6 +150,7 @@ struct spacc_ctx {
 	u8 key[AES_MAX_KEY_SIZE] __aligned(4);
 	unsigned int keylen;
 	bool use_fallback;
+	bool is_ctr;
 };
 
 struct spacc_reqctx {
@@ -457,6 +460,26 @@ static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 	return err;
 }
 
+/*
+ * Advance a 16-byte big-endian counter by the blocks one chunk consumed.  The
+ * engine takes the counter block as-is, so a multi-chunk CTR request has to
+ * carry it forward itself.
+ */
+static void spacc_ctr_advance(u8 *iv, unsigned int bytes)
+{
+	u64 add = bytes / AES_BLOCK_SIZE;
+	u32 carry = 0;
+	int i;
+
+	for (i = 15; i >= 0; i--) {
+		u32 v = iv[i] + (u32)(add & 0xff) + carry;
+
+		iv[i] = v & 0xff;
+		carry = v >> 8;
+		add >>= 8;
+	}
+}
+
 static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 {
 	struct skcipher_request *req = skcipher_request_cast(areq);
@@ -519,7 +542,8 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 			 * of this chunk.  With src == dst the engine overwrites it
 			 * in place, so save it before the chunk is started.
 			 */
-			if (!rctx->is_encrypt && chunk < left && ivsize)
+			if (!ctx->is_ctr && !rctx->is_encrypt && chunk < left &&
+			    ivsize)
 				scatterwalk_map_and_copy(next_iv, src,
 							 chunk - ivsize, ivsize, 0);
 
@@ -529,6 +553,8 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 
 		/* -ENOMEM: nothing was started (too small, or no mapping/DDT). */
 		if (err == -ENOMEM) {
+			if (ctx->is_ctr)
+				spacc_ctr_advance(iv, done);
 			err = spacc_sw_crypt(ctx, src, dst, left, iv,
 					     rctx->is_encrypt, req->base.flags);
 			break;
@@ -540,7 +566,9 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 
 		/* Next chunk starts with the ciphertext block just produced. */
 		if (done < req->cryptlen && ivsize) {
-			if (rctx->is_encrypt)
+			if (ctx->is_ctr)
+				spacc_ctr_advance(iv, chunk);
+			else if (rctx->is_encrypt)
 				scatterwalk_map_and_copy(iv, dst, chunk - ivsize,
 							 ivsize, 0);
 			else
@@ -567,16 +595,28 @@ static int spacc_cra_init(struct crypto_skcipher *tfm)
 
 	ctx->spacc = spacc_alg->spacc;
 	ctx->ctrl_default = spacc_alg->ctrl_default;
+	ctx->is_ctr = spacc_alg->is_ctr;
 
-	ctx->fallback_tfm = crypto_alloc_sync_skcipher(name, 0, CRYPTO_ALG_NEED_FALLBACK);
-	if (IS_ERR(ctx->fallback_tfm)) {
-		dev_err(ctx->spacc->dev, "Cannot allocate fallback for %s\n", name);
-		return PTR_ERR(ctx->fallback_tfm);
+	/*
+	 * CTR has no software fallback: allocating one here would ask the crypto
+	 * manager for a "ctr(aes)" implementation while it is busy instantiating
+	 * this very algorithm as a child of gcm(aes), which fails with -EAGAIN
+	 * and gets the algorithm blacklisted.  The engine handles CTR directly.
+	 */
+	if (!ctx->is_ctr) {
+		ctx->fallback_tfm = crypto_alloc_sync_skcipher(name, 0,
+							       CRYPTO_ALG_NEED_FALLBACK);
+		if (IS_ERR(ctx->fallback_tfm)) {
+			dev_err(ctx->spacc->dev,
+				"Cannot allocate fallback for %s\n", name);
+			return PTR_ERR(ctx->fallback_tfm);
+		}
+
+		dev_info_once(ctx->spacc->dev,
+			      "SPACC: software path for %s is %s\n", name,
+			      crypto_tfm_alg_driver_name(
+				      crypto_skcipher_tfm(&ctx->fallback_tfm->base)));
 	}
-
-	dev_info_once(ctx->spacc->dev, "SPACC: software path for %s is %s\n",
-		 name,
-		 crypto_tfm_alg_driver_name(crypto_skcipher_tfm(&ctx->fallback_tfm->base)));
 
 	crypto_skcipher_set_reqsize(tfm, sizeof(struct spacc_reqctx));
 	return 0;
@@ -597,6 +637,26 @@ static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
 			    unsigned int keylen)
 {
 	struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
+
+	/*
+	 * CTR has no fallback at init time (see cra_init); allocate it here,
+	 * where the crypto manager is free, so that small requests can still be
+	 * computed in software.
+	 */
+	if (!ctx->fallback_tfm) {
+		ctx->fallback_tfm = crypto_alloc_sync_skcipher(
+			crypto_tfm_alg_name(&tfm->base), 0,
+			CRYPTO_ALG_NEED_FALLBACK);
+		if (IS_ERR(ctx->fallback_tfm)) {
+			int err = PTR_ERR(ctx->fallback_tfm);
+
+			ctx->fallback_tfm = NULL;
+			dev_err(ctx->spacc->dev,
+				"Cannot allocate fallback for %s: %d\n",
+				crypto_tfm_alg_name(&tfm->base), err);
+			return err;
+		}
+	}
 
 	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
 	    keylen != AES_KEYSIZE_256)
@@ -669,7 +729,42 @@ static int spacc_aes_cbc_decrypt(struct skcipher_request *req)
 	return spacc_aes_crypt(req, false);
 }
 
+static int spacc_aes_ctr_crypt(struct skcipher_request *req)
+{
+	/* CTR decrypts by encrypting: the keystream is the same either way. */
+	return spacc_aes_crypt(req, true);
+}
+
 static const struct spacc_alg spacc_algs_tmpl[] = {
+	{
+		.ctrl_default = SPA_CTRL_CIPH_ALG_AES | SPA_CTRL_CIPH_MODE_CTR,
+		.is_ctr = true,
+		.alg = {
+			.base = {
+				.base.cra_name		= "ctr(aes)",
+				.base.cra_driver_name	= "ctr-aes-ls1024a-spacc",
+				.base.cra_priority	= 300,
+				.base.cra_flags		= CRYPTO_ALG_ASYNC |
+							  CRYPTO_ALG_NEED_FALLBACK,
+				.base.cra_blocksize	= 1,
+				.base.cra_ctxsize	= sizeof(struct spacc_ctx),
+				.base.cra_alignmask	= 0,
+				.base.cra_module	= THIS_MODULE,
+
+				.init			= spacc_cra_init,
+				.exit			= spacc_cra_exit,
+				.min_keysize		= AES_MIN_KEY_SIZE,
+				.max_keysize		= AES_MAX_KEY_SIZE,
+				.ivsize			= AES_BLOCK_SIZE,
+				.setkey			= spacc_aes_setkey,
+				.encrypt		= spacc_aes_ctr_crypt,
+				.decrypt		= spacc_aes_ctr_crypt,
+			},
+			.op = {
+				.do_one_request = spacc_do_one_request,
+			},
+		},
+	},
 	{
 		.ctrl_default = SPA_CTRL_CIPH_ALG_AES | SPA_CTRL_CIPH_MODE_ECB,
 		.alg = {
