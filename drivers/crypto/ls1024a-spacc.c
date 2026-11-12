@@ -323,6 +323,9 @@ static struct spacc_ddt *spacc_sg_to_ddt(struct spacc_dev *spacc,
 	return ddt;
 }
 
+static void spacc_engine_busy_inc(struct spacc_dev *spacc);
+static void spacc_engine_busy_dec(struct spacc_dev *spacc);
+
 static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 {
 	struct spacc_dev *spacc = dev_id;
@@ -377,7 +380,7 @@ static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 				} else {
 					slot->busy = false;
 					slot->err = err;
-					atomic_dec(&spacc->inflight);
+					spacc_engine_busy_dec(spacc);
 				}
 				spin_unlock(&spacc->pipe_lock);
 
@@ -553,6 +556,26 @@ static int spacc_hw_chunk_locked(struct spacc_dev *spacc, struct spacc_ctx *ctx,
  * Wait until nothing is in flight.  Commands in flight hold only registers and
  * their own slots, so this blocks submissions but never completion.
  */
+/*
+ * Counts every command on the engine, synchronous or pipelined.  The mutex
+ * alone already serialises programming, but keeping both paths in one state
+ * makes spacc_wait_engine_idle() a truthful "engine is quiet" test instead of
+ * a pipelined-only one.
+ */
+static void spacc_engine_busy_inc(struct spacc_dev *spacc)
+{
+	unsigned int cur = atomic_inc_return(&spacc->inflight);
+
+	if (cur > stat_peak)
+		stat_peak = cur;
+}
+
+static void spacc_engine_busy_dec(struct spacc_dev *spacc)
+{
+	if (atomic_dec_and_test(&spacc->inflight))
+		wake_up_all(&spacc->idle_wq);
+}
+
 static int spacc_wait_engine_idle(struct spacc_dev *spacc)
 {
 	int i;
@@ -587,8 +610,10 @@ static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 		mutex_unlock(&spacc_hw_lock);
 	}
 
+	spacc_engine_busy_inc(spacc);
 	err = spacc_hw_chunk_locked(spacc, ctx, src, dst, len, ivsize, iv,
 				    encrypt);
+	spacc_engine_busy_dec(spacc);
 	mutex_unlock(&spacc_hw_lock);
 
 	return err;
@@ -733,9 +758,7 @@ static int spacc_async_start(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 	spin_lock(&spacc->pipe_lock);
 	slot->busy = true;
 	slot->free = false;
-	atomic_inc(&spacc->inflight);
-	if (atomic_read(&spacc->inflight) > stat_peak)
-		stat_peak = atomic_read(&spacc->inflight);
+	spacc_engine_busy_inc(spacc);
 	spin_unlock(&spacc->pipe_lock);
 
 	spacc_write_ctrl(spacc, ctrl);
@@ -1311,6 +1334,7 @@ static int spacc_hash_hw(struct spacc_hash_ctx *hctx, const u8 *msg,
 		mutex_unlock(&spacc_hw_lock);
 	}
 
+	spacc_engine_busy_inc(spacc);
 	ddt_src = spacc_sg_to_ddt(spacc, st.sgl, len, DMA_TO_DEVICE, &a_src,
 				  &n_src);
 	if (!ddt_src) {
@@ -1373,6 +1397,7 @@ static int spacc_hash_hw(struct spacc_hash_ctx *hctx, const u8 *msg,
 	dma_pool_free(spacc->req_pool, ddt_dst, a_dst);
 	dma_pool_free(spacc->req_pool, ddt_src, a_src);
 out_unlock:
+	spacc_engine_busy_dec(spacc);
 	mutex_unlock(&spacc_hw_lock);
 	sg_free_table(&st);
 out:
