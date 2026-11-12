@@ -14,6 +14,11 @@
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/dma-mapping.h>
+#include <linux/sched.h>
+#include <linux/jiffies.h>
+#include <linux/delay.h>
+#include <linux/workqueue.h>
+#include <linux/semaphore.h>
 #include <linux/dmapool.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
@@ -106,6 +111,26 @@
 #define SPA_CTRL_KEY_EXP		29
 
 #define SPACC_MAX_DDT_ENTS		64
+
+/* Commands in flight.  The engine reports completion in SW_ID, so each
+ * outstanding command owns one slot and one identifier.
+ */
+#define SPACC_MAX_SLOTS			8
+#define SPACC_SW_ID_SYNC		0xff
+
+static unsigned int depth = 2;
+
+/* diagnostics: which path the requests take, and how deep they overlap */
+static unsigned int stat_async;
+static unsigned int stat_async_fail;
+static unsigned int stat_sync;
+static unsigned int stat_peak;
+module_param(stat_async, uint, 0444);
+module_param(stat_async_fail, uint, 0444);
+module_param(stat_sync, uint, 0444);
+module_param(stat_peak, uint, 0444);
+module_param(depth, uint, 0444);
+MODULE_PARM_DESC(depth, "commands kept in flight (1..8)");
 #define SPACC_CIPHER_PG_SZ		128
 #define SPACC_CRYPTO_BASE_OFFSET	0x00040000
 
@@ -116,6 +141,18 @@ struct spacc_ddt {
 };
 
 struct spacc_dev;
+
+struct spacc_slot {
+	struct work_struct work;
+	struct spacc_dev *spacc;
+	struct skcipher_request *req;
+	struct spacc_ctx *ctx;
+	unsigned int idx;
+	unsigned int chunk;
+	bool busy;	/* submitted, status not seen yet */
+	bool free;	/* reusable */
+	int err;
+};
 
 struct spacc_alg {
 	struct skcipher_engine_alg alg;
@@ -142,6 +179,14 @@ struct spacc_dev {
 	int req_err;
 	unsigned int next_ctx;
 	bool is_spacc3;
+	/* pipelining */
+	struct workqueue_struct *pipe_wq;
+	struct semaphore slots_sem;
+	spinlock_t pipe_lock;
+	atomic_t inflight;
+	wait_queue_head_t idle_wq;
+	unsigned int depth;
+	struct spacc_slot slots[SPACC_MAX_SLOTS];
 	/* ecb(aes), cbc(aes) and ctr(aes) */
 	struct spacc_alg algs[3];
 };
@@ -167,6 +212,8 @@ struct spacc_reqctx {
 	struct spacc_ddt *src_ddt;
 	struct spacc_ddt *dst_ddt;
 	u8 backup_iv[AES_BLOCK_SIZE];
+	struct scatterlist *src_sg;
+	struct scatterlist *dst_sg;
 };
 
 static inline void spacc_memcpy_toio32(void __iomem *dst, const void *src, unsigned int bytes)
@@ -191,7 +238,7 @@ static inline void spacc_write_proc_len(struct spacc_dev *spacc, u32 len)
 		writel(0, spacc->crypto_regs + SPACC3_REG_ICV_LEN);
 		writel(0, spacc->crypto_regs + SPACC3_REG_ICV_OFFSET);
 		writel(0, spacc->crypto_regs + SPACC3_REG_IV_OFFSET);
-		writel(0, spacc->crypto_regs + SPACC3_REG_SW_ID);
+		writel(SPACC_SW_ID_SYNC, spacc->crypto_regs + SPACC3_REG_SW_ID);
 		writel(0, spacc->crypto_regs + SPACC3_REG_AUX_INFO);
 	} else {
 		writel(0, spacc->crypto_regs + SPACC2_REG_AAD_LEN);
@@ -304,17 +351,52 @@ static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 	if (readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT) & SPA_FIFO_STAT_EMPTY)
 		return IRQ_HANDLED;
 
-	/* Pop status from FIFO */
-	writel(~0, spacc->crypto_regs + SPACC_REG_STAT_POP);
-	status = readl(spacc->crypto_regs + SPACC_REG_STATUS);
-	code = (status & SPA_STATUS_RES_CODE_MASK) >> SPA_STATUS_RES_CODE_OFFSET;
-	if (code != SPA_STATUS_OK)
-		dev_warn_ratelimited(spacc->dev,
-				     "SPACC: request failed, STATUS=0x%08x (code %u)\n",
-				     status, code);
+	while (!(readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT) &
+		 SPA_FIFO_STAT_EMPTY)) {
+		struct spacc_slot *slot = NULL;
+		unsigned int id, err;
 
-	spacc->req_err = spacc_status_to_errno(code);
-	complete(&spacc->done);
+		writel(~0, spacc->crypto_regs + SPACC_REG_STAT_POP);
+		status = readl(spacc->crypto_regs + SPACC_REG_STATUS);
+		code = (status & SPA_STATUS_RES_CODE_MASK) >>
+		       SPA_STATUS_RES_CODE_OFFSET;
+		if (code != SPA_STATUS_OK)
+			dev_warn_ratelimited(spacc->dev,
+					     "SPACC: request failed, STATUS=0x%08x (code %u)\n",
+					     status, code);
+
+		err = spacc_status_to_errno(code);
+		id = status & SPACC_SW_ID_SYNC;
+
+		if (id != SPACC_SW_ID_SYNC) {
+			if (id < spacc->depth) {
+				slot = &spacc->slots[id];
+				spin_lock(&spacc->pipe_lock);
+				if (!slot->busy) {
+					slot = NULL;
+				} else {
+					slot->busy = false;
+					slot->err = err;
+					atomic_dec(&spacc->inflight);
+				}
+				spin_unlock(&spacc->pipe_lock);
+
+				if (slot) {
+					wake_up_all(&spacc->idle_wq);
+					queue_work(spacc->pipe_wq, &slot->work);
+				}
+			} else {
+				dev_warn_ratelimited(spacc->dev,
+						     "SPACC: status with SW_ID %u (ignored)",
+						     id);
+			}
+
+			continue;
+		}
+
+		spacc->req_err = err;
+		complete(&spacc->done);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -467,7 +549,26 @@ static int spacc_hw_chunk_locked(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 	return err;
 }
 
-/* One set of registers, one command at a time. */
+/*
+ * Wait until nothing is in flight.  Commands in flight hold only registers and
+ * their own slots, so this blocks submissions but never completion.
+ */
+static int spacc_wait_engine_idle(struct spacc_dev *spacc)
+{
+	int i;
+
+	for (i = 0; i < 1000; i++) {
+		if (!atomic_read(&spacc->inflight))
+			return 0;
+		wait_event_timeout(spacc->idle_wq,
+				   !atomic_read(&spacc->inflight),
+				   msecs_to_jiffies(10));
+	}
+
+	return -ETIMEDOUT;
+}
+
+/* One set of registers, so a synchronous command needs an idle engine. */
 static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 			  struct scatterlist *src, struct scatterlist *dst,
 			  unsigned int len, unsigned int ivsize,
@@ -475,7 +576,17 @@ static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 {
 	int err;
 
-	mutex_lock(&spacc_hw_lock);
+	for (;;) {
+		err = spacc_wait_engine_idle(spacc);
+		if (err)
+			return err;
+
+		mutex_lock(&spacc_hw_lock);
+		if (!atomic_read(&spacc->inflight))
+			break;
+		mutex_unlock(&spacc_hw_lock);
+	}
+
 	err = spacc_hw_chunk_locked(spacc, ctx, src, dst, len, ivsize, iv,
 				    encrypt);
 	mutex_unlock(&spacc_hw_lock);
@@ -501,6 +612,200 @@ static void spacc_ctr_advance(u8 *iv, unsigned int bytes)
 		carry = v >> 8;
 		add >>= 8;
 	}
+}
+
+static void spacc_async_unmap(struct spacc_dev *spacc,
+			      struct spacc_reqctx *rctx, bool in_place)
+{
+	if (in_place) {
+		dma_unmap_sg(spacc->dev, rctx->src_sg, rctx->src_nents,
+			     DMA_BIDIRECTIONAL);
+		dma_pool_free(spacc->req_pool, rctx->src_ddt, rctx->src_addr);
+	} else {
+		dma_unmap_sg(spacc->dev, rctx->src_sg, rctx->src_nents,
+			     DMA_TO_DEVICE);
+		dma_unmap_sg(spacc->dev, rctx->dst_sg, rctx->dst_nents,
+			     DMA_FROM_DEVICE);
+		dma_pool_free(spacc->req_pool, rctx->src_ddt, rctx->src_addr);
+		dma_pool_free(spacc->req_pool, rctx->dst_ddt, rctx->dst_addr);
+	}
+}
+
+/*
+ * Program one command and leave it running.  The completion is matched by the
+ * SW_ID written here, so several requests can be outstanding at once and the
+ * engine is never idle while the CPU maps the next one.
+ */
+static int spacc_async_start(struct spacc_dev *spacc, struct spacc_ctx *ctx,
+			     struct skcipher_request *req,
+			     struct spacc_slot *slot, unsigned int chunk)
+{
+	struct spacc_reqctx *rctx = skcipher_request_ctx(req);
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	unsigned int ivsize = crypto_skcipher_ivsize(tfm);
+	struct scatterlist *src = req->src, *dst = req->dst;
+	bool in_place = (src == dst);
+	unsigned int ctx_id;
+	void __iomem *page;
+	u32 ctrl, fifo;
+	int i;
+
+	if (!spacc->is_spacc3)
+		return -EOPNOTSUPP;
+
+	rctx->src_sg = src;
+	rctx->dst_sg = dst;
+
+	if (in_place) {
+		rctx->src_ddt = spacc_sg_to_ddt(spacc, src, chunk,
+						DMA_BIDIRECTIONAL,
+						&rctx->src_addr,
+						&rctx->src_nents);
+		if (!rctx->src_ddt)
+			return -ENOMEM;
+		rctx->dst_ddt = rctx->src_ddt;
+		rctx->dst_addr = rctx->src_addr;
+		rctx->dst_nents = rctx->src_nents;
+	} else {
+		rctx->src_ddt = spacc_sg_to_ddt(spacc, src, chunk,
+						DMA_TO_DEVICE,
+						&rctx->src_addr,
+						&rctx->src_nents);
+		if (!rctx->src_ddt)
+			return -ENOMEM;
+		rctx->dst_ddt = spacc_sg_to_ddt(spacc, dst, chunk,
+						DMA_FROM_DEVICE,
+						&rctx->dst_addr,
+						&rctx->dst_nents);
+		if (!rctx->dst_ddt) {
+			dma_unmap_sg(spacc->dev, src, rctx->src_nents,
+				     DMA_TO_DEVICE);
+			dma_pool_free(spacc->req_pool, rctx->src_ddt,
+				      rctx->src_addr);
+			return -ENOMEM;
+		}
+	}
+
+	if (ivsize)
+		memcpy(rctx->backup_iv, req->iv, ivsize);
+
+	slot->req = req;
+	slot->ctx = ctx;
+	slot->chunk = chunk;
+	slot->err = 0;
+
+	mutex_lock(&spacc_hw_lock);
+
+	ctx_id = (spacc->next_ctx++) & 0x1f;
+	page = spacc->cipher_ctx_base + (ctx_id * spacc->cipher_pg_sz);
+	spacc_memcpy_toio32(page, ctx->key, ctx->keylen);
+	if (ivsize)
+		spacc_memcpy_toio32(page + 32, req->iv, ivsize);
+
+	writel(ctx->keylen | (ctx_id << SPA_KEY_SZ_CTX_INDEX_OFFSET) |
+	       (1U << SPA_KEY_SZ_CIPHER_OFFSET),
+	       spacc->crypto_regs + SPACC_REG_KEY_SZ);
+	writel(rctx->src_addr, spacc->crypto_regs + SPACC_REG_SRC_PTR);
+	writel(rctx->dst_addr, spacc->crypto_regs + SPACC_REG_DST_PTR);
+	writel(0, spacc->crypto_regs + SPACC_REG_OFFSET);
+	spacc_write_proc_len(spacc, chunk);
+	writel(slot->idx, spacc->crypto_regs + SPACC3_REG_SW_ID);
+
+	ctrl = ctx->ctrl_default | (ctx_id << SPA_CTRL_CTX_IDX);
+	if (rctx->is_encrypt)
+		ctrl |= (1U << SPA_CTRL_ENCRYPT_IDX);
+	else
+		ctrl |= (1U << SPA_CTRL_KEY_EXP);
+
+	/* A write into a full command FIFO stalls the bus: wait for room. */
+	for (i = 0; i < 200; i++) {
+		fifo = readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT);
+		if (!(fifo & SPA_FIFO_CMD_FULL))
+			break;
+		udelay(5);
+	}
+	if (i == 200) {
+		mutex_unlock(&spacc_hw_lock);
+		spacc_async_unmap(spacc, rctx, in_place);
+		return -EBUSY;
+	}
+
+	spin_lock(&spacc->pipe_lock);
+	slot->busy = true;
+	slot->free = false;
+	atomic_inc(&spacc->inflight);
+	if (atomic_read(&spacc->inflight) > stat_peak)
+		stat_peak = atomic_read(&spacc->inflight);
+	spin_unlock(&spacc->pipe_lock);
+
+	spacc_write_ctrl(spacc, ctrl);
+	mutex_unlock(&spacc_hw_lock);
+
+	return 0;
+}
+
+static void spacc_async_work(struct work_struct *work)
+{
+	struct spacc_slot *slot = container_of(work, struct spacc_slot, work);
+	struct spacc_dev *spacc = slot->spacc;
+	struct skcipher_request *req = slot->req;
+	struct spacc_ctx *ctx = slot->ctx;
+	struct spacc_reqctx *rctx;
+	unsigned int ivsize;
+	int err = slot->err;
+
+	if (!req)
+		return;
+
+	rctx = skcipher_request_ctx(req);
+	ivsize = crypto_skcipher_ivsize(crypto_skcipher_reqtfm(req));
+
+	spacc_async_unmap(spacc, rctx, req->src == req->dst);
+
+	if (!err && ctx->is_ctr && ivsize) {
+		spacc_ctr_advance(rctx->backup_iv, slot->chunk);
+		memcpy(req->iv, rctx->backup_iv, ivsize);
+	}
+
+	spin_lock(&spacc->pipe_lock);
+	slot->req = NULL;
+	slot->free = true;
+	spin_unlock(&spacc->pipe_lock);
+	up(&spacc->slots_sem);
+
+	local_bh_disable();
+	crypto_finalize_skcipher_request(spacc->ce, req, err);
+	local_bh_enable();
+}
+
+static struct spacc_slot *spacc_slot_get(struct spacc_dev *spacc)
+{
+	struct spacc_slot *slot = NULL;
+	int i;
+
+	if (down_interruptible(&spacc->slots_sem))
+		return NULL;
+
+	spin_lock(&spacc->pipe_lock);
+	for (i = 0; i < spacc->depth; i++) {
+		if (spacc->slots[i].free) {
+			spacc->slots[i].free = false;
+			slot = &spacc->slots[i];
+			break;
+		}
+	}
+	spin_unlock(&spacc->pipe_lock);
+
+	return slot;
+}
+
+static void spacc_slot_put(struct spacc_dev *spacc, struct spacc_slot *slot)
+{
+	spin_lock(&spacc->pipe_lock);
+	slot->req = NULL;
+	slot->free = true;
+	spin_unlock(&spacc->pipe_lock);
+	up(&spacc->slots_sem);
 }
 
 static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
@@ -529,6 +834,40 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 		memcpy(iv, req->iv, ivsize);
 
 	/*
+	 * Fast path: a request that fits one command is started and left in
+	 * flight, so the next request can be programmed while the engine works
+	 * on this one.  Longer requests keep the chunked synchronous path.
+	 */
+	{
+		struct scatterlist *asrc = req->src;
+		struct scatterlist *adst = (req->src == req->dst) ? asrc :
+					   req->dst;
+		unsigned int achunk;
+
+		achunk = min_t(unsigned int, req->cryptlen,
+			       SPACC_MAX_CHUNK_BYTES);
+		achunk = spacc_sg_span(asrc, achunk, SPACC_MAX_DDT_ENTS - 1);
+		if (adst != asrc)
+			achunk = spacc_sg_span(adst, achunk,
+					       SPACC_MAX_DDT_ENTS - 1);
+		achunk = round_down(achunk, AES_BLOCK_SIZE);
+
+		if (achunk == req->cryptlen && achunk >= SPACC_MIN_HW_BYTES) {
+			struct spacc_slot *slot = spacc_slot_get(spacc);
+
+			if (slot) {
+				if (!spacc_async_start(spacc, ctx, req, slot,
+						       achunk)) {
+					stat_async++;
+					return 0;
+				}
+				stat_async_fail++;
+				spacc_slot_put(spacc, slot);
+			}
+		}
+	}
+
+	/*
 	 * One engine command takes one DDT per direction: SPACC_MAX_DDT_ENTS - 1
 	 * scatterlist entries plus the terminator.  Cut the request into pieces
 	 * that fit, by entry count as well as by size, and chain the CBC IV
@@ -540,6 +879,7 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 		unsigned int left = req->cryptlen - done;
 		unsigned int chunk;
 
+		stat_sync++;
 		src = scatterwalk_ffwd(src_chain, req->src, done);
 		if (req->src == req->dst)
 			dst = src;
@@ -960,7 +1300,16 @@ static int spacc_hash_hw(struct spacc_hash_ctx *hctx, const u8 *msg,
 	if (err)
 		goto out;
 
-	mutex_lock(&spacc_hw_lock);
+	for (;;) {
+		err = spacc_wait_engine_idle(spacc);
+		if (err)
+			goto out;
+
+		mutex_lock(&spacc_hw_lock);
+		if (!atomic_read(&spacc->inflight))
+			break;
+		mutex_unlock(&spacc_hw_lock);
+	}
 
 	ddt_src = spacc_sg_to_ddt(spacc, st.sgl, len, DMA_TO_DEVICE, &a_src,
 				  &n_src);
@@ -1000,7 +1349,7 @@ static int spacc_hash_hw(struct spacc_hash_ctx *hctx, const u8 *msg,
 	writel(0, spacc->crypto_regs + SPACC3_REG_ICV_LEN);
 	writel(0, spacc->crypto_regs + SPACC3_REG_ICV_OFFSET);
 	writel(0, spacc->crypto_regs + SPACC3_REG_IV_OFFSET);
-	writel(0, spacc->crypto_regs + SPACC3_REG_SW_ID);
+	writel(SPACC_SW_ID_SYNC, spacc->crypto_regs + SPACC3_REG_SW_ID);
 	writel(0, spacc->crypto_regs + SPACC3_REG_AUX_INFO);
 
 	ctrl = (hctx->alg_id << 4) | (ctx_id << SPA_CTRL_CTX_IDX) |
@@ -1341,7 +1690,8 @@ static struct shash_alg spacc_hash_algs[] = {
 		.base		= {
 			.cra_name	= "hmac(sha256)",
 			.cra_driver_name = "hmac-sha256-ls1024a-spacc",
-			.cra_priority	= 300,
+			/* hmac-sha256-lib is 300 too: a tie goes to the older entry */
+			.cra_priority	= 400,
 			.cra_blocksize	= 64,
 			.cra_ctxsize	= sizeof(struct spacc_hash_ctx),
 			.cra_module	= THIS_MODULE,
@@ -1487,10 +1837,33 @@ static int spacc_probe(struct platform_device *pdev)
 	       spacc->pdu_regs + SPACC_REG_IRQ_EN);
 
 	/* Initialize crypto engine */
-	spacc->ce = crypto_engine_alloc_init(&pdev->dev, true);
+	/*
+	 * retry_support must be true: otherwise crypto-engine stops pumping after
+	 * the first request until it is finalized, and nothing is pipelined.
+	 */
+	spacc->ce = crypto_engine_alloc_init_and_set(&pdev->dev, true, true, 10);
 	if (!spacc->ce) {
 		ret = -ENOMEM;
 		goto err_irq_disable;
+	}
+
+	spacc->depth = clamp_t(unsigned int, depth, 1, SPACC_MAX_SLOTS);
+	spin_lock_init(&spacc->pipe_lock);
+	atomic_set(&spacc->inflight, 0);
+	init_waitqueue_head(&spacc->idle_wq);
+	sema_init(&spacc->slots_sem, spacc->depth);
+
+	for (i = 0; i < SPACC_MAX_SLOTS; i++) {
+		spacc->slots[i].idx = i;
+		spacc->slots[i].spacc = spacc;
+		spacc->slots[i].free = true;
+		INIT_WORK(&spacc->slots[i].work, spacc_async_work);
+	}
+
+	spacc->pipe_wq = alloc_ordered_workqueue("spacc-pipe", 0);
+	if (!spacc->pipe_wq) {
+		ret = -ENOMEM;
+		goto err_ce_exit;
 	}
 
 	ret = crypto_engine_start(spacc->ce);
@@ -1565,6 +1938,12 @@ static void spacc_remove(struct platform_device *pdev)
 
 	crypto_engine_stop(spacc->ce);
 	crypto_engine_exit(spacc->ce);
+
+	if (spacc->pipe_wq) {
+		spacc_wait_engine_idle(spacc);
+		flush_workqueue(spacc->pipe_wq);
+		destroy_workqueue(spacc->pipe_wq);
+	}
 
 	writel(0, spacc->pdu_regs + SPACC_REG_IRQ_EN);
 
