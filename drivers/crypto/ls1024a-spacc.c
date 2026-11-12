@@ -26,6 +26,8 @@
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
+#include <crypto/hash.h>
+#include <crypto/internal/hash.h>
 
 #define DRV_NAME			"ls1024a-spacc"
 
@@ -365,7 +367,9 @@ static unsigned int spacc_sg_span(struct scatterlist *sg, unsigned int len,
 #define SPACC_MAX_CHUNK_BYTES	(128 * 1024)
 
 /* Program the engine for one contiguous chunk and wait for its completion. */
-static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
+static DEFINE_MUTEX(spacc_hw_lock);
+
+static int spacc_hw_chunk_locked(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 			  struct scatterlist *src, struct scatterlist *dst,
 			  unsigned int len, unsigned int ivsize,
 			  const u8 *iv, bool encrypt)
@@ -459,6 +463,22 @@ static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 		dma_pool_free(spacc->req_pool, src_ddt, src_addr);
 		dma_pool_free(spacc->req_pool, dst_ddt, dst_addr);
 	}
+
+	return err;
+}
+
+/* One set of registers, one command at a time. */
+static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
+			  struct scatterlist *src, struct scatterlist *dst,
+			  unsigned int len, unsigned int ivsize,
+			  const u8 *iv, bool encrypt)
+{
+	int err;
+
+	mutex_lock(&spacc_hw_lock);
+	err = spacc_hw_chunk_locked(spacc, ctx, src, dst, len, ivsize, iv,
+				    encrypt);
+	mutex_unlock(&spacc_hw_lock);
 
 	return err;
 }
@@ -861,6 +881,492 @@ static const struct spacc_alg spacc_algs_tmpl[] = {
 	},
 };
 
+
+/* ------------------------------------------------------- hash / MAC --- */
+
+/* Largest message buffered for one hardware job; SMB packets are smaller. */
+#define SPACC_HASH_MAX_MSG	(256 * 1024)
+
+/* hash alg ids from the vendor tables */
+#define SPACC_H_SHA1		2
+#define SPACC_H_SHA256		4
+#define SPACC_H_CMAC		8
+
+static struct spacc_dev *spacc_hash_dev;
+
+struct spacc_hash_ctx {
+	u8 key[64];
+	unsigned int keylen;
+	unsigned int alg_id;
+	unsigned int digestsize;
+	bool keyed;
+	/* below min_hw the software implementation is cheaper */
+	struct crypto_shash *fb;
+	unsigned int min_hw;
+};
+
+struct spacc_hash_desc {
+	u8 *buf;
+	unsigned int len;
+	unsigned int alloc;
+};
+
+static void spacc_hash_free_desc(struct spacc_hash_desc *d)
+{
+	kfree(d->buf);
+	d->buf = NULL;
+	d->len = 0;
+	d->alloc = 0;
+}
+
+/*
+ * One job over the whole message: message as pre-AAD, digest into dst, ICV_LEN
+ * zero.  ICV_PT (bit 26) and ENCRYPT (bit 24) are required.  KEY_SZ carries the
+ * hash key size, or zero for unkeyed algorithms -- it must be written every
+ * time, otherwise a previous keyed job leaves its size behind.
+ */
+static int spacc_hash_hw(struct spacc_hash_ctx *hctx, const u8 *msg,
+			 unsigned int len, u8 *out)
+{
+	struct spacc_dev *spacc = spacc_hash_dev;
+	struct sg_table st;
+	struct scatterlist dsg;
+	struct spacc_ddt *ddt_src, *ddt_dst;
+	dma_addr_t a_src, a_dst;
+	int n_src = 0, n_dst = 0;
+	struct page **pages;
+	unsigned int npages, ctx_id;
+	void __iomem *page;
+	void *dig;
+	long left;
+	u32 ctrl;
+	int err = 0, i;
+
+	if (!spacc || !len)
+		return -EINVAL;
+
+	npages = DIV_ROUND_UP(offset_in_page(msg) + len, PAGE_SIZE);
+	pages = kmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
+	dig = kzalloc(64, GFP_KERNEL);
+	if (!pages || !dig) {
+		err = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < npages; i++)
+		pages[i] = virt_to_page(msg + i * PAGE_SIZE);
+
+	err = sg_alloc_table_from_pages(&st, pages, npages, offset_in_page(msg),
+					len, GFP_KERNEL);
+	if (err)
+		goto out;
+
+	mutex_lock(&spacc_hw_lock);
+
+	ddt_src = spacc_sg_to_ddt(spacc, st.sgl, len, DMA_TO_DEVICE, &a_src,
+				  &n_src);
+	if (!ddt_src) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+
+	sg_init_one(&dsg, dig, 64);
+	ddt_dst = spacc_sg_to_ddt(spacc, &dsg, 64, DMA_FROM_DEVICE, &a_dst,
+				  &n_dst);
+	if (!ddt_dst) {
+		dma_unmap_sg(spacc->dev, st.sgl, n_src, DMA_TO_DEVICE);
+		dma_pool_free(spacc->req_pool, ddt_src, a_src);
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+
+	ctx_id = (spacc->next_ctx++) & 0x1f;
+
+	if (hctx->keyed) {
+		page = spacc->crypto_regs + SPACC_REG_HASH_KEY_BASE;
+		spacc_memcpy_toio32(page + (ctx_id * spacc->cipher_pg_sz),
+				    hctx->key, 16);
+		spacc_memcpy_toio32(page, hctx->key, 16);
+	}
+	writel((hctx->keyed ? 16 : 0) | (ctx_id << SPA_KEY_SZ_CTX_INDEX_OFFSET),
+	       spacc->crypto_regs + SPACC_REG_KEY_SZ);
+
+	writel(a_src, spacc->crypto_regs + SPACC_REG_SRC_PTR);
+	writel(a_dst, spacc->crypto_regs + SPACC_REG_DST_PTR);
+	writel(0, spacc->crypto_regs + SPACC_REG_OFFSET);
+
+	writel(len, spacc->crypto_regs + SPACC3_REG_PRE_AAD_LEN);
+	writel(0, spacc->crypto_regs + SPACC3_REG_POST_AAD_LEN);
+	writel(len, spacc->crypto_regs + SPACC3_REG_PROC_LEN);
+	writel(0, spacc->crypto_regs + SPACC3_REG_ICV_LEN);
+	writel(0, spacc->crypto_regs + SPACC3_REG_ICV_OFFSET);
+	writel(0, spacc->crypto_regs + SPACC3_REG_IV_OFFSET);
+	writel(0, spacc->crypto_regs + SPACC3_REG_SW_ID);
+	writel(0, spacc->crypto_regs + SPACC3_REG_AUX_INFO);
+
+	ctrl = (hctx->alg_id << 4) | (ctx_id << SPA_CTRL_CTX_IDX) |
+	       BIT(14) | BIT(15) | BIT(24) | BIT(26);
+
+	reinit_completion(&spacc->done);
+	spacc_write_ctrl(spacc, ctrl);
+	left = wait_for_completion_timeout(&spacc->done,
+					   msecs_to_jiffies(1000));
+	if (!left)
+		err = -ETIMEDOUT;
+	else
+		err = spacc->req_err;
+
+	dma_rmb();
+	if (!err)
+		memcpy(out, dig, hctx->digestsize);
+
+	dma_unmap_sg(spacc->dev, &dsg, n_dst, DMA_FROM_DEVICE);
+	dma_unmap_sg(spacc->dev, st.sgl, n_src, DMA_TO_DEVICE);
+	dma_pool_free(spacc->req_pool, ddt_dst, a_dst);
+	dma_pool_free(spacc->req_pool, ddt_src, a_src);
+out_unlock:
+	mutex_unlock(&spacc_hw_lock);
+	sg_free_table(&st);
+out:
+	kfree(pages);
+	kfree_sensitive(dig);
+	return err;
+}
+
+static int spacc_hash_sw(struct spacc_hash_ctx *ctx, const u8 *data,
+			 unsigned int len, u8 *out)
+{
+	SHASH_DESC_ON_STACK(desc, ctx->fb);
+
+	desc->tfm = ctx->fb;
+	return crypto_shash_digest(desc, data, len, out);
+}
+
+static int spacc_hash_setkey(struct crypto_shash *tfm, const u8 *key,
+			     unsigned int keylen)
+{
+	struct spacc_hash_ctx *ctx = crypto_shash_ctx(tfm);
+
+	if (!ctx->keyed || keylen != AES_KEYSIZE_128)
+		return -EINVAL;
+	memcpy(ctx->key, key, keylen);
+	ctx->keylen = keylen;
+	if (ctx->fb)
+		return crypto_shash_setkey(ctx->fb, key, keylen);
+	return 0;
+}
+
+static int spacc_hash_init(struct shash_desc *desc)
+{
+	struct spacc_hash_desc *d = shash_desc_ctx(desc);
+
+	d->len = 0;
+	return 0;
+}
+
+static int spacc_hash_update(struct shash_desc *desc, const u8 *data,
+			     unsigned int len)
+{
+	struct spacc_hash_desc *d = shash_desc_ctx(desc);
+	unsigned int need = d->len + len;
+	u8 *p;
+
+	if (need > SPACC_HASH_MAX_MSG)
+		return -ENOSPC;
+	if (need > d->alloc) {
+		unsigned int na = max(d->alloc * 2, need);
+
+		if (na > SPACC_HASH_MAX_MSG)
+			na = SPACC_HASH_MAX_MSG;
+		p = krealloc(d->buf, na, GFP_KERNEL);
+		if (!p)
+			return -ENOMEM;
+		d->buf = p;
+		d->alloc = na;
+	}
+	memcpy(d->buf + d->len, data, len);
+	d->len += len;
+	return 0;
+}
+
+static int spacc_hash_final(struct shash_desc *desc, u8 *out)
+{
+	struct spacc_hash_desc *d = shash_desc_ctx(desc);
+	struct spacc_hash_ctx *ctx = crypto_shash_ctx(desc->tfm);
+	int err;
+
+	if (ctx->keyed && ctx->keylen != AES_KEYSIZE_128)
+		err = -EINVAL;
+	else if (ctx->fb && d->len < ctx->min_hw)
+		err = spacc_hash_sw(ctx, d->buf, d->len, out);
+	else
+		err = spacc_hash_hw(ctx, d->buf, d->len, out);
+	spacc_hash_free_desc(d);
+
+	return err;
+}
+
+static int spacc_hash_digest(struct shash_desc *desc, const u8 *data,
+			     unsigned int len, u8 *out)
+{
+	struct spacc_hash_ctx *ctx = crypto_shash_ctx(desc->tfm);
+	u8 *tmp;
+	int err;
+
+	if (ctx->keyed && ctx->keylen != AES_KEYSIZE_128)
+		return -EINVAL;
+
+	if (ctx->fb && len < ctx->min_hw)
+		return spacc_hash_sw(ctx, data, len, out);
+
+	/*
+	 * The caller's buffer may live in vmalloc space (module .rodata, for
+	 * one), where virt_to_page() does not describe its pages.  Copy it.
+	 */
+	tmp = kmalloc(len, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+	memcpy(tmp, data, len);
+	err = spacc_hash_hw(ctx, tmp, len, out);
+	kfree_sensitive(tmp);
+
+	return err;
+}
+
+static void spacc_hash_ctx_init(struct crypto_shash *tfm, unsigned int alg,
+				unsigned int ds, bool keyed,
+				const char *fb_name, unsigned int min_hw)
+{
+	struct spacc_hash_ctx *ctx = crypto_shash_ctx(tfm);
+	struct crypto_shash *fb;
+
+	ctx->alg_id = alg;
+	ctx->digestsize = ds;
+	ctx->keyed = keyed;
+	ctx->keylen = 0;
+	ctx->min_hw = min_hw;
+
+	fb = crypto_alloc_shash(fb_name, 0, 0);
+	if (IS_ERR(fb)) {
+		pr_warn("ls1024a-spacc: no software fallback %s, hardware only\n",
+			fb_name);
+		ctx->fb = NULL;
+	} else {
+		ctx->fb = fb;
+	}
+}
+
+static void spacc_hash_ctx_exit(struct crypto_shash *tfm)
+{
+	struct spacc_hash_ctx *ctx = crypto_shash_ctx(tfm);
+
+	if (ctx->fb) {
+		crypto_free_shash(ctx->fb);
+		ctx->fb = NULL;
+	}
+}
+
+static int spacc_sha1_init_tfm(struct crypto_shash *tfm)
+{
+	spacc_hash_ctx_init(tfm, SPACC_H_SHA1, 20, false, "sha1-lib", 16384);
+	return 0;
+}
+
+static int spacc_sha256_init_tfm(struct crypto_shash *tfm)
+{
+	spacc_hash_ctx_init(tfm, SPACC_H_SHA256, 32, false, "sha256-lib", 4096);
+	return 0;
+}
+
+static int spacc_cmac_init_tfm(struct crypto_shash *tfm)
+{
+	spacc_hash_ctx_init(tfm, SPACC_H_CMAC, 16, true, "cmac(aes-generic)",
+			    1024);
+	return 0;
+}
+
+
+/* ------------------------------------------------------------ HMAC --- */
+
+static int spacc_hmac_setkey(struct crypto_shash *tfm, const u8 *key,
+			     unsigned int keylen)
+{
+	struct spacc_hash_ctx *ctx = crypto_shash_ctx(tfm);
+	struct spacc_hash_ctx sha = {
+		.alg_id = SPACC_H_SHA256, .digestsize = 32, .keyed = false,
+	};
+	u8 digest[32];
+	int err;
+
+	memset(ctx->key, 0, sizeof(ctx->key));
+	if (keylen > sizeof(ctx->key)) {
+		err = spacc_hash_hw(&sha, key, keylen, digest);
+		if (err)
+			return err;
+		memcpy(ctx->key, digest, sizeof(digest));
+	} else {
+		memcpy(ctx->key, key, keylen);
+	}
+	ctx->keylen = sizeof(ctx->key);
+
+	if (ctx->fb)
+		return crypto_shash_setkey(ctx->fb, key, keylen);
+	return 0;
+}
+
+static int spacc_hmac_compute(struct spacc_hash_ctx *ctx, const u8 *msg,
+			      unsigned int len, u8 *out)
+{
+	struct spacc_hash_ctx sha = {
+		.alg_id = SPACC_H_SHA256, .digestsize = 32, .keyed = false,
+	};
+	u8 inner[32];
+	u8 *buf;
+	int i, err;
+
+	if (len > SPACC_HASH_MAX_MSG - 64)
+		return -ENOSPC;
+
+	buf = kmalloc(64 + len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	for (i = 0; i < 64; i++)
+		buf[i] = ctx->key[i] ^ 0x36;
+	memcpy(buf + 64, msg, len);
+	err = spacc_hash_hw(&sha, buf, 64 + len, inner);
+	kfree_sensitive(buf);
+	if (err)
+		return err;
+
+	buf = kmalloc(96, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	for (i = 0; i < 64; i++)
+		buf[i] = ctx->key[i] ^ 0x5c;
+	memcpy(buf + 64, inner, sizeof(inner));
+	err = spacc_hash_hw(&sha, buf, 96, out);
+	kfree_sensitive(buf);
+
+	return err;
+}
+
+static int spacc_hmac_final(struct shash_desc *desc, u8 *out)
+{
+	struct spacc_hash_desc *d = shash_desc_ctx(desc);
+	struct spacc_hash_ctx *ctx = crypto_shash_ctx(desc->tfm);
+	int err;
+
+	if (ctx->fb && d->len < ctx->min_hw)
+		err = spacc_hash_sw(ctx, d->buf, d->len, out);
+	else
+		err = spacc_hmac_compute(ctx, d->buf, d->len, out);
+	spacc_hash_free_desc(d);
+
+	return err;
+}
+
+static int spacc_hmac_digest(struct shash_desc *desc, const u8 *data,
+			     unsigned int len, u8 *out)
+{
+	struct spacc_hash_ctx *ctx = crypto_shash_ctx(desc->tfm);
+	u8 *tmp;
+	int err;
+
+	if (ctx->fb && len < ctx->min_hw)
+		return spacc_hash_sw(ctx, data, len, out);
+
+	tmp = kmalloc(len, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+	memcpy(tmp, data, len);
+	err = spacc_hmac_compute(ctx, tmp, len, out);
+	kfree_sensitive(tmp);
+
+	return err;
+}
+
+static int spacc_hmac_init_tfm(struct crypto_shash *tfm)
+{
+	spacc_hash_ctx_init(tfm, SPACC_H_SHA256, 32, false,
+			    "hmac-sha256-lib", 16384);
+	return 0;
+}
+
+static struct shash_alg spacc_hash_algs[] = {
+	{
+		.digestsize	= 20,
+		.init		= spacc_hash_init,
+		.update		= spacc_hash_update,
+		.final		= spacc_hash_final,
+		.digest		= spacc_hash_digest,
+		.descsize	= sizeof(struct spacc_hash_desc),
+		.init_tfm	= spacc_sha1_init_tfm,
+		.exit_tfm	= spacc_hash_ctx_exit,
+		.base		= {
+			.cra_name	= "sha1",
+			.cra_driver_name = "sha1-ls1024a-spacc",
+			.cra_priority	= 300,
+			.cra_blocksize	= 64,
+			.cra_ctxsize	= sizeof(struct spacc_hash_ctx),
+			.cra_module	= THIS_MODULE,
+		},
+	},
+	{
+		.digestsize	= 32,
+		.init		= spacc_hash_init,
+		.update		= spacc_hash_update,
+		.final		= spacc_hash_final,
+		.digest		= spacc_hash_digest,
+		.descsize	= sizeof(struct spacc_hash_desc),
+		.init_tfm	= spacc_sha256_init_tfm,
+		.exit_tfm	= spacc_hash_ctx_exit,
+		.base		= {
+			.cra_name	= "sha256",
+			.cra_driver_name = "sha256-ls1024a-spacc",
+			.cra_priority	= 300,
+			.cra_blocksize	= 64,
+			.cra_ctxsize	= sizeof(struct spacc_hash_ctx),
+			.cra_module	= THIS_MODULE,
+		},
+	},
+	{
+		.digestsize	= 32,
+		.init		= spacc_hash_init,
+		.update		= spacc_hash_update,
+		.final		= spacc_hmac_final,
+		.digest		= spacc_hmac_digest,
+		.setkey		= spacc_hmac_setkey,
+		.descsize	= sizeof(struct spacc_hash_desc),
+		.init_tfm	= spacc_hmac_init_tfm,
+		.exit_tfm	= spacc_hash_ctx_exit,
+		.base		= {
+			.cra_name	= "hmac(sha256)",
+			.cra_driver_name = "hmac-sha256-ls1024a-spacc",
+			.cra_priority	= 300,
+			.cra_blocksize	= 64,
+			.cra_ctxsize	= sizeof(struct spacc_hash_ctx),
+			.cra_module	= THIS_MODULE,
+		},
+	},
+	{
+		.digestsize	= 16,
+		.init		= spacc_hash_init,
+		.update		= spacc_hash_update,
+		.final		= spacc_hash_final,
+		.digest		= spacc_hash_digest,
+		.setkey		= spacc_hash_setkey,
+		.descsize	= sizeof(struct spacc_hash_desc),
+		.init_tfm	= spacc_cmac_init_tfm,
+		.exit_tfm	= spacc_hash_ctx_exit,
+		.base		= {
+			.cra_name	= "cmac(aes)",
+			.cra_driver_name = "cmac-aes-ls1024a-spacc",
+			.cra_priority	= 300,
+			.cra_blocksize	= 16,
+			.cra_ctxsize	= sizeof(struct spacc_hash_ctx),
+			.cra_module	= THIS_MODULE,
+		},
+	},
+};
 static int spacc_probe(struct platform_device *pdev)
 {
 	struct spacc_dev *spacc;
@@ -1007,6 +1513,25 @@ static int spacc_probe(struct platform_device *pdev)
 		}
 	}
 
+	{
+		int h;
+		bool ok = true;
+
+		for (h = 0; h < ARRAY_SIZE(spacc_hash_algs); h++) {
+			if (crypto_register_shash(&spacc_hash_algs[h])) {
+				dev_warn(&pdev->dev, "hash %s not registered\n",
+					 spacc_hash_algs[h].base.cra_name);
+				while (--h >= 0)
+					crypto_unregister_shash(
+						&spacc_hash_algs[h]);
+				ok = false;
+				break;
+			}
+		}
+		if (ok)
+			spacc_hash_dev = spacc;
+	}
+
 	return 0;
 
 err_ce_stop:
@@ -1028,6 +1553,12 @@ static void spacc_remove(struct platform_device *pdev)
 {
 	struct spacc_dev *spacc = platform_get_drvdata(pdev);
 	int i;
+
+	if (spacc_hash_dev) {
+		for (i = 0; i < ARRAY_SIZE(spacc_hash_algs); i++)
+			crypto_unregister_shash(&spacc_hash_algs[i]);
+		spacc_hash_dev = NULL;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(spacc->algs); i++)
 		crypto_engine_unregister_skcipher(&spacc->algs[i].alg);
