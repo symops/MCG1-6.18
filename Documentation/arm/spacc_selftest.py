@@ -271,8 +271,7 @@ def rate(fn, rounds=3):
 RESULTS = []
 
 # Ниже этого размера драйвер считает сам, выше — в софтовом fallback.
-HW_MIN = {"ecb": 8192, "cbc": 8192, "ctr": 8192,
-          "cmac": 1024, "sha1": 16384, "sha256": 4096, "hmac": 16384}
+HW_MIN = {"ecb": 8192, "cbc": 8192, "ctr": 8192, "cmac": 4096}
 HASH_LIMIT = 64 << 10
 
 
@@ -328,9 +327,6 @@ SKCIPHER = [
 
 HASHES = [
     ("cmac(aes)", 16, BASE_HASH),
-    ("sha1", None, BASE_HASH),
-    ("sha256", None, BASE_HASH),
-    ("hmac(sha256)", 16, BASE_HASH),
 ]
 
 
@@ -566,6 +562,7 @@ def sweep_ctr(entries, upto, step):
 # --------------------------------------------------------------------------
 def parse_args(argv):
     args = []
+    explicit = []
     max_size = MAX_SIZE
     sweep = False
     step = 1 << 17
@@ -581,14 +578,16 @@ def parse_args(argv):
             max_size = int(argv[i], 0)
         elif a.startswith("--step="):
             step = int(a.split("=", 1)[1], 0)
+        elif a.startswith("--sizes="):
+            explicit = [int(x, 0) for x in a.split("=", 1)[1].split(",") if x]
         elif not a.startswith("-"):
             args.append(a)
         i += 1
-    return args, max_size, sweep, step
+    return args, max_size, sweep, step, explicit
 
 
 def main():
-    args, max_size, sweep, step = parse_args(sys.argv[1:])
+    args, max_size, sweep, step, explicit = parse_args(sys.argv[1:])
 
     _raise_buffers()
     load_software()
@@ -610,7 +609,8 @@ def main():
         return 2
 
     sk_sizes = build_sizes(BASE_SKCIPHER, max_size, 16)
-    hash_sizes = build_sizes(BASE_HASH, min(max_size, 64 << 10), 1)
+    hash_sizes = (explicit if explicit
+                  else build_sizes(BASE_HASH, min(max_size, 64 << 10), 1))
 
     print()
     print("== skcipher: движок против софта (до %d байт) ==" % max_size)
