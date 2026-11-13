@@ -539,8 +539,9 @@ def test_gcm_rate(entries, sizes):
             report("gcm(aes)", n, False, None, note="AF_ALG: %s" % exc)
             continue
         note = "ctr движок %.1f" % (n / ch / 1e6)
+        # Отношение к софтовому CTR здесь не печатается: это не эталон GCM.
         report("gcm(aes)", n, True, None, hw_rate=n / g / 1e6,
-               sw_rate=n / cs / 1e6, note=note)
+               note=note + ", ctr софт %.1f (не эталон)" % (n / cs / 1e6))
 
 
 def skcipher_offset(name, key, iv, data, off, encrypt=True):
