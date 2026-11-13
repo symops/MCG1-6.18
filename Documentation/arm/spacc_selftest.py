@@ -134,14 +134,18 @@ def aead_encrypt(name, key, iv, aad, data, authsize):
                     (SOL_ALG, ALG_SET_AEAD_ASSOCLEN,
                      struct.pack("I", len(aad)))]
             op.sendmsg([aad + data], cmsg)
-            want = len(data) + authsize
+            # algif_aead возвращает AAD || шифротекст || тег: AAD копируется
+            # в приёмный буфер без изменений (memcpy_sglist, assoclen).
+            want = len(aad) + len(data) + authsize
             out = bytearray()
             while len(out) < want:
                 piece = op.recv(want - len(out))
                 if not piece:
                     break
                 out += piece
-            return bytes(out)
+            if out[:len(aad)] != aad:
+                raise OSError("AAD в ответе не совпадает с отправленным")
+            return bytes(out[len(aad):])
         finally:
             op.close()
     finally:
@@ -444,6 +448,219 @@ def test_gcm():
         print(dump(want, out, diff))
 
 
+GCM_R = 0xE1 << 120
+
+
+def _gf_mul(x, y):
+    """Умножение в GF(2^128) по определению GCM."""
+    z = 0
+    v = y
+    for i in range(127, -1, -1):
+        if (x >> i) & 1:
+            z ^= v
+        v = ((v >> 1) ^ GCM_R) if v & 1 else (v >> 1)
+    return z
+
+
+def _ghash(h, data):
+    if isinstance(h, (bytes, bytearray)):
+        h = int.from_bytes(h, "big")
+    y = 0
+    for off in range(0, len(data), 16):
+        blk = data[off:off + 16].ljust(16, b"\0")
+        y = _gf_mul(y ^ int.from_bytes(blk, "big"), h)
+    return y.to_bytes(16, "big")
+
+
+def gcm_reference(key, iv, aad, pt, ctr_name="ctr(aes)"):
+    """Эталонный GCM: GHASH здесь, счётчик — через ctr(aes)."""
+    h = skcipher("ecb(aes)", key, None, bytes(16))
+    j0 = iv + b"\x00\x00\x00\x01"
+    ctr = ((int.from_bytes(j0, "big") + 1)
+           & ((1 << 128) - 1)).to_bytes(16, "big")
+    ct = skcipher(ctr_name, key, ctr, pt)
+
+    def pad(b):
+        return b + b"\0" * (-len(b) % 16)
+
+    s = _ghash(h, pad(aad) + pad(ct) +
+               (len(aad) * 8).to_bytes(8, "big") +
+               (len(ct) * 8).to_bytes(8, "big"))
+    ek = skcipher("ecb(aes)", key, None, j0)
+    return ct + bytes(a ^ b for a, b in zip(ek, s))
+
+
+GCM_CASES = [(0, 16), (13, 1), (20, 100), (0, 1000), (13, 4096),
+             (0, 65536), (1, 65537)]
+
+
+def test_gcm_sizes():
+    """GCM против эталона: разные длины, включая некратные 16, и AAD."""
+    key = bytes(range(16))
+    iv = bytes(range(12))
+    for aadlen, n in GCM_CASES:
+        aad = bytes((i * 7 + 1) & 0xff for i in range(aadlen))
+        pt = bytes((i * 11 + 3) & 0xff for i in range(n))
+        try:
+            got = aead_encrypt("gcm(aes)", key, iv, aad, pt, 16)
+            want = gcm_reference(key, iv, aad, pt)
+        except OSError as exc:
+            report("gcm(aes)", n, False, None, note="AF_ALG: %s" % exc)
+            continue
+        d = first_diff(want, got)
+        report("gcm(aes)", n, d is None, d, note="aad=%d" % aadlen)
+        if d is not None:
+            print(dump(want, got, d))
+
+
+def test_gcm_rate(entries, sizes):
+    """Скорость GCM и оценка выигрыша.
+
+    Прямо измерить софтовый GCM нельзя: шаблон gcm не даёт выбрать софтовый
+    CTR отдельно. Поэтому считаются две измеряемые величины — софтовый CTR
+    и GHASH — и по ним оценивается софтовый GCM как последовательная работа
+    двух этапов: 1/(1/ctr + 1/ghash). Это модель, а не замер.
+    """
+    pair = pick_pair(entries, "ctr(aes)")
+    if not pair:
+        return
+    hw, sw, _ = pair
+    print("  %-14s движок gcm(aes), софт ctr(aes) и софтовый GCM по модели"
+          % "gcm(aes)")
+    key = bytes(16)
+    for n in sizes:
+        pt = bytes(n)
+        iv = bytes(12)
+        try:
+            g = rate(lambda: aead_encrypt("gcm(aes)", key, iv, b"", pt, 16))
+            ch = rate(lambda: skcipher(hw, key, bytes(16), pt))
+            cs = rate(lambda: skcipher(sw, key, bytes(16), pt))
+            try:
+                gh = rate(lambda: hash_digest("ghash", bytes(16), pt, 16))
+            except OSError:
+                gh = None
+        except OSError as exc:
+            report("gcm(aes)", n, False, None, note="AF_ALG: %s" % exc)
+            continue
+        note = "ctr движок %.1f" % (n / ch / 1e6)
+        if gh:
+            sw_gcm = 1.0 / (1.0 / (n / cs) + 1.0 / (n / gh))
+            note += ", софт GCM ~%.1f (x%.2f)" % (sw_gcm / 1e6,
+                                                (n / g) / sw_gcm)
+        report("gcm(aes)", n, True, None, hw_rate=n / g / 1e6,
+               sw_rate=n / cs / 1e6, note=note)
+
+
+def skcipher_offset(name, key, iv, data, off, encrypt=True):
+    """Тот же запрос, но буфер начинается со смещения off.
+
+    AF_ALG передаёт в драйвер страницы пользователя, поэтому смещение
+    доходит до DMA как есть. Python-срез bytes копирует и выравнивает,
+    поэтому нужен memoryview поверх bytearray.
+    """
+    buf = bytearray(len(data) + off)
+    buf[off:] = data
+    s = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
+    try:
+        s.bind(("skcipher", name))
+        _tune(s)
+        if key is not None:
+            s.setsockopt(SOL_ALG, ALG_SET_KEY, key)
+        op, _ = s.accept()
+        try:
+            _tune(op)
+            cmsg = [(SOL_ALG, ALG_SET_OP,
+                     struct.pack("I", ALG_OP_ENCRYPT if encrypt
+                                 else ALG_OP_DECRYPT))]
+            if iv is not None:
+                cmsg.append((SOL_ALG, ALG_SET_IV,
+                             struct.pack("I", len(iv)) + iv))
+            op.sendmsg([memoryview(buf)[off:]], cmsg)
+            out = bytearray()
+            while len(out) < len(data):
+                piece = op.recv(min(1 << 20, len(data) - len(out)))
+                if not piece:
+                    break
+                out += piece
+            return bytes(out)
+        finally:
+            op.close()
+    finally:
+        s.close()
+
+
+def test_unaligned(entries):
+    """Невыровненные буферы: движок против софта при том же смещении."""
+    key = bytes(range(16))
+    for name in ("ctr(aes)", "cbc(aes)"):
+        pair = pick_pair(entries, name)
+        if not pair:
+            continue
+        hw, sw, _ = pair
+        for off in (1, 3, 9):
+            for size in (4096, 65536):
+                data = bytes((i * 13 + 5) & 0xff for i in range(size))
+                iv = bytes(16)
+                try:
+                    got = skcipher_offset(hw, key, iv, data, off)
+                    ref = skcipher_offset(sw, key, iv, data, off)
+                except OSError as exc:
+                    report(name + " off", size, False, None,
+                           note="смещение %d: %s" % (off, exc))
+                    continue
+                d = first_diff(ref, got)
+                report(name + " off", size, d is None, d,
+                       note="смещение %d" % off)
+                if d is not None:
+                    print(dump(ref, got, d))
+
+
+GCM_ONLY_SIZES = [1024, 8192, 65536, 524288, 1048576]
+
+
+def run_gcm_only():
+    """Только скорость gcm(aes): годится и без нашего драйвера.
+
+    Запуск без драйвера даёт замер софтового GCM той же самой меркой.
+    """
+    ent = read_proc_crypto()
+    impl = [e for e in ent if e.get("name") == "gcm(aes)"]
+    print("== gcm(aes) ==")
+    for e in impl:
+        print("  driver: %s  prio %s" % (e.get("driver"), e.get("priority")))
+    key = bytes(16)
+    iv = bytes(12)
+    for n in GCM_ONLY_SIZES:
+        pt = bytes(n)
+        try:
+            t = rate(lambda: aead_encrypt("gcm(aes)", key, iv, b"", pt, 16))
+        except OSError as exc:
+            print("  %8d  ошибка: %s" % (n, exc))
+            continue
+        print("  %8d  %6.2f МБ/с" % (n, n / t / 1e6))
+    return 0
+
+
+def test_gcm_chunk_probe():
+    """Гипотеза: 16 байт тега в начале запроса сдвигают куски по 128 КиБ.
+
+    Если она верна, размер, при котором cryptlen+16 кратен 128 КиБ, будет
+    заметно быстрее соседних.
+    """
+    key = bytes(16)
+    iv = bytes(12)
+    print("  %-14s проверка сдвига куска" % "gcm(aes)")
+    for n in (1048576 - 16, 1048576, 1048576 + 16):
+        pt = bytes(n)
+        try:
+            t = rate(lambda: aead_encrypt("gcm(aes)", key, iv, b"", pt, 16))
+        except OSError as exc:
+            print("  gcm %8d  ошибка: %s" % (n, exc))
+            continue
+        print("  gcm %8d  cryptlen+16=%8d  %5.1f МБ/с"
+              % (n, n + 16, n / t / 1e6))
+
+
 def read_param(name):
     try:
         with open("/sys/module/%s/parameters/%s" % (OUR_MODULE, name)) as f:
@@ -563,6 +780,8 @@ def sweep_ctr(entries, upto, step):
 def parse_args(argv):
     args = []
     explicit = []
+    sk_explicit = []
+    gcm_only = False
     max_size = MAX_SIZE
     sweep = False
     step = 1 << 17
@@ -580,16 +799,26 @@ def parse_args(argv):
             step = int(a.split("=", 1)[1], 0)
         elif a.startswith("--sizes="):
             explicit = [int(x, 0) for x in a.split("=", 1)[1].split(",") if x]
+        elif a == "--gcm-only":
+            gcm_only = True
+        elif a.startswith("--sk-sizes="):
+            sk_explicit = [int(x, 0)
+                           for x in a.split("=", 1)[1].split(",") if x]
         elif not a.startswith("-"):
             args.append(a)
         i += 1
-    return args, max_size, sweep, step, explicit
+    return (args, max_size, sweep, step, explicit, sk_explicit,
+            gcm_only)
 
 
 def main():
-    args, max_size, sweep, step, explicit = parse_args(sys.argv[1:])
+    (args, max_size, sweep, step, explicit, sk_explicit,
+     gcm_only) = parse_args(sys.argv[1:])
 
     _raise_buffers()
+    if gcm_only:
+        return run_gcm_only()
+
     load_software()
     entries = read_proc_crypto()
 
@@ -608,7 +837,8 @@ def main():
         print("  драйвер не загружен")
         return 2
 
-    sk_sizes = build_sizes(BASE_SKCIPHER, max_size, 16)
+    sk_sizes = (sk_explicit if sk_explicit
+                else build_sizes(BASE_SKCIPHER, max_size, 16))
     hash_sizes = (explicit if explicit
                   else build_sizes(BASE_HASH, min(max_size, 64 << 10), 1))
 
@@ -636,6 +866,13 @@ def main():
 
     print("== AEAD ==")
     test_gcm()
+    test_gcm_sizes()
+    test_gcm_rate(entries, [1024, 8192, 65536, 524288, 1048576])
+
+    test_gcm_chunk_probe()
+
+    print("== невыровненные буферы ==")
+    test_unaligned(entries)
     print()
 
     if "--no-pipeline" not in sys.argv and read_param("depth") is not None:
