@@ -13,6 +13,7 @@ AF_ALG. Ничего, кроме python3 и стандартной библио�
 
 import os
 import socket
+import subprocess
 import struct
 import sys
 import threading
@@ -41,6 +42,19 @@ def _tune(sock):
             sock.setsockopt(socket.SOL_SOCKET, opt, BIG)
         except OSError:
             pass
+
+
+SOFT_MODULES = ("aes_arm_bs", "aes_arm", "aes_generic", "cbc", "ecb", "ctr",
+                "gcm", "ghash_arm_ce", "sha1", "sha256", "cmac")
+
+
+def load_software():
+    """Софтовые реализации появляются в /proc/crypto только после загрузки."""
+    if os.geteuid() != 0:
+        return
+    for mod in SOFT_MODULES:
+        subprocess.run(["modprobe", mod], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
 
 
 def _raise_buffers():
@@ -577,6 +591,7 @@ def main():
     args, max_size, sweep, step = parse_args(sys.argv[1:])
 
     _raise_buffers()
+    load_software()
     entries = read_proc_crypto()
 
     print("== реализации SPACC ==")
