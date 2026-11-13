@@ -7,8 +7,8 @@
 #
 # Драйвер возвращается на место в любом случае, включая прерывание.
 
-TEST=${TEST:-/data/shared/new/spacc_selftest.py}
-MODULE_FILE=${MODULE_FILE:-/data/shared/new/ls1024a-spacc.ko}
+TEST=${TEST:-spacc_selftest.py}
+MODULE_FILE=${MODULE_FILE:-ls1024a-spacc.ko}
 PY=${PY:-python3}
 
 HW=$(mktemp)
