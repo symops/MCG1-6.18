@@ -72,6 +72,7 @@
 #define SPA_STATUS_ICV_FAIL		1
 #define SPA_STATUS_MEMORY_ERROR		2
 #define SPA_STATUS_BLOCK_ERROR		3
+#define SPA_STATUS_SEC_ERROR		4
 
 #define SPA_STATUS_RES_CODE_OFFSET	24
 #define SPA_STATUS_RES_CODE_MASK	(0x3 << SPA_STATUS_RES_CODE_OFFSET)
@@ -139,6 +140,9 @@ struct spacc_dev {
 	struct completion done;
 	int req_err;
 	unsigned int next_ctx;
+	atomic_t ctx_seq;
+	/* bumped whenever a context page gets a different key */
+	u32 ctx_gen[32];
 	bool is_spacc3;
 	/* ecb(aes), cbc(aes) and ctr(aes) */
 	struct spacc_alg algs[3];
@@ -152,6 +156,9 @@ struct spacc_ctx {
 	unsigned int keylen;
 	bool use_fallback;
 	bool is_ctr;
+	/* context page owned by this tfm, and the generation it holds */
+	unsigned int ctx_id;
+	unsigned int key_gen;
 	/* serializes lazy fallback allocation and rekeying */
 	struct mutex lock;
 };
@@ -221,8 +228,10 @@ static int spacc_status_to_errno(u32 code)
 		return -EFAULT;
 	case SPA_STATUS_BLOCK_ERROR:
 		return -EIO;
+	case SPA_STATUS_SEC_ERROR:
+		return -EIO;
 	default:
-		return -EINVAL;
+		return -EIO;
 	}
 }
 
@@ -401,10 +410,19 @@ static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 		}
 	}
 
-	ctx_id = (spacc->next_ctx++) & 0x1f;
+	/*
+	 * The key stays in the context page until another tfm takes the page
+	 * over; only the IV changes per request.  Saving the key copy keeps
+	 * four MMIO writes out of the small-request path.
+	 */
+	ctx_id = ctx->ctx_id;
 	page = spacc->cipher_ctx_base + (ctx_id * spacc->cipher_pg_sz);
 
-	spacc_memcpy_toio32(page, ctx->key, ctx->keylen);
+	if (spacc->ctx_gen[ctx_id] != ctx->key_gen) {
+		spacc_memcpy_toio32(page, ctx->key, ctx->keylen);
+		spacc->ctx_gen[ctx_id]++;
+		ctx->key_gen = spacc->ctx_gen[ctx_id];
+	}
 	if (ivsize)
 		spacc_memcpy_toio32(page + 32, iv, ivsize);
 
@@ -610,6 +628,9 @@ static int spacc_cra_init(struct crypto_skcipher *tfm)
 	ctx->spacc = spacc_alg->spacc;
 	ctx->ctrl_default = spacc_alg->ctrl_default;
 	ctx->is_ctr = spacc_alg->is_ctr;
+	ctx->ctx_id = atomic_inc_return(&spacc_alg->spacc->ctx_seq) & 0x1f;
+	/* force the key write on first use */
+	ctx->key_gen = 0xffffffffu;
 	mutex_init(&ctx->lock);
 
 	/*
@@ -680,6 +701,8 @@ static int spacc_aes_setkey_locked(struct crypto_skcipher *tfm, const u8 *key,
 
 	memcpy(ctx->key, key, keylen);
 	ctx->keylen = keylen;
+	/* a new key must reach the context page on the next command */
+	ctx->key_gen = 0xffffffffu;
 
 	/* If 192-bit AES is requested and not natively supported, fallback */
 	ctx->use_fallback = (keylen == AES_KEYSIZE_192);
