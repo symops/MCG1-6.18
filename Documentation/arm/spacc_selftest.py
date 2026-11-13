@@ -516,16 +516,15 @@ def test_gcm_sizes():
 def test_gcm_rate(entries, sizes):
     """Скорость GCM и оценка выигрыша.
 
-    Прямо измерить софтовый GCM нельзя: шаблон gcm не даёт выбрать софтовый
-    CTR отдельно. Поэтому считаются две измеряемые величины — софтовый CTR
-    и GHASH — и по ним оценивается софтовый GCM как последовательная работа
-    двух этапов: 1/(1/ctr + 1/ghash). Это модель, а не замер.
+    Рядом печатается только чистый софтовый CTR — как точка отсчёта для
+    понимания, сколько забирает проход GHASH. Настоящее сравнение с софтовым
+    GCM делает режим --gcm-only, запущенный с выгруженным драйвером.
     """
     pair = pick_pair(entries, "ctr(aes)")
     if not pair:
         return
     hw, sw, _ = pair
-    print("  %-14s движок gcm(aes), софт ctr(aes) и софтовый GCM по модели"
+    print("  %-14s движок gcm(aes), рядом софтовый ctr(aes) для масштаба"
           % "gcm(aes)")
     key = bytes(16)
     for n in sizes:
@@ -535,18 +534,11 @@ def test_gcm_rate(entries, sizes):
             g = rate(lambda: aead_encrypt("gcm(aes)", key, iv, b"", pt, 16))
             ch = rate(lambda: skcipher(hw, key, bytes(16), pt))
             cs = rate(lambda: skcipher(sw, key, bytes(16), pt))
-            try:
-                gh = rate(lambda: hash_digest("ghash", bytes(16), pt, 16))
-            except OSError:
-                gh = None
+
         except OSError as exc:
             report("gcm(aes)", n, False, None, note="AF_ALG: %s" % exc)
             continue
         note = "ctr движок %.1f" % (n / ch / 1e6)
-        if gh:
-            sw_gcm = 1.0 / (1.0 / (n / cs) + 1.0 / (n / gh))
-            note += ", софт GCM ~%.1f (x%.2f)" % (sw_gcm / 1e6,
-                                                (n / g) / sw_gcm)
         report("gcm(aes)", n, True, None, hw_rate=n / g / 1e6,
                sw_rate=n / cs / 1e6, note=note)
 
