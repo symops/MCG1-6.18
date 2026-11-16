@@ -75,8 +75,9 @@
 #define SPA_STATUS_MEMORY_ERROR		2
 #define SPA_STATUS_BLOCK_ERROR		3
 
+#define SPA_STATUS_SECURITY_ERROR	4
 #define SPA_STATUS_RES_CODE_OFFSET	24
-#define SPA_STATUS_RES_CODE_MASK	(0x3 << SPA_STATUS_RES_CODE_OFFSET)
+#define SPA_STATUS_RES_CODE_MASK	(0x7 << SPA_STATUS_RES_CODE_OFFSET)
 
 /* IRQ control/status bits */
 #define SPA_IRQ_EN_CMD0_EN		BIT(0)
@@ -218,6 +219,8 @@ static int spacc_status_to_errno(u32 code)
 		return -EBADMSG;
 	case SPA_STATUS_MEMORY_ERROR:
 		return -EFAULT;
+	case SPA_STATUS_SECURITY_ERROR:
+		return -EACCES;
 	case SPA_STATUS_BLOCK_ERROR:
 		return -EIO;
 	default:
@@ -335,6 +338,9 @@ static int spacc_sw_crypt(struct spacc_ctx *ctx, struct scatterlist *src,
 {
 	SYNC_SKCIPHER_REQUEST_ON_STACK(subreq, ctx->fallback_tfm);
 	int err;
+
+        if (!ctx->fallback_tfm)
+                return -EINVAL;
 
 	skcipher_request_set_sync_tfm(subreq, ctx->fallback_tfm);
 	skcipher_request_set_callback(subreq, flags, NULL, NULL);
@@ -1101,10 +1107,16 @@ static int spacc_hash_final(struct shash_desc *desc, u8 *out)
 	struct spacc_hash_ctx *ctx = crypto_shash_ctx(desc->tfm);
 	int err;
 
+	if (!d->len && !ctx->fb && !d->have)
+                return -EINVAL;
+
 	if (!d->len && d->have) {
 		memcpy(out, d->digest, ctx->digestsize);
 		return 0;
 	}
+
+        if (!ctx->fb && d->len > SPACC_HASH_HW_MAX)
+                return -EINVAL;
 
 	if (ctx->keyed && ctx->keylen != AES_KEYSIZE_128)
 		err = -EINVAL;
@@ -1136,6 +1148,14 @@ static int spacc_hash_digest(struct shash_desc *desc, const u8 *data,
 
 	if (ctx->fb && len < ctx->min_hw)
 		return spacc_hash_sw(ctx, data, len, out);
+
+        /*
+         * Движок читает длину по модулю 64 КиБ: выше предела он вернёт
+         * дайджест не того сообщения и не сообщит об ошибке.
+         */
+        if (len > SPACC_HASH_HW_MAX)
+                return ctx->fb ? spacc_hash_sw(ctx, data, len, out)
+                                : -EINVAL;
 
 	/*
 	 * The caller's buffer may live in vmalloc space (module .rodata, for
@@ -1267,6 +1287,10 @@ static int spacc_probe(struct platform_device *pdev)
 
 	/* Map MMIO registers */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+        if (!res) {
+                ret = -ENXIO;
+                goto err_reset_assert;
+        }
 	spacc->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(spacc->regs)) {
 		ret = PTR_ERR(spacc->regs);
