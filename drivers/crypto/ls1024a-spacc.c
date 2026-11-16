@@ -339,8 +339,8 @@ static int spacc_sw_crypt(struct spacc_ctx *ctx, struct scatterlist *src,
 	SYNC_SKCIPHER_REQUEST_ON_STACK(subreq, ctx->fallback_tfm);
 	int err;
 
-        if (!ctx->fallback_tfm)
-                return -EINVAL;
+	if (!ctx->fallback_tfm)
+		return -EINVAL;
 
 	skcipher_request_set_sync_tfm(subreq, ctx->fallback_tfm);
 	skcipher_request_set_callback(subreq, flags, NULL, NULL);
@@ -1108,15 +1108,15 @@ static int spacc_hash_final(struct shash_desc *desc, u8 *out)
 	int err;
 
 	if (!d->len && !ctx->fb && !d->have)
-                return -EINVAL;
+		return -EINVAL;
 
 	if (!d->len && d->have) {
 		memcpy(out, d->digest, ctx->digestsize);
 		return 0;
 	}
 
-        if (!ctx->fb && d->len > SPACC_HASH_HW_MAX)
-                return -EINVAL;
+	if (!ctx->fb && d->len > SPACC_HASH_HW_MAX)
+		return -EINVAL;
 
 	if (ctx->keyed && ctx->keylen != AES_KEYSIZE_128)
 		err = -EINVAL;
@@ -1149,13 +1149,13 @@ static int spacc_hash_digest(struct shash_desc *desc, const u8 *data,
 	if (ctx->fb && len < ctx->min_hw)
 		return spacc_hash_sw(ctx, data, len, out);
 
-        /*
-         * Движок читает длину по модулю 64 КиБ: выше предела он вернёт
-         * дайджест не того сообщения и не сообщит об ошибке.
-         */
-        if (len > SPACC_HASH_HW_MAX)
-                return ctx->fb ? spacc_hash_sw(ctx, data, len, out)
-                                : -EINVAL;
+	/*
+	 * The engine reads the length modulo 64 KiB: above that limit it
+	 * digests a different message and reports no error.
+	 */
+	if (len > SPACC_HASH_HW_MAX)
+		return ctx->fb ? spacc_hash_sw(ctx, data, len, out)
+				: -EINVAL;
 
 	/*
 	 * The caller's buffer may live in vmalloc space (module .rodata, for
@@ -1287,10 +1287,10 @@ static int spacc_probe(struct platform_device *pdev)
 
 	/* Map MMIO registers */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-        if (!res) {
-                ret = -ENXIO;
-                goto err_reset_assert;
-        }
+	if (!res) {
+		ret = -ENXIO;
+		goto err_reset_assert;
+	}
 	spacc->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(spacc->regs)) {
 		ret = PTR_ERR(spacc->regs);
