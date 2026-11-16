@@ -891,7 +891,6 @@ static const struct spacc_alg spacc_algs_tmpl[] = {
 /* ------------------------------------------------------- hash / MAC --- */
 
 /* Largest message buffered for one hardware job; SMB packets are smaller. */
-#define SPACC_HASH_MAX_MSG	(256 * 1024)
 /* the engine reads the length modulo 64 KiB; above that it sees zero */
 #define SPACC_HASH_HW_MAX	(64 * 1024)
 
@@ -915,6 +914,8 @@ struct spacc_hash_desc {
 	u8 *buf;
 	unsigned int len;
 	unsigned int alloc;
+	/* streaming software hash, set when the message exceeds the hw window */
+	struct shash_desc *sw;
 	/* the digest survives a repeated final(), see spacc_hash_final() */
 	bool have;
 	u8 digest[64];
@@ -922,6 +923,8 @@ struct spacc_hash_desc {
 
 static void spacc_hash_free_desc(struct spacc_hash_desc *d)
 {
+	kfree_sensitive(d->sw);
+	d->sw = NULL;
 	kfree(d->buf);
 	d->buf = NULL;
 	d->len = 0;
@@ -1072,6 +1075,7 @@ static int spacc_hash_init(struct shash_desc *desc)
 	struct spacc_hash_desc *d = shash_desc_ctx(desc);
 
 	d->len = 0;
+	d->sw = NULL;
 	d->have = false;
 	return 0;
 }
@@ -1080,24 +1084,59 @@ static int spacc_hash_update(struct shash_desc *desc, const u8 *data,
 			     unsigned int len)
 {
 	struct spacc_hash_desc *d = shash_desc_ctx(desc);
-	unsigned int need = d->len + len;
-	u8 *p;
+	struct spacc_hash_ctx *ctx = crypto_shash_ctx(desc->tfm);
+	int err;
 
-	if (need > SPACC_HASH_MAX_MSG)
-		return -ENOSPC;
-	if (need > d->alloc) {
-		unsigned int na = max(d->alloc * 2, need);
+	if (d->sw)
+		return crypto_shash_update(d->sw, data, len);
 
-		if (na > SPACC_HASH_MAX_MSG)
-			na = SPACC_HASH_MAX_MSG;
-		p = krealloc(d->buf, na, GFP_KERNEL);
-		if (!p)
-			return -ENOMEM;
-		d->buf = p;
-		d->alloc = na;
+	if (d->len + len <= SPACC_HASH_HW_MAX) {
+		if (d->len + len > d->alloc) {
+			unsigned int na = max(d->alloc * 2, d->len + len);
+			u8 *p;
+
+			na = min(na, (unsigned int)SPACC_HASH_HW_MAX);
+			p = krealloc(d->buf, na, GFP_KERNEL);
+			if (!p)
+				return -ENOMEM;
+			d->buf = p;
+			d->alloc = na;
+		}
+		memcpy(d->buf + d->len, data, len);
+		d->len += len;
+		return 0;
 	}
-	memcpy(d->buf + d->len, data, len);
-	d->len += len;
+
+	/*
+	 * The engine takes at most SPACC_HASH_HW_MAX bytes per command and
+	 * cannot chain commands, so a longer message is hashed in software.
+	 * Switch once: the buffered prefix is streamed into a software
+	 * descriptor and the buffer is released.
+	 */
+	if (!ctx->fb)
+		return -EINVAL;
+
+	d->sw = kmalloc(sizeof(*d->sw) + crypto_shash_descsize(ctx->fb),
+			GFP_KERNEL);
+	if (!d->sw)
+		return -ENOMEM;
+
+	d->sw->tfm = ctx->fb;
+	err = crypto_shash_init(d->sw);
+	if (!err && d->len)
+		err = crypto_shash_update(d->sw, d->buf, d->len);
+	if (!err)
+		err = crypto_shash_update(d->sw, data, len);
+	if (err) {
+		kfree_sensitive(d->sw);
+		d->sw = NULL;
+		return err;
+	}
+
+	kfree_sensitive(d->buf);
+	d->buf = NULL;
+	d->len = 0;
+	d->alloc = 0;
 	return 0;
 }
 
@@ -1106,6 +1145,18 @@ static int spacc_hash_final(struct shash_desc *desc, u8 *out)
 	struct spacc_hash_desc *d = shash_desc_ctx(desc);
 	struct spacc_hash_ctx *ctx = crypto_shash_ctx(desc->tfm);
 	int err;
+
+	if (d->sw) {
+		err = crypto_shash_final(d->sw, out);
+		kfree_sensitive(d->sw);
+		d->sw = NULL;
+		if (!err) {
+			memcpy(d->digest, out, ctx->digestsize);
+			d->have = true;
+		}
+		spacc_hash_free_desc(d);
+		return err;
+	}
 
 	if (!d->len && !ctx->fb && !d->have)
 		return -EINVAL;
