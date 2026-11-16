@@ -119,6 +119,32 @@ def hash_digest(name, key, data, digestsize):
         s.close()
 
 
+def hash_digest_parts(name, key, data, digestsize, piece):
+    """Тот же дайджест, но отправленный несколькими update подряд.
+
+    Нужен, чтобы проверить переключение на поток: первый кусок копится в
+    буфере драйвера, а на втором сумма превышает аппаратное окно и драйвер
+    обязан скармливать накопленный префикс программному дескриптору.
+    """
+    s = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
+    try:
+        s.bind(("hash", name))
+        if key is not None:
+            s.setsockopt(SOL_ALG, ALG_SET_KEY, key)
+        op, _ = s.accept()
+        try:
+            n = len(data)
+            for off in range(0, n, piece):
+                last = off + piece >= n
+                # без MSG_MORE AF_ALG финализирует каждый кусок отдельно
+                flags = 0 if last else socket.MSG_MORE
+                op.sendmsg([data[off:off + piece]], [], flags)
+            return op.recv(digestsize)
+        finally:
+            op.close()
+    finally:
+        s.close()
+
 def aead_encrypt(name, key, iv, aad, data, authsize):
     s = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
     try:
@@ -275,7 +301,8 @@ def rate(fn, rounds=3):
 RESULTS = []
 
 # Ниже этого размера драйвер считает сам, выше — в софтовом fallback.
-HW_MIN = {"ecb": 8192, "cbc": 8192, "ctr": 8192, "cmac": 4096}
+HW_MIN = {"ecb": 8192, "cbc": 8192, "ctr": 8192, "cmac": 4096,
+          "sha256": 32768}
 HASH_LIMIT = 64 << 10
 
 
@@ -307,7 +334,7 @@ def report(alg, size, ok, diff, hw_rate=None, sw_rate=None, note=""):
 # --------------------------------------------------------------------------
 BASE_SKCIPHER = [16, 64, 1024, 8192, 16384, 65536, 131072, 262144, 917504,
                  1048576, 1052672]
-BASE_HASH = [3, 64, 1024, 4096, 16384, 65536]
+BASE_HASH = [3, 64, 1024, 4096, 16384, 65536, 131072, 262144]
 
 
 def build_sizes(base, max_size, align=16):
@@ -331,6 +358,7 @@ SKCIPHER = [
 
 HASHES = [
     ("cmac(aes)", 16, BASE_HASH),
+    ("sha256", None, BASE_HASH),
 ]
 
 
@@ -421,6 +449,16 @@ def test_hashes(entries, name, keylen, sizes):
                note=path_note(name, size))
         if diff is not None:
             print(dump(ref, got, diff))
+
+        # переключение на поток: то же сообщение, но кусками
+        if size >= 131072 and size % 4096 == 0:
+            piece = 40000
+            part = hash_digest_parts(name, key, data, digestsize, piece)
+            d2 = first_diff(ref, part)
+            report(name + " частями", size, d2 is None, d2,
+                   note="по %d" % piece)
+            if d2 is not None:
+                print(dump(ref, part, d2))
 
 
 GCM_VECTOR = {
@@ -654,6 +692,71 @@ def test_gcm_chunk_probe():
               % (n, n + 16, n / t / 1e6))
 
 
+def bench_threads(name, size, nthreads, seconds=2.0):
+    """Суммарная скорость при нескольких потоках.
+
+    Однопоточный замер ничего не говорит о конвейере: в очереди в любой
+    момент не больше одного запроса. Здесь N потоков шлют запросы
+    одновременно, и видно, растёт ли суммарная скорость.
+    """
+    import threading
+
+    key = bytes(range(16))
+    iv = None if name.startswith("ecb") else bytes(16)
+    data = bytes(size)
+    counts = [0] * nthreads
+    deadline = time.monotonic() + seconds
+
+    errors = [None] * nthreads
+
+    def worker(i):
+        done = 0
+        try:
+            while time.monotonic() < deadline:
+                skcipher(name, key, iv, data)
+                done += size
+        except OSError as exc:
+            errors[i] = exc
+        counts[i] = done
+
+    t0 = time.monotonic()
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(nthreads)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    elapsed = time.monotonic() - t0
+    for exc in errors:
+        if exc is not None:
+            raise exc
+
+    return sum(counts) / elapsed / 1e6
+
+
+def test_threads(entries, name="cbc(aes)", size=65536, top=0):
+    pair = pick_pair(entries, name)
+    if not pair:
+        print("  %-14s нет пары, пропуск" % name)
+        return 0
+    hw, _sw, _ = pair
+    plan = [1, 2, 4, 8]
+    if top and top not in plan:
+        plan.append(top)
+    base = None
+    print("  %-14s движок %s, запрос %d байт" % (name, hw, size))
+    for n in plan:
+        try:
+            rate_mb = bench_threads(hw, size, n)
+        except OSError as exc:
+            print("  потоков %d  ошибка: %s" % (n, exc))
+            continue
+        if base is None:
+            base = rate_mb
+        rel = ("x%.2f" % (rate_mb / base)) if base else "n/a"
+        print("  потоков %d  %6.1f МБ/с  %s" % (n, rate_mb, rel))
+    return base
+
+
 def read_param(name):
     try:
         with open("/sys/module/%s/parameters/%s" % (OUR_MODULE, name)) as f:
@@ -775,6 +878,7 @@ def parse_args(argv):
     explicit = []
     sk_explicit = []
     gcm_only = False
+    threads = 0
     max_size = MAX_SIZE
     sweep = False
     step = 1 << 17
@@ -792,6 +896,8 @@ def parse_args(argv):
             step = int(a.split("=", 1)[1], 0)
         elif a.startswith("--sizes="):
             explicit = [int(x, 0) for x in a.split("=", 1)[1].split(",") if x]
+        elif a.startswith("--threads="):
+            threads = int(a.split("=", 1)[1])
         elif a == "--gcm-only":
             gcm_only = True
         elif a.startswith("--sk-sizes="):
@@ -801,16 +907,21 @@ def parse_args(argv):
             args.append(a)
         i += 1
     return (args, max_size, sweep, step, explicit, sk_explicit,
-            gcm_only)
+            gcm_only, threads)
 
 
 def main():
     (args, max_size, sweep, step, explicit, sk_explicit,
-     gcm_only) = parse_args(sys.argv[1:])
+     gcm_only, threads) = parse_args(sys.argv[1:])
 
     _raise_buffers()
     if gcm_only:
         return run_gcm_only()
+
+    if threads:
+        print("== многопоточный замер ==")
+        test_threads(read_proc_crypto(), top=threads)
+        return 0
 
     load_software()
     entries = read_proc_crypto()
@@ -833,7 +944,7 @@ def main():
     sk_sizes = (sk_explicit if sk_explicit
                 else build_sizes(BASE_SKCIPHER, max_size, 16))
     hash_sizes = (explicit if explicit
-                  else build_sizes(BASE_HASH, min(max_size, 64 << 10), 1))
+                  else build_sizes(BASE_HASH, max_size, 1))
 
     print()
     print("== skcipher: движок против софта (до %d байт) ==" % max_size)
