@@ -461,6 +461,34 @@ def test_hashes(entries, name, keylen, sizes):
                 print(dump(ref, part, d2))
 
 
+def test_key192(entries):
+    """AES-192: движок против софта с 24-байтным ключом.
+
+    Вендорский референс объявляет размеры ключа {16, 24, 32} для всех
+    режимов AES, поэтому 192 должен работать на движке. Проверка отвечает
+    на это замером, а не предположением.
+    """
+    key = bytes((i * 5 + 1) & 0xff for i in range(24))
+    for name in ("ecb(aes)", "cbc(aes)", "ctr(aes)"):
+        pair = pick_pair(entries, name)
+        if not pair:
+            continue
+        hw, sw, _ = pair
+        print("  %-14s движок %s, ключ 192" % (name, hw))
+        iv = None if name.startswith("ecb") else bytes(16)
+        for size in (8192, 65536, 262144):
+            data = bytes((i * 13 + 7) & 0xff for i in range(size))
+            try:
+                got = skcipher(hw, key, iv, data)
+                ref = skcipher(sw, key, iv, data)
+            except OSError as exc:
+                report(name + " 192", size, False, None, note=str(exc))
+                continue
+            d = first_diff(ref, got)
+            report(name + " 192", size, d is None, d)
+            if d is not None:
+                print(dump(ref, got, d))
+
 GCM_VECTOR = {
     "key": bytes(16),
     "iv": bytes(12),
@@ -967,6 +995,10 @@ def main():
             continue
         test_hashes(entries, name, keylen, hash_sizes)
         print()
+
+    print("== AES-192 ==")
+    test_key192(entries)
+    print()
 
     print("== AEAD ==")
     test_gcm()
