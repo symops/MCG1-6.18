@@ -161,7 +161,6 @@ struct spacc_ctx {
 	u32 ctrl_default;
 	u8 key[AES_MAX_KEY_SIZE] __aligned(4);
 	unsigned int keylen;
-	bool use_fallback;
 	bool is_ctr;
 	/* Serializes lazy fallback allocation and rekeying */
 	struct mutex lock;
@@ -651,13 +650,6 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 	if (req->cryptlen == 0)
 		goto finalize;
 
-	/* AES-192 is not supported by the engine. */
-	if (unlikely(ctx->use_fallback)) {
-		err = spacc_sw_crypt(ctx, req->src, req->dst, req->cryptlen,
-				     req->iv, rctx->is_encrypt, req->base.flags);
-		goto finalize;
-	}
-
 	if (ivsize)
 		memcpy(iv, req->iv, ivsize);
 
@@ -846,9 +838,6 @@ static int spacc_aes_setkey_locked(struct crypto_skcipher *tfm, const u8 *key,
 
 	memcpy(ctx->key, key, keylen);
 	ctx->keylen = keylen;
-
-	/* AES-192 is not supported natively by LS1024A SPACC */
-	ctx->use_fallback = (keylen == AES_KEYSIZE_192);
 
 	return 0;
 }
