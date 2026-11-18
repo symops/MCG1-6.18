@@ -29,7 +29,6 @@
 #include <linux/reset.h>
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
-#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -100,6 +99,7 @@
 #define SPACC_CIPHER_PG_SZ		128
 #define SPACC_CIPHER_IV_OFFSET		32
 #define SPACC_CRYPTO_BASE_OFFSET	0x00040000
+#define SPACC_MIN_MMIO_SIZE		0x00048000
 
 /*
  * Clamp chunk size to the largest AES-block-aligned value that fits in
@@ -296,7 +296,7 @@ static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 {
 	struct spacc_dev *spacc = dev_id;
 	unsigned long flags;
-	u32 stat, status, code;
+	u32 stat, cstat, status, code;
 
 	spin_lock_irqsave(&spacc->lock, flags);
 
@@ -307,12 +307,9 @@ static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 	}
 
 	/* Clear interrupt: source first, then top-level aggregator */
-	if (spacc->crypto_regs != spacc->pdu_regs) {
-		u32 cstat = readl(spacc->crypto_regs + SPACC_REG_IRQ_STAT);
-
-		if (cstat)
-			writel(cstat, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
-	}
+	cstat = readl(spacc->crypto_regs + SPACC_REG_IRQ_STAT);
+	if (cstat)
+		writel(cstat, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
 	writel(stat, spacc->pdu_regs + SPACC_REG_IRQ_STAT);
 
 	/*
@@ -409,8 +406,7 @@ static void spacc_hw_init_regs(struct spacc_dev *spacc)
 	}
 
 	/* Clear any stale pending interrupts */
-	if (spacc->crypto_regs != spacc->pdu_regs)
-		writel(~0, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
+	writel(~0, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
 	writel(~0, spacc->pdu_regs + SPACC_REG_IRQ_STAT);
 
 	/*
@@ -802,6 +798,10 @@ static int spacc_aes_setkey_locked(struct crypto_skcipher *tfm, const u8 *key,
 	struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
 	int err;
 
+	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
+	    keylen != AES_KEYSIZE_256)
+		return -EINVAL;
+
 	/*
 	 * CTR has no fallback at init time (see cra_init); allocate it here,
 	 * where the crypto manager is free, so that small requests can still be
@@ -820,10 +820,6 @@ static int spacc_aes_setkey_locked(struct crypto_skcipher *tfm, const u8 *key,
 			return err;
 		}
 	}
-
-	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
-	    keylen != AES_KEYSIZE_256)
-		return -EINVAL;
 
 	/* fallback_tfm is guaranteed non-NULL by cra_init() or the block above */
 	crypto_sync_skcipher_clear_flags(ctx->fallback_tfm,
@@ -1061,17 +1057,13 @@ static int spacc_probe(struct platform_device *pdev)
 		goto err_reset_assert;
 	}
 
-	/*
-	 * Full LS1024A IPsec/SPACC block window (>= 0x48000) maps top-level PDU
-	 * registers at offset 0 and the SPACC core at 0x40000. A 64 KiB window
-	 * maps the SPACC core directly at offset 0.
-	 */
-	if (resource_size(res) >= 0x48000)
-		spacc->crypto_regs = spacc->regs + SPACC_CRYPTO_BASE_OFFSET;
-	else
-		spacc->crypto_regs = spacc->regs;
+	if (resource_size(res) < SPACC_MIN_MMIO_SIZE) {
+		ret = -EINVAL;
+		goto err_reset_assert;
+	}
 
 	spacc->pdu_regs = spacc->regs;
+	spacc->crypto_regs = spacc->regs + SPACC_CRYPTO_BASE_OFFSET;
 	spacc->cipher_ctx_base = spacc->crypto_regs + SPACC_REG_CIPH_KEY_BASE;
 	spacc->cipher_pg_sz = SPACC_CIPHER_PG_SZ;
 
