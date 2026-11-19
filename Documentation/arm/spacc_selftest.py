@@ -73,7 +73,7 @@ def _raise_buffers():
 
 
 def skcipher(name, key, iv, data, encrypt=True):
-    """Один запрос через AF_ALG. Возвращает байты результата."""
+    """Один запрос через AF_ALG. Для замеров скорости есть Skcipher."""
     s = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
     try:
         s.bind(("skcipher", name))
@@ -324,6 +324,8 @@ def report(alg, size, ok, diff, hw_rate=None, sw_rate=None, note=""):
     if hw_rate and sw_rate:
         line += "  %6.1f / %6.1f МБ/с (x%.2f)" % (hw_rate, sw_rate,
                                                   hw_rate / sw_rate)
+    elif hw_rate:
+        line += "  %6.1f МБ/с" % hw_rate
     if note:
         line += "  " + note
     print(line)
@@ -362,6 +364,57 @@ HASHES = [
 ]
 
 
+class Skcipher:
+    """Постоянная AF_ALG-сессия: сокет и ключ один раз на весь замер.
+
+    Раньше каждый вызов создавал сокет, ставил ключ, делал accept и закрывал
+    всё это. На 64 КиБ такая обвязка стоила больше миллисекунды, то есть
+    сравнимую с самой операцией величину, и все замеры скорости были
+    занижены. Здесь setup вынесен из измеряемого цикла.
+    """
+
+    def __init__(self, name, key, ivlen):
+        self.ivlen = ivlen
+        self.s = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
+        try:
+            self.s.bind(("skcipher", name))
+            _tune(self.s)
+            if key is not None:
+                self.s.setsockopt(SOL_ALG, ALG_SET_KEY, key)
+            self.op, _ = self.s.accept()
+        except OSError:
+            self.s.close()
+            raise
+        _tune(self.op)
+
+    def close(self):
+        try:
+            self.op.close()
+        finally:
+            self.s.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def run(self, data, iv=None, encrypt=True):
+        cmsg = [(SOL_ALG, ALG_SET_OP,
+                 struct.pack("I", ALG_OP_ENCRYPT if encrypt
+                             else ALG_OP_DECRYPT))]
+        if iv is not None:
+            cmsg.append((SOL_ALG, ALG_SET_IV,
+                         struct.pack("I", len(iv)) + iv))
+        self.op.sendmsg([data], cmsg)
+        out = bytearray()
+        while len(out) < len(data):
+            piece = self.op.recv(min(1 << 20, len(data) - len(out)))
+            if not piece:
+                break
+            out += piece
+        return bytes(out)
+
 def test_skcipher(entries, name, sizes, timing=True):
     pair = pick_pair(entries, name)
     if not pair:
@@ -373,34 +426,37 @@ def test_skcipher(entries, name, sizes, timing=True):
     key = bytes(range(16))
     iv = None if name.startswith("ecb") else bytes(16)
 
-    for size in sizes:
-        data = os.urandom(size)
-        try:
-            got = skcipher(hw, key, iv, data)
-            ref = skcipher(sw, key, iv, data)
-        except OSError as exc:
-            report(name, size, False, None, note="ошибка AF_ALG: %s" % exc)
-            continue
+    with Skcipher(hw, key, len(iv) if iv else 0) as hws, \
+         Skcipher(sw, key, len(iv) if iv else 0) as sws:
+        for size in sizes:
+            data = os.urandom(size)
+            try:
+                got = hws.run(data, iv)
+                ref = sws.run(data, iv)
+            except OSError as exc:
+                report(name, size, False, None,
+                       note="ошибка AF_ALG: %s" % exc)
+                continue
 
-        diff = first_diff(ref, got)
-        ok = diff is None
-        hw_rate = sw_rate = None
-        if timing and ok:
-            rounds = 3 if size >= 65536 else 20
-            hw_rate = size / rate(lambda: skcipher(hw, key, iv, data), rounds) / 1e6
-            sw_rate = size / rate(lambda: skcipher(sw, key, iv, data), rounds) / 1e6
-        report(name, size, ok, diff, hw_rate, sw_rate,
-               note=path_note(name, size))
-        if not ok and diff is not None:
-            print(dump(ref, got, diff))
+            diff = first_diff(ref, got)
+            ok = diff is None
+            hw_rate = sw_rate = None
+            if timing and ok:
+                rounds = 3 if size >= 65536 else 20
+                hw_rate = size / rate(lambda: hws.run(data, iv), rounds) / 1e6
+                sw_rate = size / rate(lambda: sws.run(data, iv), rounds) / 1e6
+            report(name, size, ok, diff, hw_rate, sw_rate,
+                   note=path_note(name, size))
+            if not ok and diff is not None:
+                print(dump(ref, got, diff))
 
-        # расшифровка тем же драйвером должна вернуть исходные данные
-        if not name.startswith("ecb") and ok:
-            back = skcipher(hw, key, iv, got, encrypt=False)
-            rd = first_diff(data, back)
-            if rd is not None:
-                report(name + " dec", size, False, rd)
-                print(dump(data, back, rd))
+            # расшифровка тем же драйвером должна вернуть исходные данные
+            if not name.startswith("ecb") and ok:
+                back = hws.run(got, iv, encrypt=False)
+                rd = first_diff(data, back)
+                if rd is not None:
+                    report(name + " dec", size, False, rd)
+                    print(dump(data, back, rd))
 
 
 def test_hashes(entries, name, keylen, sizes):
@@ -501,7 +557,7 @@ def test_ctr_tail(entries):
     if not pair:
         return
     hw, sw, _ = pair
-    print("  %-14s движок %s, некратные длины" % (name, hw))
+    print("  %-14s движок %s, некротные длины" % (name, hw))
     key = bytes(range(16))
     iv = bytes(16)
     for size in (17, 100, 8193, 65537, 1048581):
@@ -621,21 +677,22 @@ def test_gcm_rate(entries, sizes):
     print("  %-14s движок gcm(aes), рядом софтовый ctr(aes) для масштаба"
           % "gcm(aes)")
     key = bytes(16)
-    for n in sizes:
-        pt = bytes(n)
-        iv = bytes(12)
-        try:
-            g = rate(lambda: aead_encrypt("gcm(aes)", key, iv, b"", pt, 16))
-            ch = rate(lambda: skcipher(hw, key, bytes(16), pt))
-            cs = rate(lambda: skcipher(sw, key, bytes(16), pt))
+    with Skcipher(hw, key, 16) as hws, Skcipher(sw, key, 16) as sws:
+        for n in sizes:
+            pt = bytes(n)
+            iv = bytes(12)
+            try:
+                g = rate(lambda: aead_encrypt("gcm(aes)", key, iv, b"", pt, 16))
+                ch = rate(lambda: hws.run(pt, bytes(16)))
+                cs = rate(lambda: sws.run(pt, bytes(16)))
 
-        except OSError as exc:
-            report("gcm(aes)", n, False, None, note="AF_ALG: %s" % exc)
-            continue
-        note = "ctr движок %.1f" % (n / ch / 1e6)
-        # Отношение к софтовому CTR здесь не печатается: это не эталон GCM.
-        report("gcm(aes)", n, True, None, hw_rate=n / g / 1e6,
-               note=note + ", ctr софт %.1f (не эталон)" % (n / cs / 1e6))
+            except OSError as exc:
+                report("gcm(aes)", n, False, None, note="AF_ALG: %s" % exc)
+                continue
+            note = "ctr движок %.1f" % (n / ch / 1e6)
+            # Отношение к софтовому CTR здесь не печатается: это не эталон.
+            report("gcm(aes)", n, True, None, hw_rate=n / g / 1e6,
+                   note=note + ", ctr софт %.1f (не эталон)" % (n / cs / 1e6))
 
 
 def skcipher_offset(name, key, iv, data, off, encrypt=True):
@@ -768,9 +825,13 @@ def bench_threads(name, size, nthreads, seconds=2.0):
     def worker(i):
         done = 0
         try:
-            while time.monotonic() < deadline:
-                skcipher(name, key, iv, data)
-                done += size
+            session = Skcipher(name, key, len(iv) if iv else 0)
+            try:
+                while time.monotonic() < deadline:
+                    session.run(data, iv)
+                    done += size
+            finally:
+                session.close()
         except OSError as exc:
             errors[i] = exc
         counts[i] = done
