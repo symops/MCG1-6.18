@@ -501,7 +501,7 @@ def test_ctr_tail(entries):
     if not pair:
         return
     hw, sw, _ = pair
-    print("  %-14s движок %s, некротные длины" % (name, hw))
+    print("  %-14s движок %s, некратные длины" % (name, hw))
     key = bytes(range(16))
     iv = bytes(16)
     for size in (17, 100, 8193, 65537, 1048581):
