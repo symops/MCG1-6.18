@@ -489,6 +489,34 @@ def test_key192(entries):
             if d is not None:
                 print(dump(ref, got, d))
 
+def test_ctr_tail(entries):
+    """CTR с длиной не кратной 16: префикс на движке, хвост в софте.
+
+    ECB и CBC требуют полных блоков, а CTR — потоковый режим: длина 100
+    или 65537 законна. Драйвер считает выровненный префикс на движке и
+    доделывает остаток до 15 байт в софте.
+    """
+    name = "ctr(aes)"
+    pair = pick_pair(entries, name)
+    if not pair:
+        return
+    hw, sw, _ = pair
+    print("  %-14s движок %s, некротные длины" % (name, hw))
+    key = bytes(range(16))
+    iv = bytes(16)
+    for size in (17, 100, 8193, 65537, 1048581):
+        data = bytes((i * 17 + 5) & 0xff for i in range(size))
+        try:
+            got = skcipher(hw, key, iv, data)
+            ref = skcipher(sw, key, iv, data)
+        except OSError as exc:
+            report(name + " хвост", size, False, None, note=str(exc))
+            continue
+        d = first_diff(ref, got)
+        report(name + " хвост", size, d is None, d)
+        if d is not None:
+            print(dump(ref, got, d))
+
 GCM_VECTOR = {
     "key": bytes(16),
     "iv": bytes(12),
@@ -995,6 +1023,10 @@ def main():
             continue
         test_hashes(entries, name, keylen, hash_sizes)
         print()
+
+    print("== CTR с хвостом ==")
+    test_ctr_tail(entries)
+    print()
 
     print("== AES-192 ==")
     test_key192(entries)
