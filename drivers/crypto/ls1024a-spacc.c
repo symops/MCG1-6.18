@@ -865,16 +865,14 @@ static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
 		return 0;
 
 	/*
-	 * CTR is a stream mode and the algorithm advertises blocksize 1, so a
-	 * length that is not a multiple of 16 is legitimate.  The engine works
-	 * in blocks, therefore such a request is computed in software.
+	 * ECB and CBC operate strictly on full AES blocks. CTR is a stream
+	 * mode with blocksize 1: small non-aligned requests (< SPACC_MIN_HW_BYTES)
+	 * take the synchronous software path below, while larger ones run
+	 * their block-aligned prefix on SPACC and finish the trailing
+	 * sub-block tail in spacc_do_one_request().
 	 */
-	if (req->cryptlen % AES_BLOCK_SIZE) {
-		if (!ctx->is_ctr)
-			return -EINVAL;
-		return spacc_sw_crypt(ctx, req->src, req->dst, req->cryptlen,
-				      req->iv, is_encrypt, req->base.flags);
-	}
+	if (!ctx->is_ctr && (req->cryptlen % AES_BLOCK_SIZE))
+		return -EINVAL;
 
 	/*
 	 * Synchronous software path: the result is the return value.  The
