@@ -93,7 +93,8 @@
 #define SPA_CTRL_KEY_EXP		29
 
 /* Engine limits and tuning */
-#define SPACC_MAX_DDT_ENTS		64
+/* Hardware DDT prefetcher stops after 16 entries (15 data + 1 terminator) */
+#define SPACC_MAX_DDT_ENTS		16
 #define SPACC_MAX_SG_ENTS		(SPACC_MAX_DDT_ENTS - 1)
 #define SPACC_CIPHER_PG_SZ		128
 #define SPACC_CIPHER_IV_OFFSET		32
@@ -108,10 +109,17 @@
 #define SPACC_MAX_CHUNK_BYTES		round_down(SZ_64K - 1, AES_BLOCK_SIZE)
 
 /*
- * Hardware setup and DMA round-trip overhead dominates for small requests.
- * Requests smaller than 8 KiB are therefore processed in software.
+ * Hardware setup and DMA round-trip overhead dominates for small standalone
+ * requests.  Requests smaller than 8 KiB are therefore processed in software.
  */
 #define SPACC_MIN_HW_BYTES		(8 * 1024)
+
+/*
+ * Once a large request is already executing in do_one_request(), finishing a
+ * ~4 KiB remainder after a 15-entry DDT split on SPACC is much faster than
+ * falling back to kernel software aes-generic.
+ */
+#define SPACC_MIN_TAIL_HW_BYTES		256
 
 /* DDT format matching hardware descriptor */
 struct spacc_ddt {
@@ -615,6 +623,9 @@ static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 		dma_pool_free(spacc->req_pool, dst_ddt, dst_addr);
 	}
 
+	/* Order DMA completion before CPU reads destination buffers */
+	dma_rmb();
+
 	return err;
 }
 
@@ -703,7 +714,7 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 		 * list so fragmented that one DDT covers no more: finish in
 		 * software.  (Whole requests this small never get here.)
 		 */
-		if (chunk < SPACC_MIN_HW_BYTES) {
+		if (chunk < SPACC_MIN_TAIL_HW_BYTES) {
 			err = -ENOMEM;
 		} else {
 			/*
