@@ -40,7 +40,6 @@
 #define SPACC_REG_IRQ_STAT		0x00000004
 #define SPACC_REG_IRQ_CTRL		0x00000008
 #define SPACC_REG_FIFO_STAT		0x0000000C
-#define SPACC_REG_SDMA_BRST_SZ		0x00000010
 #define SPACC_REG_SRC_PTR		0x00000020
 #define SPACC_REG_DST_PTR		0x00000024
 #define SPACC_REG_OFFSET		0x00000028
@@ -809,6 +808,7 @@ static int spacc_aes_setkey_locked(struct crypto_skcipher *tfm, const u8 *key,
 				   unsigned int keylen)
 {
 	struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
+	struct crypto_sync_skcipher *fb = ctx->fallback_tfm;
 	int err;
 
 	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
@@ -820,13 +820,11 @@ static int spacc_aes_setkey_locked(struct crypto_skcipher *tfm, const u8 *key,
 	 * where the crypto manager is free, so that small requests can still be
 	 * computed in software.
 	 */
-	if (!ctx->fallback_tfm) {
-		ctx->fallback_tfm = crypto_alloc_sync_skcipher(
-			crypto_tfm_alg_name(&tfm->base), 0,
-			CRYPTO_ALG_NEED_FALLBACK);
-		if (IS_ERR(ctx->fallback_tfm)) {
-			err = PTR_ERR(ctx->fallback_tfm);
-			ctx->fallback_tfm = NULL;
+	if (!fb) {
+		fb = crypto_alloc_sync_skcipher(crypto_tfm_alg_name(&tfm->base),
+						0, CRYPTO_ALG_NEED_FALLBACK);
+		if (IS_ERR(fb)) {
+			err = PTR_ERR(fb);
 			dev_err(ctx->spacc->dev,
 				"Cannot allocate fallback for %s: %d\n",
 				crypto_tfm_alg_name(&tfm->base), err);
@@ -834,17 +832,19 @@ static int spacc_aes_setkey_locked(struct crypto_skcipher *tfm, const u8 *key,
 		}
 	}
 
-	/* fallback_tfm is guaranteed non-NULL by cra_init() or the block above */
-	crypto_sync_skcipher_clear_flags(ctx->fallback_tfm,
-					 CRYPTO_TFM_REQ_MASK);
-	crypto_sync_skcipher_set_flags(ctx->fallback_tfm,
+	crypto_sync_skcipher_clear_flags(fb, CRYPTO_TFM_REQ_MASK);
+	crypto_sync_skcipher_set_flags(fb,
 				       crypto_skcipher_get_flags(tfm) &
 				       CRYPTO_TFM_REQ_MASK);
 
-	err = crypto_sync_skcipher_setkey(ctx->fallback_tfm, key, keylen);
-	if (err)
+	err = crypto_sync_skcipher_setkey(fb, key, keylen);
+	if (err) {
+		if (!ctx->fallback_tfm)
+			crypto_free_sync_skcipher(fb);
 		return err;
+	}
 
+	ctx->fallback_tfm = fb;
 	memcpy(ctx->key, key, keylen);
 	ctx->keylen = keylen;
 
@@ -1105,16 +1105,16 @@ static int spacc_probe(struct platform_device *pdev)
 		goto err_reset_assert;
 	}
 
+	spin_lock_irqsave(&spacc->lock, flags);
+	spacc_hw_init_regs(spacc);
+	spin_unlock_irqrestore(&spacc->lock, flags);
+
 	ret = devm_request_irq(&pdev->dev, spacc->irq, spacc_irq_handler, 0,
 			       dev_name(&pdev->dev), spacc);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to request IRQ %d: %d\n", spacc->irq, ret);
 		goto err_reset_assert;
 	}
-
-	spin_lock_irqsave(&spacc->lock, flags);
-	spacc_hw_init_regs(spacc);
-	spin_unlock_irqrestore(&spacc->lock, flags);
 
 	/* Initialize crypto engine without real-time thread priority */
 	spacc->ce = crypto_engine_alloc_init(&pdev->dev, false);
