@@ -119,7 +119,7 @@
  * remainder after a 15-entry DDT split on SPACC is faster than falling back
  * to kernel software aes-generic.
  */
-#define SPACC_MIN_TAIL_HW_BYTES		256
+#define SPACC_MIN_TAIL_HW_BYTES		2048
 
 /* DDT format matching hardware descriptor */
 struct spacc_ddt {
