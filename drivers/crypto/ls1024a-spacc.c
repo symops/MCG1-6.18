@@ -288,6 +288,9 @@ static struct spacc_ddt *spacc_sg_to_ddt(struct spacc_dev *spacc,
 	ddt[ddt_idx].p = 0;
 	ddt[ddt_idx].len = 0;
 
+	/* Descriptors must be in RAM before the engine fetches them */
+	dma_wmb();
+
 	return ddt;
 }
 
@@ -571,6 +574,13 @@ static int spacc_hw_chunk(struct spacc_dev *spacc, struct spacc_ctx *ctx,
 	if (ivsize)
 		spacc_memcpy_toio32(page + SPACC_CIPHER_IV_OFFSET, iv, ivsize);
 
+	/*
+	 * The key/IV writes above are posted; read the context page back so they
+	 * reach the engine's SRAM before CTRL starts it.  page is always written
+	 * (the key), so it serves for IV-less modes as well.
+	 */
+	(void)readl(page);
+
 	writel(ctx->keylen | (ctx_id << SPA_KEY_SZ_CTX_INDEX_OFFSET) |
 	       (1U << SPA_KEY_SZ_CIPHER_OFFSET),
 	       spacc->crypto_regs + SPACC_REG_KEY_SZ);
@@ -666,14 +676,16 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 
 		chunk = min_t(unsigned int, left, SPACC_MAX_CHUNK_BYTES);
 		/*
-		 * The engine carries only the low 32 bits of the counter and wraps
-		 * them to zero without touching byte 11.  End the chunk at that
-		 * boundary; spacc_ctr_advance() then continues the 128-bit count.
+		 * The engine carries the counter only within its low 16 bits: on
+		 * 0xffff it wraps to 0 and never touches byte 13.  End the chunk at
+		 * that boundary; spacc_ctr_advance() then continues the 128-bit
+		 * count.  The 32-bit carry looks correct in the register, but the
+		 * keystream diverges from the first block past the 16-bit wrap.
 		 */
 		if (ctx->is_ctr) {
-			u32 low = ((u32)iv[12] << 24) | ((u32)iv[13] << 16) |
-				  ((u32)iv[14] << 8) | iv[15];
-			u64 limit = (0x100000000ULL - low) * AES_BLOCK_SIZE;
+			u32 low = ((u32)iv[14] << 8) | iv[15];
+			u64 limit = (0x10000ULL - low) * AES_BLOCK_SIZE;
+
 			if (limit < chunk)
 				chunk = (unsigned int)limit;
 		}
