@@ -666,14 +666,6 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 		dst = in_place ? src : scatterwalk_ffwd(dst_chain, req->dst, done);
 
 		chunk = min_t(unsigned int, left, SPACC_MAX_CHUNK_BYTES);
-		chunk = spacc_sg_span(src, chunk, SPACC_MAX_SG_ENTS, &src_nents);
-		if (!in_place)
-			chunk = spacc_sg_span(dst, chunk, SPACC_MAX_SG_ENTS,
-					      &dst_nents);
-		else
-			dst_nents = src_nents;
-		chunk = round_down(chunk, AES_BLOCK_SIZE);
-
 		/*
 		 * The engine carries only the low 32 bits of the counter and wraps
 		 * them to zero without touching byte 11.  End the chunk at that
@@ -686,6 +678,14 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 			if (limit < chunk)
 				chunk = (unsigned int)limit;
 		}
+
+		chunk = spacc_sg_span(src, chunk, SPACC_MAX_SG_ENTS, &src_nents);
+		if (!in_place)
+			chunk = spacc_sg_span(dst, chunk, SPACC_MAX_SG_ENTS,
+					      &dst_nents);
+		else
+			dst_nents = src_nents;
+		chunk = round_down(chunk, AES_BLOCK_SIZE);
 
 		/*
 		 * Less than an engine round trip is worth -- a short tail, or a
