@@ -675,6 +675,19 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 		chunk = round_down(chunk, AES_BLOCK_SIZE);
 
 		/*
+		 * The engine carries only the low 32 bits of the counter and wraps
+		 * them to zero without touching byte 11.  End the chunk at that
+		 * boundary; spacc_ctr_advance() then continues the 128-bit count.
+		 */
+		if (ctx->is_ctr) {
+			u32 low = ((u32)iv[12] << 24) | ((u32)iv[13] << 16) |
+				  ((u32)iv[14] << 8) | iv[15];
+			u64 limit = (0x100000000ULL - low) * AES_BLOCK_SIZE;
+			if (limit < chunk)
+				chunk = (unsigned int)limit;
+		}
+
+		/*
 		 * Less than an engine round trip is worth -- a short tail, or a
 		 * list so fragmented that one DDT covers no more: finish in
 		 * software.  (Whole requests this small never get here.)
