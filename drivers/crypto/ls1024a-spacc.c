@@ -110,14 +110,14 @@
 
 /*
  * Hardware setup and DMA round-trip overhead dominates for small standalone
- * requests.  Requests smaller than 8 KiB are therefore processed in software.
+ * requests. Requests smaller than 8 KiB are therefore processed in software.
  */
 #define SPACC_MIN_HW_BYTES		(8 * 1024)
 
 /*
- * Once a large request is already executing in do_one_request(), finishing a
- * ~4 KiB remainder after a 15-entry DDT split on SPACC is much faster than
- * falling back to kernel software aes-generic.
+ * Once a request is already executing in do_one_request(), finishing a ~4 KiB
+ * remainder after a 15-entry DDT split on SPACC is faster than falling back
+ * to kernel software aes-generic.
  */
 #define SPACC_MIN_TAIL_HW_BYTES		256
 
@@ -710,9 +710,10 @@ static int spacc_do_one_request(struct crypto_engine *ce, void *areq)
 		chunk = round_down(chunk, AES_BLOCK_SIZE);
 
 		/*
-		 * Less than an engine round trip is worth -- a short tail, or a
-		 * list so fragmented that one DDT covers no more: finish in
-		 * software.  (Whole requests this small never get here.)
+		 * Tiny remainders (< SPACC_MIN_TAIL_HW_BYTES, e.g. sub-block CTR
+		 * tails or a single trailing block after a 16-bit counter wrap)
+		 * finish in software; ~4 KiB remainders after a 15-entry DDT split
+		 * run a second hardware pass.
 		 */
 		if (chunk < SPACC_MIN_TAIL_HW_BYTES) {
 			err = -ENOMEM;
