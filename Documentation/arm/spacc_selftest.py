@@ -364,6 +364,56 @@ HASHES = [
 ]
 
 
+class Aead:
+    """Постоянная AF_ALG-сессия для AEAD: сокет и ключ один раз на серию.
+
+    Как и Skcipher, избавляет замер от создания сокета и установки ключа на
+    каждый вызов. algif_aead возвращает AAD || шифротекст || тег, поэтому
+    префикс отрезается здесь же и проверяется на совпадение.
+    """
+
+    def __init__(self, name, key, authsize):
+        self.authsize = authsize
+        self.s = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
+        try:
+            self.s.bind(("aead", name))
+            _tune(self.s)
+            self.s.setsockopt(SOL_ALG, ALG_SET_KEY, key)
+            self.s.setsockopt(SOL_ALG, ALG_SET_AEAD_AUTHSIZE, None, authsize)
+            self.op, _ = self.s.accept()
+        except OSError:
+            self.s.close()
+            raise
+        _tune(self.op)
+
+    def close(self):
+        try:
+            self.op.close()
+        finally:
+            self.s.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def run(self, aad, data, iv):
+        cmsg = [(SOL_ALG, ALG_SET_OP, struct.pack("I", ALG_OP_ENCRYPT)),
+                (SOL_ALG, ALG_SET_IV, struct.pack("I", len(iv)) + iv),
+                (SOL_ALG, ALG_SET_AEAD_ASSOCLEN, struct.pack("I", len(aad)))]
+        self.op.sendmsg([aad + data], cmsg)
+        want = len(aad) + len(data) + self.authsize
+        out = bytearray()
+        while len(out) < want:
+            piece = self.op.recv(want - len(out))
+            if not piece:
+                break
+            out += piece
+        if out[:len(aad)] != aad:
+            raise OSError("AAD в ответе не совпадает")
+        return bytes(out[len(aad):])
+
 class Skcipher:
     """Постоянная AF_ALG-сессия: сокет и ключ один раз на весь замер.
 
@@ -677,12 +727,13 @@ def test_gcm_rate(entries, sizes):
     print("  %-14s движок gcm(aes), рядом софтовый ctr(aes) для масштаба"
           % "gcm(aes)")
     key = bytes(16)
-    with Skcipher(hw, key, 16) as hws, Skcipher(sw, key, 16) as sws:
+    with Skcipher(hw, key, 16) as hws, Skcipher(sw, key, 16) as sws, \
+         Aead("gcm(aes)", key, 16) as aead:
         for n in sizes:
             pt = bytes(n)
             iv = bytes(12)
             try:
-                g = rate(lambda: aead_encrypt("gcm(aes)", key, iv, b"", pt, 16))
+                g = rate(lambda: aead.run(b"", pt, iv))
                 ch = rate(lambda: hws.run(pt, bytes(16)))
                 cs = rate(lambda: sws.run(pt, bytes(16)))
 
@@ -774,14 +825,15 @@ def run_gcm_only():
         print("  driver: %s  prio %s" % (e.get("driver"), e.get("priority")))
     key = bytes(16)
     iv = bytes(12)
-    for n in GCM_ONLY_SIZES:
-        pt = bytes(n)
-        try:
-            t = rate(lambda: aead_encrypt("gcm(aes)", key, iv, b"", pt, 16))
-        except OSError as exc:
-            print("  %8d  ошибка: %s" % (n, exc))
-            continue
-        print("  %8d  %6.2f МБ/с" % (n, n / t / 1e6))
+    with Aead("gcm(aes)", key, 16) as a:
+        for n in GCM_ONLY_SIZES:
+            pt = bytes(n)
+            try:
+                t = rate(lambda: a.run(b"", pt, iv))
+            except OSError as exc:
+                print("  %8d  ошибка: %s" % (n, exc))
+                continue
+            print("  %8d  %6.2f МБ/с" % (n, n / t / 1e6))
     return 0
 
 
