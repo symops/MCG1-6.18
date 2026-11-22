@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Freescale LS1024A SPACC Crypto Engine Driver (Pipelined Ring Edition)
+ * Freescale LS1024A SPACC (Elliptic EPN-1802) Crypto Engine Driver
  *
  * Copyright (C) 2026 Antigravity Project
  */
@@ -10,8 +10,9 @@
 #include <crypto/internal/skcipher.h>
 #include <crypto/scatterwalk.h>
 #include <crypto/skcipher.h>
-#include <linux/bottom_half.h>
+#include <linux/atomic.h>
 #include <linux/clk.h>
+#include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmapool.h>
@@ -20,15 +21,18 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/lockdep.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/rcupdate.h>
 #include <linux/reset.h>
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -36,7 +40,11 @@
 
 #define DRV_NAME			"ls1024a-spacc"
 
-/* Hardware Register Offsets */
+/* LS1024A PDU & SPACC Register Offsets */
+#define SPACC_CRYPTO_BASE_OFFSET	0x00040000
+/* Covers PDU registers + SPACC crypto window (0x40000..0x47fff) */
+#define SPACC_MIN_MMIO_SIZE		0x00048000
+
 #define SPACC_REG_IRQ_EN		0x00000000
 #define SPACC_REG_IRQ_STAT		0x00000004
 #define SPACC_REG_IRQ_CTRL		0x00000008
@@ -85,46 +93,56 @@
 #define SPA_KEY_SZ_CTX_INDEX_OFFSET	8
 #define SPA_KEY_SZ_CIPHER_OFFSET	31
 
-/* Control register bits */
+/* Control register bits (EPN-1802 TRM) */
 #define SPA_CTRL_CIPH_ALG_AES		0x02
 #define SPA_CTRL_CIPH_MODE_ECB		(0x00 << 8)
 #define SPA_CTRL_CIPH_MODE_CBC		(0x01 << 8)
 #define SPA_CTRL_CIPH_MODE_CTR		(0x02 << 8)
 #define SPA_CTRL_CTX_IDX		16
 #define SPA_CTRL_ENCRYPT_IDX		24
+/* Bit 29 overwrites the context slot key with the inverse AES key schedule */
 #define SPA_CTRL_KEY_EXP		29
 
-/* Engine limits and pipeline tuning */
-/* Hardware DDT prefetcher stops after 16 entries (15 data + 1 terminator) */
-#define SPACC_MAX_DDT_ENTS		16
 /*
- * One command covers at most 15 data entries: the DDT prefetcher drops the
- * 16th.  Entry count is NOT what corrupts data under load (proved: 4-entry
- * commands fail just as well); memory bus contention is.  Single-threaded
- * use is clean at any count up to this limit.
+ * LS1024A EPN-1802 hardware limits and erratum parameters:
+ * Hardware DDT prefetcher supports up to 16 entries total (15 scatter-gather
+ * segments + 1 null terminator entry).
  */
+#define SPACC_MAX_DDT_ENTS		16
 #define SPACC_MAX_SG_ENTS		(SPACC_MAX_DDT_ENTS - 1)
 #define SPACC_RING_SIZE			16
 #define SPACC_QUEUE_LEN			128
 #define SPACC_CIPHER_PG_SZ		128
 #define SPACC_CIPHER_IV_OFFSET		32
-#define SPACC_CRYPTO_BASE_OFFSET	0x00040000
-#define SPACC_MIN_MMIO_SIZE		0x00048000
 
+/*
+ * PROC_LEN and DDT segment length fields are 16-bit (max 65535); round down
+ * to AES block size (65520). Contiguous/coalesced SG entries reach 65520 B,
+ * while discontiguous 4 KiB pages are capped at 15 * 4096 = 61440 B by
+ * spacc_sg_span().
+ */
 #define SPACC_MAX_CHUNK_BYTES		round_down(SZ_64K - 1, AES_BLOCK_SIZE)
-#define SPACC_MIN_HW_BYTES		(8 * 1024)
 /*
- * A short remainder of an already-running request is still cheaper on the
- * engine than a fallback: 4 KiB on the engine costs ~0.17 ms, the same on
- * aes-generic ~1.6 ms.  The whole-request entry threshold stays at 8 KiB.
+ * Below 2048 bytes (measured on LS1024A @ 200-250 MHz SPACC vs 650 MHz ARMv7
+ * Cortex-A9 software AES), DDT setup + IRQ + 64-byte tail recomputation
+ * overhead exceeds SW AES throughput; route small requests directly to SW.
  */
-#define SPACC_MIN_TAIL_HW_BYTES		2048
+#define SPACC_MIN_HW_BYTES		2048
+#define SPACC_MIN_TAIL_HW_BYTES		1024
 
 /*
- * Descriptor as the engine sees it.  The address is 32-bit because the
- * driver sets a 32-bit DMA mask in probe(); widening it would need both a
- * larger descriptor and a different mask.
+ * LS1024A EPN-1802 (0x18020642) erratum workaround:
+ * Under memory contention, the last 8-24 bytes of a DMA write burst may be
+ * corrupted. Recomputing the final 64 bytes (2 ARMv7 cache lines) on the CPU
+ * after dma_unmap guarantees 100% integrity at full pipeline throughput.
  */
+#define SPACC_TAIL_FIX_BYTES		64
+
+static_assert(SPACC_TAIL_FIX_BYTES % AES_BLOCK_SIZE == 0);
+static_assert(SPACC_MIN_TAIL_HW_BYTES >= SPACC_TAIL_FIX_BYTES);
+static_assert(SPACC_MAX_CHUNK_BYTES >= SPACC_MIN_TAIL_HW_BYTES);
+static_assert(SPACC_CIPHER_PG_SZ >= SPACC_CIPHER_IV_OFFSET + AES_BLOCK_SIZE);
+
 struct spacc_ddt {
 	u32 p;
 	u32 len;
@@ -153,46 +171,71 @@ struct spacc_hw_slot {
 	unsigned int dst_nents;
 	unsigned int len;
 	int err;
-	u8 next_iv[AES_BLOCK_SIZE] __aligned(4);
+	u8 tail_iv[AES_BLOCK_SIZE] __aligned(4);
+	u8 tail_src[SPACC_TAIL_FIX_BYTES] __aligned(4);
+
+	/*
+	 * Cached key state in hardware context slot_idx. Accessed exclusively
+	 * by the single-threaded hw->wq worker while the slot is idle (between
+	 * reap at hw->tail and submit at hw->head). Because KEY_EXP replaces
+	 * the forward key in context memory with the inverse key schedule,
+	 * both key generation and direction must match to skip reload.
+	 */
+	u64 cached_ctx_id;
+	int cached_key_gen;
+	bool cached_is_encrypt;
 };
 
-struct spacc_dev {
+/*
+ * Hardware-bound state whose lifetime strictly matches probe()..remove().
+ * Published via RCU in struct spacc_dev; once unbound in remove() and
+ * synchronize_rcu() completes, no TFM can obtain a pointer to spacc_hw,
+ * cleanly decoupling devm-managed resources from kref-lived TFM contexts.
+ */
+struct spacc_hw {
 	struct device *dev;
-	void __iomem *regs;
 	void __iomem *pdu_regs;
 	void __iomem *crypto_regs;
 	void __iomem *cipher_ctx_base;
-	unsigned int cipher_pg_sz;
 	int irq;
-	struct clk *clk;
 	struct reset_control *rst;
 	struct dma_pool *req_pool;
 
-	/* Asynchronous request backlog */
 	spinlock_t q_lock;
 	struct crypto_queue queue;
+	/* Owned exclusively by the single-threaded hw->wq worker */
 	struct list_head active_reqs;
 
-	/* Hardware command pipeline ring (1:1 slot -> hardware ctx_id 0..15) */
 	spinlock_t hw_lock;
 	struct spacc_hw_slot ring[SPACC_RING_SIZE];
-	unsigned int head;		/* next slot to submit (worker only) */
-	unsigned int complete_idx;	/* next slot to pop status (ISR) */
-	unsigned int tail;		/* oldest slot to unmap/finalize (worker) */
-	unsigned int hw_inflight;	/* commands currently in HW FIFOs */
+	unsigned int head;
+	unsigned int complete_idx;
+	/* Owned exclusively by the single-threaded hw->wq worker */
+	unsigned int tail;
+	unsigned int hw_inflight;
 	unsigned long last_progress;
 
 	struct workqueue_struct *wq;
 	struct work_struct work;
 	struct delayed_work watchdog;
-	bool shutting_down;
+	struct completion drained;
+	bool stopping;
+	bool skip_dma_unmap;
+	bool halted_in_reset;
+};
 
+struct spacc_dev {
+	struct kref refcount;
+	struct spacc_hw __rcu *hw;
+	atomic64_t next_ctx_id;
 	struct spacc_alg algs[3];
 };
 
 struct spacc_ctx {
 	struct spacc_dev *spacc;
 	struct crypto_sync_skcipher *fallback_tfm;
+	u64 ctx_id;
+	atomic_t key_gen;
 	u32 ctrl_default;
 	u8 key[AES_MAX_KEY_SIZE] __aligned(4);
 	unsigned int keylen;
@@ -205,6 +248,8 @@ struct spacc_reqctx {
 	struct skcipher_request *req;
 	bool is_encrypt;
 	bool cbc_enc_busy;
+	bool ctr_bridge_busy;
+	bool completed;
 	unsigned int offset;
 	unsigned int inflight_cmds;
 	unsigned int sw_tail_len;
@@ -213,6 +258,22 @@ struct spacc_reqctx {
 	u8 final_iv[AES_BLOCK_SIZE] __aligned(4);
 };
 
+static bool spacc_use_hw = true;
+module_param_named(hw, spacc_use_hw, bool, 0444);
+
+static void spacc_dev_release(struct kref *kref)
+{
+	struct spacc_dev *spacc = container_of(kref, struct spacc_dev, refcount);
+
+	kfree(spacc);
+}
+
+/*
+ * EPN-1802 context memory maps key and IV bytes in native little-endian 32-bit
+ * word order matching host byte stream layout (byte 0 at LSB of word 0).
+ * Writes bytes to MMIO using relaxed stores; caller must order these writes
+ * against subsequent device command register writes with wmb() or writel().
+ */
 static inline void spacc_memcpy_toio32(void __iomem *dst, const void *src,
 				       unsigned int bytes)
 {
@@ -223,24 +284,26 @@ static inline void spacc_memcpy_toio32(void __iomem *dst, const void *src,
 
 	WARN_ON_ONCE(bytes % 4);
 
-	for (i = 0; i < words; i++) {
-		u32 val = get_unaligned((const u32 *)(src8 + i * 4));
-
-		writel(val, dst32 + i);
-	}
+	for (i = 0; i < words; i++)
+		writel_relaxed(get_unaligned((const u32 *)(src8 + i * 4)),
+			       dst32 + i);
 }
 
-static inline void spacc_write_proc_len(struct spacc_dev *spacc, u32 len,
+/*
+ * Writes all per-command fields using relaxed stores. Caller must ensure
+ * ordering against the CTRL write (via non-relaxed writel() or wmb()).
+ */
+static inline void spacc_write_proc_len(struct spacc_hw *hw, u32 len,
 					u32 sw_id)
 {
-	writel(0, spacc->crypto_regs + SPACC_REG_PRE_AAD_LEN);
-	writel(0, spacc->crypto_regs + SPACC_REG_POST_AAD_LEN);
-	writel(len, spacc->crypto_regs + SPACC_REG_PROC_LEN);
-	writel(0, spacc->crypto_regs + SPACC_REG_ICV_LEN);
-	writel(0, spacc->crypto_regs + SPACC_REG_ICV_OFFSET);
-	writel(0, spacc->crypto_regs + SPACC_REG_IV_OFFSET);
-	writel(sw_id, spacc->crypto_regs + SPACC_REG_SW_ID);
-	writel(0, spacc->crypto_regs + SPACC_REG_AUX_INFO);
+	writel_relaxed(0, hw->crypto_regs + SPACC_REG_PRE_AAD_LEN);
+	writel_relaxed(0, hw->crypto_regs + SPACC_REG_POST_AAD_LEN);
+	writel_relaxed(len, hw->crypto_regs + SPACC_REG_PROC_LEN);
+	writel_relaxed(0, hw->crypto_regs + SPACC_REG_ICV_LEN);
+	writel_relaxed(0, hw->crypto_regs + SPACC_REG_ICV_OFFSET);
+	writel_relaxed(0, hw->crypto_regs + SPACC_REG_IV_OFFSET);
+	writel_relaxed(sw_id, hw->crypto_regs + SPACC_REG_SW_ID);
+	writel_relaxed(0, hw->crypto_regs + SPACC_REG_AUX_INFO);
 }
 
 static int spacc_status_to_errno(u32 code)
@@ -253,7 +316,7 @@ static int spacc_status_to_errno(u32 code)
 	case SPA_STATUS_MEMORY_ERROR:
 		return -EFAULT;
 	case SPA_STATUS_SECURITY_ERROR:
-		return -EACCES;
+		return -EKEYREJECTED;
 	case SPA_STATUS_BLOCK_ERROR:
 		return -EIO;
 	default:
@@ -279,7 +342,7 @@ static unsigned int spacc_sg_span(struct scatterlist *sg, unsigned int len,
 	return span;
 }
 
-static struct spacc_ddt *spacc_sg_to_ddt(struct spacc_dev *spacc,
+static struct spacc_ddt *spacc_sg_to_ddt(struct spacc_hw *hw,
 					 struct scatterlist *sgl,
 					 unsigned int nbytes,
 					 unsigned int nents,
@@ -293,21 +356,31 @@ static struct spacc_ddt *spacc_sg_to_ddt(struct spacc_dev *spacc,
 	if (!nents || nents > SPACC_MAX_SG_ENTS)
 		return NULL;
 
-	mapped_ents = dma_map_sg(spacc->dev, sgl, nents, dir);
+	mapped_ents = dma_map_sg(hw->dev, sgl, nents, dir);
 	if (mapped_ents <= 0)
 		return NULL;
 
-	ddt = dma_pool_alloc(spacc->req_pool, GFP_KERNEL, ddt_phys);
+	ddt = dma_pool_alloc(hw->req_pool, GFP_KERNEL, ddt_phys);
 	if (!ddt) {
-		dma_unmap_sg(spacc->dev, sgl, nents, dir);
+		dma_unmap_sg(hw->dev, sgl, nents, dir);
 		return NULL;
 	}
 
+	/*
+	 * dma_map_sg() may coalesce adjacent entries, returning
+	 * mapped_ents <= nents. Iterate over mapped_ents DMA segments and
+	 * enforce the SPACC_MAX_SG_ENTS hardware DDT limit.
+	 */
 	for_each_sg(sgl, cur, mapped_ents, i) {
 		unsigned int len = min_t(unsigned int, sg_dma_len(cur), nbytes);
 
 		if (!len)
 			continue;
+		if (ddt_idx >= SPACC_MAX_SG_ENTS) {
+			dma_pool_free(hw->req_pool, ddt, *ddt_phys);
+			dma_unmap_sg(hw->dev, sgl, nents, dir);
+			return NULL;
+		}
 		ddt[ddt_idx].p = sg_dma_address(cur);
 		ddt[ddt_idx].len = len;
 		ddt_idx++;
@@ -315,35 +388,33 @@ static struct spacc_ddt *spacc_sg_to_ddt(struct spacc_dev *spacc,
 		if (nbytes == 0)
 			break;
 	}
+
+	if (nbytes != 0) {
+		dma_pool_free(hw->req_pool, ddt, *ddt_phys);
+		dma_unmap_sg(hw->dev, sgl, nents, dir);
+		return NULL;
+	}
+
 	ddt[ddt_idx].p = 0;
 	ddt[ddt_idx].len = 0;
 
-	/*
-	 * LS1024A erratum workaround: the DDT prefetcher may race descriptor
-	 * writes.  On this platform a read back from coherent memory drains the
-	 * write path for the region before the MMIO CTRL write below can start
-	 * the prefetcher.  The kernel does not guarantee this ordering on other
-	 * architectures; that is why the platform is named here.
-	 */
-	(void)READ_ONCE(ddt[ddt_idx].len);
-
+	/* Order DDT writes before hardware starts prefetching descriptors */
 	dma_wmb();
 
 	return ddt;
 }
 
-static void spacc_ctr_advance(u8 *iv, unsigned int bytes)
+static void spacc_ctr_add_blocks(u8 *iv, u32 blocks)
 {
-	u64 add = bytes / AES_BLOCK_SIZE;
 	u32 carry = 0;
 	int i;
 
-	for (i = 15; i >= 0 && (add || carry); i--) {
-		u32 v = iv[i] + (u32)(add & 0xff) + carry;
+	for (i = 15; i >= 0 && (blocks || carry); i--) {
+		u32 v = iv[i] + (blocks & 0xff) + carry;
 
 		iv[i] = v & 0xff;
 		carry = v >> 8;
-		add >>= 8;
+		blocks >>= 8;
 	}
 }
 
@@ -351,119 +422,226 @@ static int spacc_sw_crypt(struct spacc_ctx *ctx, struct scatterlist *src,
 			  struct scatterlist *dst, unsigned int len, u8 *iv,
 			  bool is_encrypt, u32 flags)
 {
+	SYNC_SKCIPHER_REQUEST_ON_STACK(subreq, ctx->fallback_tfm);
 	int err;
 
-	if (unlikely(!ctx->fallback_tfm))
-		return -EINVAL;
+	/*
+	 * Per-request state lives on the stack and the key inside fallback_tfm
+	 * is immutable during active transforms per the Crypto API contract.
+	 */
+	skcipher_request_set_sync_tfm(subreq, ctx->fallback_tfm);
+	skcipher_request_set_callback(subreq,
+				      flags & ~CRYPTO_TFM_REQ_MAY_SLEEP,
+				      NULL, NULL);
+	skcipher_request_set_crypt(subreq, src, dst, len, iv);
 
-	{
-		SYNC_SKCIPHER_REQUEST_ON_STACK(subreq, ctx->fallback_tfm);
+	err = is_encrypt ? crypto_skcipher_encrypt(subreq) :
+			   crypto_skcipher_decrypt(subreq);
 
-		skcipher_request_set_sync_tfm(subreq, ctx->fallback_tfm);
-		skcipher_request_set_callback(subreq,
-					      flags & CRYPTO_TFM_REQ_MAY_SLEEP,
-					      NULL, NULL);
-		skcipher_request_set_crypt(subreq, src, dst, len, iv);
-
-		if (is_encrypt)
-			err = crypto_skcipher_encrypt(subreq);
-		else
-			err = crypto_skcipher_decrypt(subreq);
-
-		skcipher_request_zero(subreq);
-	}
-
+	skcipher_request_zero(subreq);
 	return err;
 }
 
-static void spacc_hw_init_regs(struct spacc_dev *spacc)
+static int spacc_fixup_slot_tail(struct spacc_ctx *ctx,
+				 struct spacc_reqctx *rctx,
+				 struct spacc_hw_slot *slot,
+				 unsigned int ivsize)
 {
-	int limit = 64;
+	u8 tail_out[SPACC_TAIL_FIX_BYTES] __aligned(4);
+	struct scatterlist sg_in, sg_out;
+	unsigned int fix_off = slot->len - SPACC_TAIL_FIX_BYTES;
+	int err;
 
-	lockdep_assert_held(&spacc->hw_lock);
+	if (!ctx->is_ctr && rctx->is_encrypt && ivsize)
+		scatterwalk_map_and_copy(slot->tail_iv, slot->dst,
+					 fix_off - ivsize, ivsize, 0);
 
-	while (limit-- &&
-	       !(readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT) &
-		 SPA_FIFO_STAT_EMPTY)) {
-		writel(~0, spacc->crypto_regs + SPACC_REG_STAT_POP);
-		(void)readl(spacc->crypto_regs + SPACC_REG_STATUS);
+	sg_init_one(&sg_in, slot->tail_src, SPACC_TAIL_FIX_BYTES);
+	sg_init_one(&sg_out, tail_out, SPACC_TAIL_FIX_BYTES);
+
+	err = spacc_sw_crypt(ctx, &sg_in, &sg_out, SPACC_TAIL_FIX_BYTES,
+			     ivsize ? slot->tail_iv : NULL,
+			     rctx->is_encrypt, 0);
+	if (!err) {
+		scatterwalk_map_and_copy(tail_out, slot->dst, fix_off,
+					 SPACC_TAIL_FIX_BYTES, 1);
+		if (ivsize) {
+			if (!ctx->is_ctr && rctx->is_encrypt) {
+				memcpy(rctx->iv,
+				       tail_out + SPACC_TAIL_FIX_BYTES - ivsize,
+				       ivsize);
+				memcpy(rctx->final_iv, rctx->iv, ivsize);
+			} else {
+				/*
+				 * spacc_sw_crypt() updates slot->tail_iv
+				 * in-place per the skcipher API contract,
+				 * leaving it at the exact post-chunk IV.
+				 */
+				memcpy(rctx->final_iv, slot->tail_iv, ivsize);
+			}
+		}
 	}
 
-	writel(~0, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
-	writel(~0, spacc->pdu_regs + SPACC_REG_IRQ_STAT);
+	memzero_explicit(tail_out, sizeof(tail_out));
+	memzero_explicit(slot->tail_src, sizeof(slot->tail_src));
+	memzero_explicit(slot->tail_iv, sizeof(slot->tail_iv));
+	return err;
+}
 
-	/* Keep STAT_CNT fixed at 1 forever to avoid IRQ threshold glitches */
+static inline void spacc_invalidate_slot_cache(struct spacc_hw_slot *slot)
+{
+	slot->cached_ctx_id = 0;
+	slot->cached_key_gen = 0;
+	slot->cached_is_encrypt = false;
+}
+
+static void __spacc_hw_init_regs(struct spacc_hw *hw, bool enable_irq)
+{
+	int limit = 64;
+	int i;
+
+	lockdep_assert_held(&hw->hw_lock);
+
+	while (limit-- &&
+	       !(readl(hw->crypto_regs + SPACC_REG_FIFO_STAT) &
+		 SPA_FIFO_STAT_EMPTY)) {
+		writel(~0, hw->crypto_regs + SPACC_REG_STAT_POP);
+		(void)readl(hw->crypto_regs + SPACC_REG_STATUS);
+	}
+
+	writel(~0, hw->crypto_regs + SPACC_REG_IRQ_STAT);
+	writel(~0, hw->pdu_regs + SPACC_REG_IRQ_STAT);
+
 	writel(1 << SPA_IRQ_CTRL_STAT_CNT_OFFSET,
-	       spacc->crypto_regs + SPACC_REG_IRQ_CTRL);
-	writel(SPA_IRQ_EN_STAT_EN | SPA_IRQ_EN_GLBL_EN,
-	       spacc->pdu_regs + SPACC_REG_IRQ_EN);
+	       hw->crypto_regs + SPACC_REG_IRQ_CTRL);
+	writel(enable_irq ? (SPA_IRQ_EN_STAT_EN | SPA_IRQ_EN_GLBL_EN) : 0,
+	       hw->pdu_regs + SPACC_REG_IRQ_EN);
 
-	spacc->hw_inflight = 0;
+	for (i = 0; i < SPACC_RING_SIZE; i++)
+		spacc_invalidate_slot_cache(&hw->ring[i]);
+
+	hw->hw_inflight = 0;
+}
+
+static void spacc_hw_init_regs(struct spacc_hw *hw)
+{
+	__spacc_hw_init_regs(hw, true);
+}
+
+/*
+ * Mask interrupts, synchronize the IRQ handler, and assert hardware reset so
+ * the bus master cannot continue writing to DMA buffers after unmap.
+ */
+static int spacc_halt_hw(struct spacc_hw *hw, bool deassert)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&hw->hw_lock, flags);
+	writel(0, hw->pdu_regs + SPACC_REG_IRQ_EN);
+	spin_unlock_irqrestore(&hw->hw_lock, flags);
+
+	synchronize_irq(hw->irq);
+
+	ret = reset_control_assert(hw->rst);
+	if (ret)
+		return ret;
+
+	if (deassert) {
+		fsleep(10);
+		ret = reset_control_deassert(hw->rst);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static irqreturn_t spacc_irq_handler(int irq, void *dev_id)
 {
-	struct spacc_dev *spacc = dev_id;
+	struct spacc_hw *hw = dev_id;
 	unsigned long flags;
 	u32 stat, cstat, status, code;
 	bool completed_any = false;
 
-	spin_lock_irqsave(&spacc->hw_lock, flags);
+	spin_lock_irqsave(&hw->hw_lock, flags);
 
-	stat = readl(spacc->pdu_regs + SPACC_REG_IRQ_STAT);
+	stat = readl(hw->pdu_regs + SPACC_REG_IRQ_STAT);
 	if (!(stat & (SPA_IRQ_STAT_STAT_MASK | SPA_IRQ_STAT_CMD))) {
-		spin_unlock_irqrestore(&spacc->hw_lock, flags);
+		spin_unlock_irqrestore(&hw->hw_lock, flags);
 		return IRQ_NONE;
 	}
 
-	cstat = readl(spacc->crypto_regs + SPACC_REG_IRQ_STAT);
+	cstat = readl(hw->crypto_regs + SPACC_REG_IRQ_STAT);
 	if (cstat)
-		writel(cstat, spacc->crypto_regs + SPACC_REG_IRQ_STAT);
-	writel(stat, spacc->pdu_regs + SPACC_REG_IRQ_STAT);
+		writel(cstat, hw->crypto_regs + SPACC_REG_IRQ_STAT);
+	writel(stat, hw->pdu_regs + SPACC_REG_IRQ_STAT);
 
-	while (spacc->hw_inflight > 0 &&
-	       !(readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT) &
+	while (hw->hw_inflight > 0 &&
+	       !(readl(hw->crypto_regs + SPACC_REG_FIFO_STAT) &
 		 SPA_FIFO_STAT_EMPTY)) {
-		struct spacc_hw_slot *slot = &spacc->ring[spacc->complete_idx];
+		struct spacc_hw_slot *slot = &hw->ring[hw->complete_idx];
 
-		writel(~0, spacc->crypto_regs + SPACC_REG_STAT_POP);
-		status = readl(spacc->crypto_regs + SPACC_REG_STATUS);
+		writel(~0, hw->crypto_regs + SPACC_REG_STAT_POP);
+		status = readl(hw->crypto_regs + SPACC_REG_STATUS);
 		code = (status & SPA_STATUS_RES_CODE_MASK) >>
 		       SPA_STATUS_RES_CODE_OFFSET;
 		if (code != SPA_STATUS_OK)
-			dev_warn_ratelimited(spacc->dev,
-					     "SPACC: command failed, STATUS=0x%08x (code %u)\n",
+			dev_warn_ratelimited(hw->dev,
+					     "SPACC command failed: STATUS=0x%08x (code %u)\n",
 					     status, code);
 
 		slot->err = spacc_status_to_errno(code);
-		spacc->complete_idx = (spacc->complete_idx + 1) % SPACC_RING_SIZE;
-		spacc->hw_inflight--;
-		spacc->last_progress = jiffies;
+		hw->complete_idx = (hw->complete_idx + 1) % SPACC_RING_SIZE;
+		hw->hw_inflight--;
+		hw->last_progress = jiffies;
 		completed_any = true;
 	}
 
-	spin_unlock_irqrestore(&spacc->hw_lock, flags);
+	/* Drain any orphaned status entries if hw_inflight is 0 to prevent IRQ storm */
+	if (hw->hw_inflight == 0 &&
+	    !(readl(hw->crypto_regs + SPACC_REG_FIFO_STAT) &
+	      SPA_FIFO_STAT_EMPTY)) {
+		int limit = SPACC_RING_SIZE;
+
+		dev_warn_ratelimited(hw->dev,
+				     "Draining orphaned SPACC completion status\n");
+		while (limit-- &&
+		       !(readl(hw->crypto_regs + SPACC_REG_FIFO_STAT) &
+			 SPA_FIFO_STAT_EMPTY)) {
+			writel(~0, hw->crypto_regs + SPACC_REG_STAT_POP);
+			(void)readl(hw->crypto_regs + SPACC_REG_STATUS);
+		}
+	}
+
+	spin_unlock_irqrestore(&hw->hw_lock, flags);
 
 	if (completed_any)
-		queue_work(spacc->wq, &spacc->work);
+		queue_work(hw->wq, &hw->work);
 
 	return IRQ_HANDLED;
 }
 
-static void spacc_free_slot_dma(struct spacc_dev *spacc,
+static void spacc_free_slot_dma(struct spacc_hw *hw,
 				struct spacc_hw_slot *slot)
 {
+	if (unlikely(READ_ONCE(hw->skip_dma_unmap))) {
+		slot->src_ddt = NULL;
+		slot->dst_ddt = NULL;
+		return;
+	}
+
 	if (slot->src == slot->dst) {
-		dma_unmap_sg(spacc->dev, slot->src, slot->src_nents,
+		dma_unmap_sg(hw->dev, slot->src, slot->src_nents,
 			     DMA_BIDIRECTIONAL);
-		dma_pool_free(spacc->req_pool, slot->src_ddt, slot->src_addr);
+		dma_pool_free(hw->req_pool, slot->src_ddt, slot->src_addr);
 	} else {
-		dma_unmap_sg(spacc->dev, slot->src, slot->src_nents,
+		dma_unmap_sg(hw->dev, slot->src, slot->src_nents,
 			     DMA_TO_DEVICE);
-		dma_unmap_sg(spacc->dev, slot->dst, slot->dst_nents,
+		dma_unmap_sg(hw->dev, slot->dst, slot->dst_nents,
 			     DMA_FROM_DEVICE);
-		dma_pool_free(spacc->req_pool, slot->src_ddt, slot->src_addr);
-		dma_pool_free(spacc->req_pool, slot->dst_ddt, slot->dst_addr);
+		dma_pool_free(hw->req_pool, slot->src_ddt, slot->src_addr);
+		dma_pool_free(hw->req_pool, slot->dst_ddt, slot->dst_addr);
 	}
 	slot->src_ddt = NULL;
 	slot->dst_ddt = NULL;
@@ -473,57 +651,67 @@ static void spacc_finish_request(struct skcipher_request *req, int err)
 {
 	struct spacc_reqctx *rctx = skcipher_request_ctx(req);
 
-	list_del_init(&rctx->node);
+	/*
+	 * Must only be called once per request from the single-threaded
+	 * hw->wq worker context.
+	 */
+	if (WARN_ON_ONCE(rctx->completed))
+		return;
+	rctx->completed = true;
+
+	if (!list_empty(&rctx->node))
+		list_del_init(&rctx->node);
+
 	memzero_explicit(rctx->iv, sizeof(rctx->iv));
 	memzero_explicit(rctx->final_iv, sizeof(rctx->final_iv));
-	local_bh_disable();
 	skcipher_request_complete(req, err);
-	local_bh_enable();
 }
 
-static void spacc_reap_completed(struct spacc_dev *spacc)
+/* Returns true if at least one ring slot was freed */
+static bool spacc_reap_completed(struct spacc_hw *hw)
 {
 	unsigned long flags;
 	unsigned int comp_idx;
+	bool reaped_any = false;
 
-	spin_lock_irqsave(&spacc->hw_lock, flags);
-	comp_idx = spacc->complete_idx;
-	spin_unlock_irqrestore(&spacc->hw_lock, flags);
+	spin_lock_irqsave(&hw->hw_lock, flags);
+	comp_idx = hw->complete_idx;
+	spin_unlock_irqrestore(&hw->hw_lock, flags);
 
-	while (spacc->tail != comp_idx) {
-		struct spacc_hw_slot *slot = &spacc->ring[spacc->tail];
+	while (hw->tail != comp_idx) {
+		struct spacc_hw_slot *slot = &hw->ring[hw->tail];
 		struct skcipher_request *req = slot->req;
 		struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
 		struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
 		struct spacc_reqctx *rctx = skcipher_request_ctx(req);
 		unsigned int ivsize = crypto_skcipher_ivsize(tfm);
-		int slot_err = slot->err;
+		/*
+		 * Ordering of slot->err and complete_idx is guaranteed by the
+		 * hw_lock acquire above pairing with the IRQ handler's release.
+		 * dma_unmap_sg() ensures DMA visibility for the payload buffer.
+		 */
+		int slot_err = READ_ONCE(slot->err);
 
-		spacc_free_slot_dma(spacc, slot);
-		dma_rmb();
+		spacc_free_slot_dma(hw, slot);
 
-		if (slot_err && !rctx->err)
-			rctx->err = slot_err;
-
-		rctx->inflight_cmds--;
-		rctx->cbc_enc_busy = false;
-
-		if (ivsize && !rctx->err) {
-			if (!ctx->is_ctr && rctx->is_encrypt) {
-				/*
-				 * The next chunk chains from this ciphertext block, so it
-				 * has to become the running IV, not just the final one.
-				 */
-				scatterwalk_map_and_copy(rctx->iv, slot->dst,
-							 slot->len - ivsize,
-							 ivsize, 0);
-				memcpy(rctx->final_iv, rctx->iv, ivsize);
-			} else {
-				memcpy(rctx->final_iv, slot->next_iv, ivsize);
-			}
+		if (slot_err) {
+			spacc_invalidate_slot_cache(slot);
+			if (!rctx->err)
+				rctx->err = slot_err;
 		}
 
-		spacc->tail = (spacc->tail + 1) % SPACC_RING_SIZE;
+		rctx->inflight_cmds--;
+		if (rctx->inflight_cmds == 0) {
+			rctx->cbc_enc_busy = false;
+			rctx->ctr_bridge_busy = false;
+		}
+
+		if (!rctx->err)
+			rctx->err = spacc_fixup_slot_tail(ctx, rctx, slot,
+							  ivsize);
+
+		hw->tail = (hw->tail + 1) % SPACC_RING_SIZE;
+		reaped_any = true;
 
 		if (rctx->inflight_cmds == 0 &&
 		    (rctx->err || rctx->sw_tail_len > 0 ||
@@ -538,7 +726,8 @@ static void spacc_reap_completed(struct spacc_dev *spacc)
 				rctx->err = spacc_sw_crypt(ctx, s, d,
 							   rctx->sw_tail_len,
 							   rctx->final_iv,
-							   rctx->is_encrypt, 0);
+							   rctx->is_encrypt,
+							   req->base.flags);
 			}
 
 			if (!rctx->err && ivsize)
@@ -547,9 +736,34 @@ static void spacc_reap_completed(struct spacc_dev *spacc)
 			spacc_finish_request(req, rctx->err);
 		}
 	}
+
+	return reaped_any;
 }
 
-static bool spacc_submit_next_chunk(struct spacc_dev *spacc,
+static void spacc_fallback_remainder(struct spacc_ctx *ctx,
+				     struct spacc_reqctx *rctx,
+				     struct skcipher_request *req,
+				     struct scatterlist *s,
+				     struct scatterlist *d,
+				     unsigned int left, unsigned int ivsize)
+{
+	if (WARN_ON_ONCE(!left)) {
+		if (rctx->inflight_cmds == 0)
+			spacc_finish_request(req, rctx->err);
+		return;
+	}
+
+	rctx->sw_tail_len = left;
+	if (rctx->inflight_cmds == 0) {
+		int err = spacc_sw_crypt(ctx, s, d, left, rctx->final_iv,
+					 rctx->is_encrypt, req->base.flags);
+		if (!err && ivsize)
+			memcpy(req->iv, rctx->final_iv, ivsize);
+		spacc_finish_request(req, err);
+	}
+}
+
+static bool spacc_submit_next_chunk(struct spacc_hw *hw,
 				    struct skcipher_request *req)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
@@ -558,39 +772,27 @@ static bool spacc_submit_next_chunk(struct spacc_dev *spacc,
 	unsigned int ivsize = crypto_skcipher_ivsize(tfm);
 	bool in_place = (req->src == req->dst);
 	unsigned int left = req->cryptlen - rctx->offset;
-	unsigned int slot_idx = spacc->head;
-	struct spacc_hw_slot *slot = &spacc->ring[slot_idx];
+	unsigned int slot_idx = hw->head;
+	struct spacc_hw_slot *slot = &hw->ring[slot_idx];
 	unsigned int chunk, src_nents = 0, dst_nents = 0;
+	u8 key_copy[AES_MAX_KEY_SIZE] __aligned(4) = { 0 };
+	u8 next_iv[AES_BLOCK_SIZE] __aligned(4) = { 0 };
+	unsigned int keylen;
 	void __iomem *page;
 	unsigned long flags;
+	bool key_cached;
+	int key_gen;
 	u32 ctrl;
 
-	/*
-	 * One command at a time.  Concurrent load on the memory bus is the
-	 * trigger of the silicon write-path defect, and serialization costs
-	 * nothing measured.  The ring stays: completion bookkeeping, watchdog
-	 * recovery and hardware-context indexing still run through it; only its
-	 * depth is unused while commands do not overlap.
-	 */
-	if (READ_ONCE(spacc->hw_inflight) > 0)
-		return false;
-
 	if (left < SPACC_MIN_TAIL_HW_BYTES) {
-		rctx->sw_tail_len = left;
-		if (rctx->inflight_cmds == 0) {
-			struct scatterlist sc[2], dc[2];
-			struct scatterlist *s, *d;
-			int err;
+		struct scatterlist sc[2], dc[2];
+		struct scatterlist *s = scatterwalk_ffwd(sc, req->src,
+							 rctx->offset);
+		struct scatterlist *d = in_place ? s :
+					scatterwalk_ffwd(dc, req->dst,
+							 rctx->offset);
 
-			s = scatterwalk_ffwd(sc, req->src, rctx->offset);
-			d = in_place ? s :
-			    scatterwalk_ffwd(dc, req->dst, rctx->offset);
-			err = spacc_sw_crypt(ctx, s, d, left, rctx->final_iv,
-					     rctx->is_encrypt, 0);
-			if (!err && ivsize)
-				memcpy(req->iv, rctx->final_iv, ivsize);
-			spacc_finish_request(req, err);
-		}
+		spacc_fallback_remainder(ctx, rctx, req, s, d, left, ivsize);
 		return true;
 	}
 
@@ -600,8 +802,37 @@ static bool spacc_submit_next_chunk(struct spacc_dev *spacc,
 
 	chunk = min_t(unsigned int, left, SPACC_MAX_CHUNK_BYTES);
 	if (ctx->is_ctr) {
+		/*
+		 * EPN-1802 hardware AES-CTR increments only the lower 16 bits
+		 * of the counter block without carry into upper bytes. Split
+		 * chunks at the 16-bit counter wrap boundary; if the wrap
+		 * distance is smaller than SPACC_MIN_TAIL_HW_BYTES, wait for
+		 * prior in-flight commands to drain before bridging in SW so
+		 * final_iv updates remain strictly monotonic.
+		 */
 		u32 low = ((u32)rctx->iv[14] << 8) | rctx->iv[15];
 		u64 limit = (0x10000ULL - low) * AES_BLOCK_SIZE;
+
+		if (limit < SPACC_MIN_TAIL_HW_BYTES && limit < left) {
+			unsigned int bridge = (unsigned int)limit;
+
+			if (rctx->inflight_cmds > 0) {
+				rctx->ctr_bridge_busy = true;
+				return true;
+			}
+
+			rctx->err = spacc_sw_crypt(ctx, slot->src, slot->dst,
+						   bridge, rctx->iv,
+						   rctx->is_encrypt,
+						   req->base.flags);
+			if (rctx->err) {
+				spacc_finish_request(req, rctx->err);
+				return true;
+			}
+			memcpy(rctx->final_iv, rctx->iv, ivsize);
+			rctx->offset += bridge;
+			return true;
+		}
 
 		if (limit < chunk)
 			chunk = (unsigned int)limit;
@@ -613,81 +844,71 @@ static bool spacc_submit_next_chunk(struct spacc_dev *spacc,
 				      &dst_nents);
 	else
 		dst_nents = src_nents;
-	/*
-	 * The chunk end must not split a cache line: DMA is non-coherent,
-	 * and a dirty line covering [end - 16, end + 16) would clobber the
-	 * last block written by the engine.
-	 */
-	chunk = round_down(chunk, 2 * AES_BLOCK_SIZE);
+
+	if (chunk < left)
+		chunk = round_down(chunk, 2 * AES_BLOCK_SIZE);
 
 	if (chunk < SPACC_MIN_TAIL_HW_BYTES) {
-		rctx->sw_tail_len = left;
-		if (rctx->inflight_cmds == 0) {
-			int err = spacc_sw_crypt(ctx, slot->src, slot->dst,
-						 left, rctx->final_iv,
-						 rctx->is_encrypt, 0);
-			if (!err && ivsize)
-				memcpy(req->iv, rctx->final_iv, ivsize);
-			spacc_finish_request(req, err);
-		}
+		spacc_fallback_remainder(ctx, rctx, req, slot->src, slot->dst,
+					 left, ivsize);
 		return true;
 	}
 
+	/* Snapshot tail data and next-chunk IV before DMA mapping */
+	scatterwalk_map_and_copy(slot->tail_src, slot->src,
+				 chunk - SPACC_TAIL_FIX_BYTES,
+				 SPACC_TAIL_FIX_BYTES, 0);
+	if (ivsize) {
+		if (ctx->is_ctr) {
+			memcpy(slot->tail_iv, rctx->iv, ivsize);
+			spacc_ctr_add_blocks(slot->tail_iv,
+					     (chunk - SPACC_TAIL_FIX_BYTES) /
+					     AES_BLOCK_SIZE);
+			memcpy(next_iv, rctx->iv, ivsize);
+			spacc_ctr_add_blocks(next_iv, chunk / AES_BLOCK_SIZE);
+		} else if (!rctx->is_encrypt) {
+			scatterwalk_map_and_copy(slot->tail_iv, slot->src,
+						 chunk - SPACC_TAIL_FIX_BYTES - ivsize,
+						 ivsize, 0);
+			scatterwalk_map_and_copy(next_iv, slot->src,
+						 chunk - ivsize, ivsize, 0);
+		}
+	}
+
 	if (in_place) {
-		slot->src_ddt = spacc_sg_to_ddt(spacc, slot->src, chunk,
+		slot->src_ddt = spacc_sg_to_ddt(hw, slot->src, chunk,
 						src_nents, DMA_BIDIRECTIONAL,
 						&slot->src_addr);
 		if (!slot->src_ddt) {
-			rctx->sw_tail_len = left;
-			if (rctx->inflight_cmds == 0) {
-				int err = spacc_sw_crypt(ctx, slot->src,
-							 slot->dst, left,
-							 rctx->final_iv,
-							 rctx->is_encrypt, 0);
-				if (!err && ivsize)
-					memcpy(req->iv, rctx->final_iv, ivsize);
-				spacc_finish_request(req, err);
-			}
+			memzero_explicit(next_iv, sizeof(next_iv));
+			spacc_fallback_remainder(ctx, rctx, req, slot->src,
+						 slot->dst, left, ivsize);
 			return true;
 		}
 		slot->dst_ddt = slot->src_ddt;
 		slot->dst_addr = slot->src_addr;
 	} else {
-		slot->src_ddt = spacc_sg_to_ddt(spacc, slot->src, chunk,
+		slot->src_ddt = spacc_sg_to_ddt(hw, slot->src, chunk,
 						src_nents, DMA_TO_DEVICE,
 						&slot->src_addr);
 		if (!slot->src_ddt) {
-			rctx->sw_tail_len = left;
-			if (rctx->inflight_cmds == 0) {
-				int err = spacc_sw_crypt(ctx, slot->src,
-							 slot->dst, left,
-							 rctx->final_iv,
-							 rctx->is_encrypt, 0);
-				if (!err && ivsize)
-					memcpy(req->iv, rctx->final_iv, ivsize);
-				spacc_finish_request(req, err);
-			}
+			memzero_explicit(next_iv, sizeof(next_iv));
+			spacc_fallback_remainder(ctx, rctx, req, slot->src,
+						 slot->dst, left, ivsize);
 			return true;
 		}
-		slot->dst_ddt = spacc_sg_to_ddt(spacc, slot->dst, chunk,
+		slot->dst_ddt = spacc_sg_to_ddt(hw, slot->dst, chunk,
 						dst_nents, DMA_FROM_DEVICE,
 						&slot->dst_addr);
 		if (!slot->dst_ddt) {
-			dma_unmap_sg(spacc->dev, slot->src, src_nents,
+			memzero_explicit(next_iv, sizeof(next_iv));
+			dma_unmap_sg(hw->dev, slot->src, src_nents,
 				     DMA_TO_DEVICE);
-			dma_pool_free(spacc->req_pool, slot->src_ddt,
+			dma_pool_free(hw->req_pool, slot->src_ddt,
 				      slot->src_addr);
 			slot->src_ddt = NULL;
-			rctx->sw_tail_len = left;
-			if (rctx->inflight_cmds == 0) {
-				int err = spacc_sw_crypt(ctx, slot->src,
-							 slot->dst, left,
-							 rctx->final_iv,
-							 rctx->is_encrypt, 0);
-				if (!err && ivsize)
-					memcpy(req->iv, rctx->final_iv, ivsize);
-				spacc_finish_request(req, err);
-			}
+			spacc_fallback_remainder(ctx, rctx, req, slot->src,
+						 slot->dst, left, ivsize);
 			return true;
 		}
 	}
@@ -699,169 +920,310 @@ static bool spacc_submit_next_chunk(struct spacc_dev *spacc,
 	slot->err = 0;
 
 	/* Slot index maps 1:1 to hardware cipher context 0..15 */
-	page = spacc->cipher_ctx_base + (slot_idx * spacc->cipher_pg_sz);
-	spacc_memcpy_toio32(page, ctx->key, ctx->keylen);
+	page = hw->cipher_ctx_base + (slot_idx * SPACC_CIPHER_PG_SZ);
+	mutex_lock(&ctx->lock);
+	key_gen = atomic_read(&ctx->key_gen);
+	keylen = ctx->keylen;
+	key_cached = (slot->cached_ctx_id == ctx->ctx_id &&
+		      slot->cached_key_gen == key_gen &&
+		      slot->cached_is_encrypt == rctx->is_encrypt);
+	if (!key_cached)
+		memcpy(key_copy, ctx->key, keylen);
+	mutex_unlock(&ctx->lock);
+
+	if (!key_cached) {
+		spacc_memcpy_toio32(page, key_copy, keylen);
+		memzero_explicit(key_copy, sizeof(key_copy));
+		slot->cached_ctx_id = ctx->ctx_id;
+		slot->cached_key_gen = key_gen;
+		slot->cached_is_encrypt = rctx->is_encrypt;
+	}
+
 	if (ivsize)
 		spacc_memcpy_toio32(page + SPACC_CIPHER_IV_OFFSET, rctx->iv,
 				    ivsize);
-	(void)readl(page);
-
-	if (ctx->is_ctr) {
-		spacc_ctr_advance(rctx->iv, chunk);
-		if (ivsize)
-			memcpy(slot->next_iv, rctx->iv, ivsize);
-	} else if (!rctx->is_encrypt && ivsize) {
-		scatterwalk_map_and_copy(rctx->iv, slot->src, chunk - ivsize,
-					 ivsize, 0);
-		memcpy(slot->next_iv, rctx->iv, ivsize);
-	}
 
 	ctrl = ctx->ctrl_default | (slot_idx << SPA_CTRL_CTX_IDX);
 	if (rctx->is_encrypt)
 		ctrl |= BIT(SPA_CTRL_ENCRYPT_IDX);
-	else
+	else if (!key_cached)
 		ctrl |= BIT(SPA_CTRL_KEY_EXP);
 
-	spin_lock_irqsave(&spacc->hw_lock, flags);
-	if (readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT) &
-	    SPA_FIFO_CMD_FULL) {
-		spin_unlock_irqrestore(&spacc->hw_lock, flags);
-		spacc_free_slot_dma(spacc, slot);
+	/*
+	 * Order context memory writes before command registers; wmb() is
+	 * conservative vs dma_wmb() but cost is negligible vs DMA burst.
+	 */
+	wmb();
+
+	spin_lock_irqsave(&hw->hw_lock, flags);
+	if (hw->hw_inflight >= SPACC_RING_SIZE ||
+	    (readl(hw->crypto_regs + SPACC_REG_FIFO_STAT) &
+	     SPA_FIFO_CMD_FULL)) {
+		spin_unlock_irqrestore(&hw->hw_lock, flags);
+		memzero_explicit(next_iv, sizeof(next_iv));
+		spacc_free_slot_dma(hw, slot);
+		spacc_invalidate_slot_cache(slot);
 		return false;
 	}
 
-	writel(ctx->keylen | (slot_idx << SPA_KEY_SZ_CTX_INDEX_OFFSET) |
-	       (1U << SPA_KEY_SZ_CIPHER_OFFSET),
-	       spacc->crypto_regs + SPACC_REG_KEY_SZ);
-	writel(slot->src_addr, spacc->crypto_regs + SPACC_REG_SRC_PTR);
-	writel(slot->dst_addr, spacc->crypto_regs + SPACC_REG_DST_PTR);
-	writel(0, spacc->crypto_regs + SPACC_REG_OFFSET);
-	spacc_write_proc_len(spacc, chunk, slot_idx);
-	writel(ctrl, spacc->crypto_regs + SPACC_REG_CTRL);
+	/*
+	 * The final non-relaxed writel() orders all prior relaxed context
+	 * and command-register writes before CTRL triggers execution.
+	 */
+	writel_relaxed(keylen | (slot_idx << SPA_KEY_SZ_CTX_INDEX_OFFSET) |
+		       (1U << SPA_KEY_SZ_CIPHER_OFFSET),
+		       hw->crypto_regs + SPACC_REG_KEY_SZ);
+	writel_relaxed(slot->src_addr, hw->crypto_regs + SPACC_REG_SRC_PTR);
+	writel_relaxed(slot->dst_addr, hw->crypto_regs + SPACC_REG_DST_PTR);
+	writel_relaxed(0, hw->crypto_regs + SPACC_REG_OFFSET);
+	spacc_write_proc_len(hw, chunk, slot_idx);
+	writel(ctrl, hw->crypto_regs + SPACC_REG_CTRL);
 
-	spacc->head = (spacc->head + 1) % SPACC_RING_SIZE;
-	if (spacc->hw_inflight == 0)
-		spacc->last_progress = jiffies;
-	spacc->hw_inflight++;
-	spin_unlock_irqrestore(&spacc->hw_lock, flags);
+	hw->head = (hw->head + 1) % SPACC_RING_SIZE;
+	if (hw->hw_inflight == 0)
+		hw->last_progress = jiffies;
+	hw->hw_inflight++;
+	spin_unlock_irqrestore(&hw->hw_lock, flags);
+
+	/* Commit request progression only after hardware submission succeeds */
+	if (ivsize && (ctx->is_ctr || !rctx->is_encrypt))
+		memcpy(rctx->iv, next_iv, ivsize);
+	memzero_explicit(next_iv, sizeof(next_iv));
 
 	rctx->offset += chunk;
 	rctx->inflight_cmds++;
-	rctx->cbc_enc_busy = true;
+	if (ivsize && !ctx->is_ctr && rctx->is_encrypt)
+		rctx->cbc_enc_busy = true;
 
 	return true;
 }
 
-static void spacc_work_fn(struct work_struct *work)
+static void spacc_drain_stopping(struct spacc_hw *hw)
 {
-	struct spacc_dev *spacc = container_of(work, struct spacc_dev, work);
-	unsigned long flags;
-	unsigned int inflight;
+	struct spacc_reqctx *rctx, *tmp;
 
-	spacc_reap_completed(spacc);
+	/*
+	 * Complete any active requests whose DMA commands have already finished
+	 * using the software fallback so callers never hang during remove().
+	 * Requests with inflight_cmds > 0 stay on active_reqs until
+	 * spacc_reap_completed() drains their final IRQ/forced completion.
+	 */
+	list_for_each_entry_safe(rctx, tmp, &hw->active_reqs, node) {
+		struct skcipher_request *req = rctx->req;
+		struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+		struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
+		unsigned int ivsize = crypto_skcipher_ivsize(tfm);
+		unsigned int left = req->cryptlen - rctx->offset;
 
-	while (((spacc->head + 1) % SPACC_RING_SIZE) != spacc->tail) {
-		struct skcipher_request *target = NULL;
-		struct spacc_reqctx *rctx;
+		if (rctx->inflight_cmds != 0)
+			continue;
 
-		list_for_each_entry(rctx, &spacc->active_reqs, node) {
-			struct skcipher_request *cand = rctx->req;
+		if (!rctx->err && left > 0) {
+			struct scatterlist sc[2], dc[2];
+			struct scatterlist *s = scatterwalk_ffwd(sc, req->src,
+								 rctx->offset);
+			struct scatterlist *d = (req->src == req->dst) ? s :
+						scatterwalk_ffwd(dc, req->dst,
+								 rctx->offset);
 
-			if (!rctx->err && !rctx->sw_tail_len &&
-			    !rctx->cbc_enc_busy &&
-			    rctx->offset < cand->cryptlen) {
-				target = cand;
-				break;
-			}
+			rctx->err = spacc_sw_crypt(ctx, s, d, left,
+						   rctx->final_iv,
+						   rctx->is_encrypt,
+						   req->base.flags);
 		}
 
-		if (!target) {
-			struct crypto_async_request *areq, *backlog;
+		if (!rctx->err && ivsize)
+			memcpy(req->iv, rctx->final_iv, ivsize);
 
-			spin_lock_bh(&spacc->q_lock);
-			backlog = crypto_get_backlog(&spacc->queue);
-			areq = crypto_dequeue_request(&spacc->queue);
-			spin_unlock_bh(&spacc->q_lock);
-
-			if (!areq)
-				break;
-
-			if (backlog) {
-				local_bh_disable();
-				backlog->complete(backlog, -EINPROGRESS);
-				local_bh_enable();
-			}
-
-			target = skcipher_request_cast(areq);
-			rctx = skcipher_request_ctx(target);
-			list_add_tail(&rctx->node, &spacc->active_reqs);
-		}
-
-		if (!spacc_submit_next_chunk(spacc, target))
-			break;
-
-		/* Reap any fast completions while feeding the pipeline */
-		spacc_reap_completed(spacc);
+		spacc_finish_request(req, rctx->err);
 	}
 
-	spin_lock_irqsave(&spacc->hw_lock, flags);
-	inflight = spacc->hw_inflight;
-	spin_unlock_irqrestore(&spacc->hw_lock, flags);
+	for (;;) {
+		struct crypto_async_request *areq, *backlog;
+		struct skcipher_request *req;
+		struct crypto_skcipher *tfm;
+		struct spacc_ctx *ctx;
+		struct spacc_reqctx *rctx;
+		int err;
 
-	if (inflight > 0 && !spacc->shutting_down)
-		mod_delayed_work(spacc->wq, &spacc->watchdog,
+		spin_lock_bh(&hw->q_lock);
+		backlog = crypto_get_backlog(&hw->queue);
+		areq = crypto_dequeue_request(&hw->queue);
+		spin_unlock_bh(&hw->q_lock);
+
+		if (!areq)
+			break;
+
+		if (backlog)
+			backlog->complete(backlog, -EINPROGRESS);
+
+		req = skcipher_request_cast(areq);
+		tfm = crypto_skcipher_reqtfm(req);
+		ctx = crypto_skcipher_ctx(tfm);
+		rctx = skcipher_request_ctx(req);
+
+		err = spacc_sw_crypt(ctx, req->src, req->dst, req->cryptlen,
+				     req->iv, rctx->is_encrypt,
+				     req->base.flags);
+		spacc_finish_request(req, err);
+	}
+
+	if (list_empty(&hw->active_reqs))
+		complete_all(&hw->drained);
+}
+
+static void spacc_work_fn(struct work_struct *work)
+{
+	struct spacc_hw *hw = container_of(work, struct spacc_hw, work);
+	int budget = SPACC_RING_SIZE;
+	unsigned long flags;
+	unsigned int inflight;
+	bool reaped_any;
+
+	/*
+	 * Loop while reaping frees up ring slots so the hardware pipeline stays
+	 * saturated, bounded by budget so spacc_watchdog_fn() (on the same
+	 * max_active=1 workqueue) can never be starved under continuous load.
+	 */
+	do {
+		spacc_reap_completed(hw);
+
+		if (unlikely(READ_ONCE(hw->stopping))) {
+			spacc_drain_stopping(hw);
+			cancel_delayed_work(&hw->watchdog);
+			return;
+		}
+
+		while (((hw->head + 1) % SPACC_RING_SIZE) != hw->tail &&
+		       !READ_ONCE(hw->stopping)) {
+			struct skcipher_request *target = NULL;
+			struct spacc_reqctx *rctx;
+
+			/* Exclusive access: hw->wq is single-threaded (max_active=1) */
+			list_for_each_entry(rctx, &hw->active_reqs, node) {
+				struct skcipher_request *cand = rctx->req;
+
+				if (!rctx->err && !rctx->sw_tail_len &&
+				    !rctx->cbc_enc_busy &&
+				    !rctx->ctr_bridge_busy &&
+				    rctx->offset < cand->cryptlen) {
+					target = cand;
+					break;
+				}
+			}
+
+			if (!target) {
+				struct crypto_async_request *areq, *backlog;
+
+				spin_lock_bh(&hw->q_lock);
+				backlog = crypto_get_backlog(&hw->queue);
+				areq = crypto_dequeue_request(&hw->queue);
+				spin_unlock_bh(&hw->q_lock);
+
+				if (!areq)
+					break;
+
+				if (backlog)
+					backlog->complete(backlog, -EINPROGRESS);
+
+				target = skcipher_request_cast(areq);
+				rctx = skcipher_request_ctx(target);
+				list_add_tail(&rctx->node, &hw->active_reqs);
+			}
+
+			if (!spacc_submit_next_chunk(hw, target))
+				break;
+		}
+
+		reaped_any = spacc_reap_completed(hw);
+	} while (reaped_any && --budget > 0 && !READ_ONCE(hw->stopping));
+
+	if (unlikely(READ_ONCE(hw->stopping))) {
+		spacc_drain_stopping(hw);
+		cancel_delayed_work(&hw->watchdog);
+		return;
+	}
+
+	spin_lock_irqsave(&hw->hw_lock, flags);
+	inflight = hw->hw_inflight;
+	spin_unlock_irqrestore(&hw->hw_lock, flags);
+
+	if (inflight > 0)
+		mod_delayed_work(hw->wq, &hw->watchdog,
 				 msecs_to_jiffies(1000));
 	else
-		cancel_delayed_work(&spacc->watchdog);
+		cancel_delayed_work(&hw->watchdog);
+
+	/* Re-queue ourselves if budget expired with pending work remaining */
+	if (budget == 0) {
+		bool has_queued;
+
+		spin_lock_bh(&hw->q_lock);
+		has_queued = hw->queue.qlen > 0;
+		spin_unlock_bh(&hw->q_lock);
+
+		if (has_queued || !list_empty(&hw->active_reqs))
+			queue_work(hw->wq, &hw->work);
+	}
 }
 
 static void spacc_watchdog_fn(struct work_struct *work)
 {
-	struct spacc_dev *spacc = container_of(work, struct spacc_dev,
-					       watchdog.work);
+	struct spacc_hw *hw = container_of(work, struct spacc_hw,
+					    watchdog.work);
 	unsigned long flags;
 	bool timed_out = false;
+	int ret;
 
-	if (READ_ONCE(spacc->shutting_down))
+	if (READ_ONCE(hw->stopping))
 		return;
 
-	spin_lock_irqsave(&spacc->hw_lock, flags);
-	if (spacc->hw_inflight > 0 &&
-	    time_after(jiffies, spacc->last_progress + msecs_to_jiffies(1000)))
+	spin_lock_irqsave(&hw->hw_lock, flags);
+	if (hw->hw_inflight > 0 &&
+	    time_after(jiffies, hw->last_progress + msecs_to_jiffies(1000)))
 		timed_out = true;
-	spin_unlock_irqrestore(&spacc->hw_lock, flags);
+	spin_unlock_irqrestore(&hw->hw_lock, flags);
 
 	if (!timed_out)
 		return;
 
-	dev_err_ratelimited(spacc->dev,
-			    "SPACC: pipeline stalled (IRQ_STAT=0x%08x FIFO_STAT=0x%08x), resetting engine\n",
-			    readl(spacc->crypto_regs + SPACC_REG_IRQ_STAT),
-			    readl(spacc->crypto_regs + SPACC_REG_FIFO_STAT));
+	dev_err_ratelimited(hw->dev,
+			    "SPACC stalled (IRQ_STAT=0x%08x FIFO_STAT=0x%08x), resetting\n",
+			    readl(hw->crypto_regs + SPACC_REG_IRQ_STAT),
+			    readl(hw->crypto_regs + SPACC_REG_FIFO_STAT));
 
-	spin_lock_irqsave(&spacc->hw_lock, flags);
-	writel(0, spacc->pdu_regs + SPACC_REG_IRQ_EN);
-	spin_unlock_irqrestore(&spacc->hw_lock, flags);
-
-	synchronize_irq(spacc->irq);
-	if (spacc->rst && !reset_control_assert(spacc->rst)) {
-		fsleep(10);
-		reset_control_deassert(spacc->rst);
+	ret = spacc_halt_hw(hw, true);
+	if (ret) {
+		dev_crit(hw->dev,
+			 "Failed to reset stalled SPACC (%d); halting HW path and leaking active DMA mappings\n",
+			 ret);
+		WRITE_ONCE(hw->skip_dma_unmap, true);
+		WRITE_ONCE(hw->stopping, true);
+		spin_lock_irqsave(&hw->hw_lock, flags);
+		hw->hw_inflight = 0;
+		while (hw->complete_idx != hw->head) {
+			hw->ring[hw->complete_idx].err = -ETIMEDOUT;
+			hw->complete_idx = (hw->complete_idx + 1) %
+					   SPACC_RING_SIZE;
+		}
+		spin_unlock_irqrestore(&hw->hw_lock, flags);
+		queue_work(hw->wq, &hw->work);
+		return;
 	}
 
-	spin_lock_irqsave(&spacc->hw_lock, flags);
-	spacc_hw_init_regs(spacc);
 	/*
-	 * hw_inflight is not decremented here: spacc_hw_init_regs() above has
-	 * already reset it to 0 together with the engine state.
+	 * Hardware reset discards any unpopped status FIFO entries; fail all
+	 * in-flight ring slots with -ETIMEDOUT so upper layers can retry.
 	 */
-	while (spacc->complete_idx != spacc->head) {
-		spacc->ring[spacc->complete_idx].err = -ETIMEDOUT;
-		spacc->complete_idx = (spacc->complete_idx + 1) % SPACC_RING_SIZE;
+	spin_lock_irqsave(&hw->hw_lock, flags);
+	spacc_hw_init_regs(hw);
+	while (hw->complete_idx != hw->head) {
+		hw->ring[hw->complete_idx].err = -ETIMEDOUT;
+		hw->complete_idx = (hw->complete_idx + 1) % SPACC_RING_SIZE;
 	}
-	spin_unlock_irqrestore(&spacc->hw_lock, flags);
+	spin_unlock_irqrestore(&hw->hw_lock, flags);
 
-	queue_work(spacc->wq, &spacc->work);
+	queue_work(hw->wq, &hw->work);
 }
 
 static int spacc_cra_init(struct crypto_skcipher *tfm)
@@ -869,22 +1231,30 @@ static int spacc_cra_init(struct crypto_skcipher *tfm)
 	struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
 	struct skcipher_alg *alg = crypto_skcipher_alg(tfm);
 	struct spacc_alg *spacc_alg = container_of(alg, struct spacc_alg, alg);
+	struct spacc_dev *spacc = spacc_alg->spacc;
 	const char *name = crypto_tfm_alg_name(&tfm->base);
 
-	ctx->spacc = spacc_alg->spacc;
+	if (!kref_get_unless_zero(&spacc->refcount))
+		return -ENODEV;
+
+	if (!rcu_access_pointer(spacc->hw)) {
+		kref_put(&spacc->refcount, spacc_dev_release);
+		return -ENODEV;
+	}
+
+	ctx->fallback_tfm = crypto_alloc_sync_skcipher(name, 0,
+						       CRYPTO_ALG_NEED_FALLBACK);
+	if (IS_ERR(ctx->fallback_tfm)) {
+		kref_put(&spacc->refcount, spacc_dev_release);
+		return PTR_ERR(ctx->fallback_tfm);
+	}
+
+	ctx->spacc = spacc;
+	ctx->ctx_id = atomic64_inc_return(&spacc->next_ctx_id);
+	atomic_set(&ctx->key_gen, 0);
 	ctx->ctrl_default = spacc_alg->ctrl_default;
 	ctx->is_ctr = spacc_alg->is_ctr;
 	mutex_init(&ctx->lock);
-
-	if (!ctx->is_ctr) {
-		ctx->fallback_tfm = crypto_alloc_sync_skcipher(name, 0,
-							       CRYPTO_ALG_NEED_FALLBACK);
-		if (IS_ERR(ctx->fallback_tfm)) {
-			dev_err(ctx->spacc->dev,
-				"Cannot allocate fallback for %s\n", name);
-			return PTR_ERR(ctx->fallback_tfm);
-		}
-	}
 
 	crypto_skcipher_set_reqsize(tfm, sizeof(struct spacc_reqctx));
 	return 0;
@@ -894,50 +1264,10 @@ static void spacc_cra_exit(struct crypto_skcipher *tfm)
 {
 	struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
 
-	if (ctx->fallback_tfm) {
-		crypto_free_sync_skcipher(ctx->fallback_tfm);
-		ctx->fallback_tfm = NULL;
-	}
+	crypto_free_sync_skcipher(ctx->fallback_tfm);
 	memzero_explicit(ctx->key, sizeof(ctx->key));
 	mutex_destroy(&ctx->lock);
-}
-
-static int spacc_aes_setkey_locked(struct crypto_skcipher *tfm, const u8 *key,
-				   unsigned int keylen)
-{
-	struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
-	struct crypto_sync_skcipher *fb = ctx->fallback_tfm;
-	int err;
-
-	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
-	    keylen != AES_KEYSIZE_256)
-		return -EINVAL;
-
-	if (!fb) {
-		fb = crypto_alloc_sync_skcipher(crypto_tfm_alg_name(&tfm->base),
-						0, CRYPTO_ALG_NEED_FALLBACK);
-		if (IS_ERR(fb))
-			return PTR_ERR(fb);
-	}
-
-	crypto_sync_skcipher_clear_flags(fb, CRYPTO_TFM_REQ_MASK);
-	crypto_sync_skcipher_set_flags(fb,
-				       crypto_skcipher_get_flags(tfm) &
-				       CRYPTO_TFM_REQ_MASK);
-
-	err = crypto_sync_skcipher_setkey(fb, key, keylen);
-	if (err) {
-		if (!ctx->fallback_tfm)
-			crypto_free_sync_skcipher(fb);
-		return err;
-	}
-
-	ctx->fallback_tfm = fb;
-	memzero_explicit(ctx->key, sizeof(ctx->key));
-	memcpy(ctx->key, key, keylen);
-	ctx->keylen = keylen;
-
-	return 0;
+	kref_put(&ctx->spacc->refcount, spacc_dev_release);
 }
 
 static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
@@ -946,27 +1276,34 @@ static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
 	struct spacc_ctx *ctx = crypto_skcipher_ctx(tfm);
 	int err;
 
-	mutex_lock(&ctx->lock);
-	err = spacc_aes_setkey_locked(tfm, key, keylen);
-	mutex_unlock(&ctx->lock);
+	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
+	    keylen != AES_KEYSIZE_256)
+		return -EINVAL;
 
+	mutex_lock(&ctx->lock);
+
+	crypto_sync_skcipher_clear_flags(ctx->fallback_tfm,
+					 CRYPTO_TFM_REQ_MASK);
+	crypto_sync_skcipher_set_flags(ctx->fallback_tfm,
+				       crypto_skcipher_get_flags(tfm) &
+				       CRYPTO_TFM_REQ_MASK);
+
+	err = crypto_sync_skcipher_setkey(ctx->fallback_tfm, key, keylen);
+	if (!err) {
+		memzero_explicit(ctx->key, sizeof(ctx->key));
+		memcpy(ctx->key, key, keylen);
+		ctx->keylen = keylen;
+		atomic_inc(&ctx->key_gen);
+	}
+
+	mutex_unlock(&ctx->lock);
 	return err;
 }
 
 /*
- * Under memory bus contention the engine corrupts the final write beats
- * of a command: beat-aligned zeros or garbage in the last 8-24 bytes, ~1%
- * of commands under concurrent load, any mode and size (LS1024A silicon
- * defect; see the project report for the full investigation).  A single
- * crypto thread is clean over thousands of operations.  Default off:
- * software is always correct.
- *
- * Runtime-switchable on purpose (0644): single-threaded batch jobs enable
- * the engine without reloading the module.  Readers use READ_ONCE.
+ * Returns -EINPROGRESS when queued for asynchronous HW execution, -EBUSY when
+ * queued into backlog, or 0 / negative errno when completed inline via SW.
  */
-static bool spacc_use_hw;
-module_param_named(hw, spacc_use_hw, bool, 0644);
-
 static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
@@ -974,6 +1311,7 @@ static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
 	struct spacc_reqctx *rctx = skcipher_request_ctx(req);
 	struct spacc_dev *spacc = ctx->spacc;
 	unsigned int ivsize = crypto_skcipher_ivsize(tfm);
+	struct spacc_hw *hw;
 	int err;
 
 	if (req->cryptlen == 0)
@@ -982,25 +1320,22 @@ static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
 	if (!ctx->is_ctr && (req->cryptlen % AES_BLOCK_SIZE))
 		return -EINVAL;
 
-	/*
-	 * Every mode reaches the engine only as a single chunk.  Requests that
-	 * need a second command lose the last block of a chunk under concurrent
-	 * load -- measured on both CBC and CTR, ~0.2% of requests -- and nothing
-	 * in the API can detect it afterwards.
-	 */
-	if (!READ_ONCE(spacc_use_hw) ||
-	    req->cryptlen < SPACC_MIN_HW_BYTES ||
-	    req->cryptlen > SPACC_MAX_CHUNK_BYTES ||
-	    sg_nents_for_len(req->src, req->cryptlen) > SPACC_MAX_SG_ENTS ||
-	    (req->src != req->dst &&
-	     sg_nents_for_len(req->dst, req->cryptlen) > SPACC_MAX_SG_ENTS))
+	rcu_read_lock();
+	hw = rcu_dereference(spacc->hw);
+	if (unlikely(!hw || READ_ONCE(hw->stopping) ||
+		     !READ_ONCE(spacc_use_hw) ||
+		     req->cryptlen < SPACC_MIN_HW_BYTES)) {
+		rcu_read_unlock();
 		return spacc_sw_crypt(ctx, req->src, req->dst, req->cryptlen,
 				      req->iv, is_encrypt, req->base.flags);
+	}
 
 	INIT_LIST_HEAD(&rctx->node);
 	rctx->req = req;
 	rctx->is_encrypt = is_encrypt;
 	rctx->cbc_enc_busy = false;
+	rctx->ctr_bridge_busy = false;
+	rctx->completed = false;
 	rctx->offset = 0;
 	rctx->inflight_cmds = 0;
 	rctx->sw_tail_len = 0;
@@ -1010,11 +1345,13 @@ static int spacc_aes_crypt(struct skcipher_request *req, bool is_encrypt)
 		memcpy(rctx->final_iv, req->iv, ivsize);
 	}
 
-	spin_lock_bh(&spacc->q_lock);
-	err = crypto_enqueue_request(&spacc->queue, &req->base);
-	spin_unlock_bh(&spacc->q_lock);
+	spin_lock_bh(&hw->q_lock);
+	err = crypto_enqueue_request(&hw->queue, &req->base);
+	spin_unlock_bh(&hw->q_lock);
 
-	queue_work(spacc->wq, &spacc->work);
+	if (err == -EINPROGRESS || err == -EBUSY)
+		queue_work(hw->wq, &hw->work);
+	rcu_read_unlock();
 
 	return err;
 }
@@ -1056,7 +1393,6 @@ static const struct spacc_alg spacc_algs_tmpl[] = {
 						  CRYPTO_ALG_NEED_FALLBACK,
 			.base.cra_blocksize	= 1,
 			.base.cra_ctxsize	= sizeof(struct spacc_ctx),
-			.base.cra_alignmask	= 0,
 			.base.cra_module	= THIS_MODULE,
 
 			.init			= spacc_cra_init,
@@ -1079,7 +1415,6 @@ static const struct spacc_alg spacc_algs_tmpl[] = {
 						  CRYPTO_ALG_NEED_FALLBACK,
 			.base.cra_blocksize	= AES_BLOCK_SIZE,
 			.base.cra_ctxsize	= sizeof(struct spacc_ctx),
-			.base.cra_alignmask	= 0,
 			.base.cra_module	= THIS_MODULE,
 
 			.init			= spacc_cra_init,
@@ -1101,7 +1436,6 @@ static const struct spacc_alg spacc_algs_tmpl[] = {
 						  CRYPTO_ALG_NEED_FALLBACK,
 			.base.cra_blocksize	= AES_BLOCK_SIZE,
 			.base.cra_ctxsize	= sizeof(struct spacc_ctx),
-			.base.cra_alignmask	= 0,
 			.base.cra_module	= THIS_MODULE,
 
 			.init			= spacc_cra_init,
@@ -1116,71 +1450,132 @@ static const struct spacc_alg spacc_algs_tmpl[] = {
 	},
 };
 
+static void spacc_quiesce_hw(struct platform_device *pdev,
+			     struct spacc_dev *spacc, struct spacc_hw *hw)
+{
+	unsigned long flags;
+
+	WRITE_ONCE(hw->stopping, true);
+	RCU_INIT_POINTER(spacc->hw, NULL);
+	synchronize_rcu();
+
+	/*
+	 * After cancel_delayed_work_sync() returns, watchdog will not issue
+	 * any new resets; watchdog may have already queued hw->work, making
+	 * the subsequent queue_work() an idempotent no-op.
+	 */
+	cancel_delayed_work_sync(&hw->watchdog);
+	queue_work(hw->wq, &hw->work);
+
+	if (!wait_for_completion_timeout(&hw->drained,
+					 msecs_to_jiffies(2000))) {
+		int ret = spacc_halt_hw(hw, false);
+
+		if (ret) {
+			dev_crit(hw->dev,
+				 "Failed to halt SPACC during teardown (%d); leaking active DMA mappings\n",
+				 ret);
+			WRITE_ONCE(hw->skip_dma_unmap, true);
+		} else {
+			hw->halted_in_reset = true;
+		}
+
+		spin_lock_irqsave(&hw->hw_lock, flags);
+		hw->hw_inflight = 0;
+		while (hw->complete_idx != hw->head) {
+			hw->ring[hw->complete_idx].err = -EIO;
+			hw->complete_idx = (hw->complete_idx + 1) %
+					   SPACC_RING_SIZE;
+		}
+		spin_unlock_irqrestore(&hw->hw_lock, flags);
+
+		queue_work(hw->wq, &hw->work);
+		if (!wait_for_completion_timeout(&hw->drained,
+						 msecs_to_jiffies(2000)))
+			dev_err(hw->dev,
+				"Timed out draining remaining requests\n");
+	}
+
+	if (!hw->halted_in_reset) {
+		spin_lock_irqsave(&hw->hw_lock, flags);
+		writel(0, hw->pdu_regs + SPACC_REG_IRQ_EN);
+		spin_unlock_irqrestore(&hw->hw_lock, flags);
+	}
+
+	/* Ensure IRQ handler has exited before destroying hw->wq */
+	devm_free_irq(&pdev->dev, hw->irq, hw);
+
+	drain_workqueue(hw->wq);
+	destroy_workqueue(hw->wq);
+}
+
 static int spacc_probe(struct platform_device *pdev)
 {
 	struct spacc_dev *spacc;
+	struct spacc_hw *hw;
 	struct resource *res;
+	struct clk *clk;
 	unsigned long flags;
 	u32 spacc_id;
 	int ret, i;
 
-	spacc = devm_kzalloc(&pdev->dev, sizeof(*spacc), GFP_KERNEL);
+	spacc = kzalloc(sizeof(*spacc), GFP_KERNEL);
 	if (!spacc)
 		return -ENOMEM;
 
-	spacc->dev = &pdev->dev;
-	spin_lock_init(&spacc->q_lock);
-	spin_lock_init(&spacc->hw_lock);
-	crypto_init_queue(&spacc->queue, SPACC_QUEUE_LEN);
-	INIT_LIST_HEAD(&spacc->active_reqs);
-	INIT_WORK(&spacc->work, spacc_work_fn);
-	INIT_DELAYED_WORK(&spacc->watchdog, spacc_watchdog_fn);
-
-	spacc->clk = devm_clk_get_optional(&pdev->dev, "spacc");
-	if (IS_ERR(spacc->clk))
-		return dev_err_probe(&pdev->dev, PTR_ERR(spacc->clk),
-				     "Failed to get spacc clock\n");
-
-	if (spacc->clk) {
-		ret = clk_prepare_enable(spacc->clk);
-		if (ret)
-			return dev_err_probe(&pdev->dev, ret,
-					     "Failed to enable spacc clock\n");
+	hw = devm_kzalloc(&pdev->dev, sizeof(*hw), GFP_KERNEL);
+	if (!hw) {
+		kfree(spacc);
+		return -ENOMEM;
 	}
 
-	spacc->rst = devm_reset_control_get_optional_shared(&pdev->dev, "spacc");
-	if (IS_ERR(spacc->rst)) {
-		ret = dev_err_probe(&pdev->dev, PTR_ERR(spacc->rst),
-				     "Failed to get spacc reset\n");
-		goto err_clk_disable;
+	kref_init(&spacc->refcount);
+	hw->dev = &pdev->dev;
+	spin_lock_init(&hw->q_lock);
+	spin_lock_init(&hw->hw_lock);
+	crypto_init_queue(&hw->queue, SPACC_QUEUE_LEN);
+	INIT_LIST_HEAD(&hw->active_reqs);
+	INIT_WORK(&hw->work, spacc_work_fn);
+	INIT_DELAYED_WORK(&hw->watchdog, spacc_watchdog_fn);
+	init_completion(&hw->drained);
+
+	clk = devm_clk_get_enabled(&pdev->dev, "spacc");
+	if (IS_ERR(clk)) {
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(clk),
+				    "Failed to enable spacc clock\n");
+		goto err_put_ref;
 	}
 
-	if (spacc->rst) {
-		ret = reset_control_deassert(spacc->rst);
-		if (ret) {
-			dev_err(&pdev->dev, "Failed to deassert reset: %d\n", ret);
-			goto err_clk_disable;
-		}
+	hw->rst = devm_reset_control_get_exclusive(&pdev->dev, "spacc");
+	if (IS_ERR(hw->rst)) {
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(hw->rst),
+				    "Failed to get spacc reset\n");
+		goto err_put_ref;
 	}
 
-	spacc->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
-	if (IS_ERR(spacc->regs)) {
-		ret = PTR_ERR(spacc->regs);
+	ret = reset_control_deassert(hw->rst);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to deassert reset: %d\n", ret);
+		goto err_put_ref;
+	}
+
+	hw->pdu_regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+	if (IS_ERR(hw->pdu_regs)) {
+		ret = PTR_ERR(hw->pdu_regs);
 		goto err_reset_assert;
 	}
 
-	spacc->pdu_regs = spacc->regs;
-	if (resource_size(res) >= SPACC_MIN_MMIO_SIZE)
-		spacc->crypto_regs = spacc->regs + SPACC_CRYPTO_BASE_OFFSET;
-	else
-		spacc->crypto_regs = spacc->regs;
+	if (resource_size(res) < SPACC_MIN_MMIO_SIZE) {
+		dev_err(&pdev->dev, "Invalid MMIO resource %pr\n", res);
+		ret = -EINVAL;
+		goto err_reset_assert;
+	}
 
-	spacc->cipher_ctx_base = spacc->crypto_regs + SPACC_REG_CIPH_KEY_BASE;
-	spacc->cipher_pg_sz = SPACC_CIPHER_PG_SZ;
+	hw->crypto_regs = hw->pdu_regs + SPACC_CRYPTO_BASE_OFFSET;
+	hw->cipher_ctx_base = hw->crypto_regs + SPACC_REG_CIPH_KEY_BASE;
 
-	spacc_id = readl(spacc->pdu_regs + SPACC_REG_ID);
-	dev_info(&pdev->dev,
-		 "LS1024A SPACC pipelined engine probed (version %u.%u)\n",
+	spacc_id = readl(hw->pdu_regs + SPACC_REG_ID);
+	dev_info(&pdev->dev, "LS1024A SPACC engine probed (version %u.%u)\n",
 		 (spacc_id >> 4) & 0x0f, spacc_id & 0x0f);
 
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
@@ -1188,114 +1583,106 @@ static int spacc_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Failed to set DMA mask: %d\n", ret);
 		goto err_reset_assert;
 	}
-
-	spacc->req_pool = dmam_pool_create(dev_name(&pdev->dev), &pdev->dev,
-					   SPACC_MAX_DDT_ENTS * sizeof(struct spacc_ddt),
-					   8, 0);
-	if (!spacc->req_pool) {
-		ret = -ENOMEM;
-		goto err_reset_assert;
-	}
-
-	/*
-	 * One worker owns the slot ring and the hardware contexts, so max_active
-	 * is 1 by design: pipeline depth comes from the ring, not from more
-	 * workers.
-	 */
-	spacc->wq = alloc_workqueue("ls1024a-spacc",
-				    WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
-	if (!spacc->wq) {
-		ret = -ENOMEM;
-		goto err_reset_assert;
-	}
-
-	spacc->irq = platform_get_irq(pdev, 0);
-	if (spacc->irq < 0) {
-		ret = spacc->irq;
-		goto err_wq_destroy;
-	}
-
-	spin_lock_irqsave(&spacc->hw_lock, flags);
-	spacc_hw_init_regs(spacc);
-	spin_unlock_irqrestore(&spacc->hw_lock, flags);
-
-	ret = devm_request_irq(&pdev->dev, spacc->irq, spacc_irq_handler, 0,
-			       dev_name(&pdev->dev), spacc);
+	/* Keep each coalesced SG segment within the 16-bit DDT length field */
+	ret = dma_set_max_seg_size(&pdev->dev, SPACC_MAX_CHUNK_BYTES);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to request IRQ %d: %d\n", spacc->irq, ret);
+		dev_err(&pdev->dev, "Failed to set max DMA segment size: %d\n",
+			ret);
+		goto err_reset_assert;
+	}
+
+	hw->req_pool = dmam_pool_create(dev_name(&pdev->dev), &pdev->dev,
+					SPACC_MAX_DDT_ENTS * sizeof(struct spacc_ddt),
+					8, 0);
+	if (!hw->req_pool) {
+		ret = -ENOMEM;
+		goto err_reset_assert;
+	}
+
+	hw->wq = alloc_workqueue(DRV_NAME,
+				 WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	if (!hw->wq) {
+		ret = -ENOMEM;
+		goto err_reset_assert;
+	}
+
+	hw->irq = platform_get_irq(pdev, 0);
+	if (hw->irq < 0) {
+		ret = hw->irq;
 		goto err_wq_destroy;
 	}
+
+	/* Request IRQ before unmasking hardware interrupts */
+	ret = devm_request_irq(&pdev->dev, hw->irq, spacc_irq_handler, 0,
+			       dev_name(&pdev->dev), hw);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to request IRQ %d: %d\n",
+			hw->irq, ret);
+		goto err_wq_destroy;
+	}
+
+	spin_lock_irqsave(&hw->hw_lock, flags);
+	spacc_hw_init_regs(hw);
+	spin_unlock_irqrestore(&hw->hw_lock, flags);
+
+	rcu_assign_pointer(spacc->hw, hw);
 
 	for (i = 0; i < ARRAY_SIZE(spacc_algs_tmpl); i++) {
 		spacc->algs[i] = spacc_algs_tmpl[i];
 		spacc->algs[i].spacc = spacc;
 		ret = crypto_register_skcipher(&spacc->algs[i].alg);
 		if (ret) {
-			dev_err(&pdev->dev, "Failed to register algorithm %s: %d\n",
+			dev_err(&pdev->dev,
+				"Failed to register algorithm %s: %d\n",
 				spacc->algs[i].alg.base.cra_name, ret);
 			while (--i >= 0)
 				crypto_unregister_skcipher(&spacc->algs[i].alg);
-			goto err_irq_free;
+			goto err_quiesce_hw;
 		}
 	}
 
 	platform_set_drvdata(pdev, spacc);
 	return 0;
 
-err_irq_free:
-	writel(0, spacc->pdu_regs + SPACC_REG_IRQ_EN);
-	devm_free_irq(&pdev->dev, spacc->irq, spacc);
+err_quiesce_hw:
+	spacc_quiesce_hw(pdev, spacc, hw);
+	goto err_reset_assert;
 err_wq_destroy:
-	destroy_workqueue(spacc->wq);
+	/* Safe without drain: spacc->hw was never published, no work queued */
+	destroy_workqueue(hw->wq);
 err_reset_assert:
-	if (spacc->rst)
-		reset_control_assert(spacc->rst);
-err_clk_disable:
-	if (spacc->clk)
-		clk_disable_unprepare(spacc->clk);
+	if (!hw->halted_in_reset)
+		reset_control_assert(hw->rst);
+err_put_ref:
+	kref_put(&spacc->refcount, spacc_dev_release);
 	return ret;
 }
 
 static void spacc_remove(struct platform_device *pdev)
 {
 	struct spacc_dev *spacc = platform_get_drvdata(pdev);
+	struct spacc_hw *hw = rcu_dereference_protected(spacc->hw, 1);
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(spacc->algs); i++)
 		crypto_unregister_skcipher(&spacc->algs[i].alg);
 
-	/*
-	 * Mark teardown, then drain the worker BEFORE cancelling the timer: a
-	 * running spacc_work_fn that read the flag just before it was set may
-	 * still re-arm the watchdog, and only a drained worker makes the
-	 * subsequent cancel final.
-	 */
-	spacc->shutting_down = true;
-	smp_mb();
-	drain_workqueue(spacc->wq);
-	cancel_delayed_work_sync(&spacc->watchdog);
-	destroy_workqueue(spacc->wq);
+	spacc_quiesce_hw(pdev, spacc, hw);
 
-	writel(0, spacc->pdu_regs + SPACC_REG_IRQ_EN);
-	devm_free_irq(&pdev->dev, spacc->irq, spacc);
+	if (!hw->halted_in_reset) {
+		for (i = 0; i < SPACC_RING_SIZE; i++)
+			memset_io(hw->cipher_ctx_base +
+				  (i * SPACC_CIPHER_PG_SZ),
+				  0, SPACC_CIPHER_PG_SZ);
 
-	/* Key material survives cra_exit in the MMIO context pages: wipe. */
-	for (i = 0; i < SPACC_RING_SIZE; i++)
-		memset_io(spacc->cipher_ctx_base + (i * spacc->cipher_pg_sz),
-			  0, spacc->cipher_pg_sz);
+		reset_control_assert(hw->rst);
+	}
 
-	if (spacc->rst)
-		reset_control_assert(spacc->rst);
-
-	if (spacc->clk)
-		clk_disable_unprepare(spacc->clk);
+	kref_put(&spacc->refcount, spacc_dev_release);
 }
 
 static const struct of_device_id spacc_of_match[] = {
 	{ .compatible = "fsl,ls1024a-spacc" },
-	{ .compatible = "picochip,spacc-ls1024a" },
-	{ .compatible = "picochip,spacc-ipsec" },
-	{ .compatible = "picochip,spacc-l2" },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, spacc_of_match);
@@ -1304,12 +1691,12 @@ static struct platform_driver spacc_driver = {
 	.probe		= spacc_probe,
 	.remove		= spacc_remove,
 	.driver		= {
-		.name	= DRV_NAME,
-		.of_match_table = spacc_of_match,
+		.name		= DRV_NAME,
+		.of_match_table	= spacc_of_match,
 	},
 };
 module_platform_driver(spacc_driver);
 
-MODULE_DESCRIPTION("Freescale LS1024A SPACC Pipelined Crypto Engine Driver");
+MODULE_DESCRIPTION("Freescale LS1024A SPACC Crypto Engine Driver");
 MODULE_AUTHOR("Antigravity Team");
 MODULE_LICENSE("GPL");
