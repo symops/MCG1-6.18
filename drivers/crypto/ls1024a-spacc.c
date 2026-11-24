@@ -179,7 +179,7 @@ struct spacc_hw_slot {
 
 	/* Context SRAM key cache metadata */
 	const struct spacc_ctx *last_ctx;
-	u64 last_key_gen;
+	unsigned long last_key_gen;
 	unsigned int last_keylen;
 
 	u8 tail_src[SPACC_TAIL_FIX_BYTES] __aligned(4);
@@ -230,7 +230,7 @@ struct spacc_ctx {
 	struct crypto_sync_skcipher *fallback_tfm;
 	u8 key[AES_MAX_KEY_SIZE] __aligned(4);
 	unsigned int keylen;
-	u64 key_gen;
+	unsigned long key_gen;
 	struct mutex lock;
 };
 
@@ -245,7 +245,7 @@ struct spacc_reqctx {
 	u8 iv[AES_BLOCK_SIZE] __aligned(4);
 };
 
-static atomic64_t spacc_key_gen_seq = ATOMIC64_INIT(0);
+static atomic_long_t spacc_key_gen_seq = ATOMIC_LONG_INIT(0);
 
 static void spacc_dev_release(struct kref *ref)
 {
@@ -321,8 +321,7 @@ static unsigned int spacc_build_chunk_sgl(struct scatterlist *orig_sgl,
 			 * normalized within a single base page.
 			 */
 			sg_set_page(&dst_sgl[used],
-				    nth_page(sg_page(sg),
-					     page_off >> PAGE_SHIFT),
+				    sg_page(sg) + (page_off >> PAGE_SHIFT),
 				    take, offset_in_page(page_off));
 			total += take;
 			used++;
@@ -677,7 +676,7 @@ static bool spacc_submit_next_chunk(struct spacc_hw *hw,
 	unsigned int chunk, src_nents = 0, dst_nents = 0;
 	void __iomem *page;
 	unsigned long flags;
-	u64 key_gen;
+	unsigned long key_gen;
 	u32 ctrl;
 
 	if (unlikely(READ_ONCE(hw->shutting_down) || READ_ONCE(hw->hw_dead)))
@@ -1134,7 +1133,7 @@ static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
 		memcpy(ctx->key, key, keylen);
 		ctx->keylen = keylen;
 		smp_store_release(&ctx->key_gen,
-				  (u64)atomic64_inc_return(&spacc_key_gen_seq));
+				  (unsigned long)atomic_long_inc_return(&spacc_key_gen_seq));
 	}
 
 	mutex_unlock(&ctx->lock);
@@ -1287,9 +1286,11 @@ static int spacc_probe(struct platform_device *pdev)
 		goto err_reset_assert;
 	}
 
-	if (resource_size(res) < SPACC_MIN_MMIO_SIZE) {
+	resource_size_t res_size = resource_size(res);
+
+	if (res_size < SPACC_MIN_MMIO_SIZE) {
 		dev_err(&pdev->dev, "MMIO region too small (%pa < %#x)\n",
-			&resource_size(res), SPACC_MIN_MMIO_SIZE);
+			&res_size, SPACC_MIN_MMIO_SIZE);
 		ret = -EINVAL;
 		goto err_reset_assert;
 	}
