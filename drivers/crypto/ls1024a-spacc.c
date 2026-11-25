@@ -228,6 +228,7 @@ struct spacc_dev {
 struct spacc_ctx {
 	struct spacc_dev *sdev;
 	struct crypto_sync_skcipher *fallback_tfm;
+	struct crypto_aes_ctx aes_ctx;
 	u8 key[AES_MAX_KEY_SIZE] __aligned(4);
 	unsigned int keylen;
 	unsigned long key_gen;
@@ -576,24 +577,59 @@ static void spacc_clear_slot_secrets(struct spacc_hw_slot *slot)
 }
 
 /*
+ * Fast direct-AES CTR fixup for the command tail without allocating a
+ * sync_skcipher request or walking the Crypto API dispatch layer.
+ */
+static void spacc_fix_tail_direct_aes(const struct crypto_aes_ctx *aes_ctx,
+				      const u8 *src_buf,
+				      struct scatterlist *dst_base,
+				      unsigned int dst_offset,
+				      unsigned int tail_len,
+				      const u8 *start_iv)
+{
+	u8 ctr[AES_BLOCK_SIZE] __aligned(4);
+	u8 stream[AES_BLOCK_SIZE] __aligned(4);
+	u8 out_buf[SPACC_TAIL_FIX_BYTES] __aligned(4);
+	unsigned int pos = 0;
+
+	memcpy(ctr, start_iv, AES_BLOCK_SIZE);
+
+	while (pos < tail_len) {
+		unsigned int step = min_t(unsigned int, AES_BLOCK_SIZE,
+					  tail_len - pos);
+		unsigned int i;
+
+		aes_encrypt(aes_ctx, stream, ctr);
+		for (i = 0; i < step; i++)
+			out_buf[pos + i] = src_buf[pos + i] ^ stream[i];
+
+		pos += step;
+		spacc_ctr_advance_blocks(ctr, 1);
+	}
+
+	scatterwalk_map_and_copy(out_buf, dst_base, dst_offset, tail_len, 1);
+
+	memzero_explicit(ctr, sizeof(ctr));
+	memzero_explicit(stream, sizeof(stream));
+	memzero_explicit(out_buf, sizeof(out_buf));
+}
+
+/*
  * Recompute the command tail on the CPU.  The engine's last write burst may
  * have lost or scrambled 8-24 bytes; the source bytes were saved before the
  * command, so this works for in-place buffers too.
  */
-static int spacc_fix_tail(struct spacc_ctx *ctx, struct spacc_hw_slot *slot)
+static void spacc_fix_tail(struct spacc_ctx *ctx, struct spacc_hw_slot *slot)
 {
-	struct scatterlist src_sg, dc[2];
-	struct scatterlist *dst_base, *dst;
+	struct scatterlist *dst_base;
 
 	if (!slot->tail_len)
-		return 0;
+		return;
 
-	sg_init_table(&src_sg, 1);
-	sg_set_buf(&src_sg, slot->tail_src, slot->tail_len);
 	dst_base = slot->in_place ? slot->src_sgl : slot->dst_sgl;
-	dst = scatterwalk_ffwd(dc, dst_base, slot->len - slot->tail_len);
-
-	return spacc_sw_crypt(ctx, &src_sg, dst, slot->tail_len, slot->tail_iv, 0);
+	spacc_fix_tail_direct_aes(&ctx->aes_ctx, slot->tail_src, dst_base,
+				  slot->len - slot->tail_len, slot->tail_len,
+				  slot->tail_iv);
 }
 
 static void spacc_finish_request(struct skcipher_request *req, int err)
@@ -631,7 +667,7 @@ static void spacc_reap_completed(struct spacc_hw *hw)
 			rctx->err = slot_err;
 
 		if (!rctx->err)
-			rctx->err = spacc_fix_tail(ctx, slot);
+			spacc_fix_tail(ctx, slot);
 
 		spacc_clear_slot_secrets(slot);
 
@@ -1105,6 +1141,7 @@ static void spacc_cra_exit(struct crypto_skcipher *tfm)
 		crypto_free_sync_skcipher(ctx->fallback_tfm);
 		ctx->fallback_tfm = NULL;
 	}
+	memzero_explicit(&ctx->aes_ctx, sizeof(ctx->aes_ctx));
 	memzero_explicit(ctx->key, sizeof(ctx->key));
 	mutex_destroy(&ctx->lock);
 	kref_put(&ctx->sdev->refcount, spacc_dev_release);
@@ -1128,12 +1165,17 @@ static int spacc_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
 				       CRYPTO_TFM_REQ_MASK);
 
 	err = crypto_sync_skcipher_setkey(ctx->fallback_tfm, key, keylen);
+	if (!err)
+		err = aes_expandkey(&ctx->aes_ctx, key, keylen);
+
 	if (!err) {
 		memzero_explicit(ctx->key, sizeof(ctx->key));
 		memcpy(ctx->key, key, keylen);
 		ctx->keylen = keylen;
 		smp_store_release(&ctx->key_gen,
 				  (unsigned long)atomic_long_inc_return(&spacc_key_gen_seq));
+	} else {
+		memzero_explicit(&ctx->aes_ctx, sizeof(ctx->aes_ctx));
 	}
 
 	mutex_unlock(&ctx->lock);
